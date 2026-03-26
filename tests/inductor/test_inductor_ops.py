@@ -191,8 +191,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             "param_sets": {
                 "2d_0": (0, cached_randn((63, 129))),
                 "2d_1": (1, cached_randn((63, 129))),
-                # Skip until https://github.com/torch-spyre/torch-spyre/issues/521 is implemented
-                # "2d_01": ((0, 1), cached_randn((63, 129))),
+                "2d_01": ((0, 1), cached_randn((63, 129))),
                 "3d_0": (0, cached_randn((3, 7, 9))),
                 "3d_1": (1, cached_randn((3, 7, 9))),
                 "3d_2": (2, cached_randn((3, 7, 9))),
