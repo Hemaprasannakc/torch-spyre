@@ -12,7 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
+
 from typing import Optional
+import torch._dynamo.guards as _dynamo_guards
+from torch._dynamo.guards import GuardBuilder
 from torch_spyre._C import get_spyre_tensor_layout, to_with_layout, empty_with_layout
 from torch_spyre._C import SpyreTensorLayout
 
@@ -101,3 +105,48 @@ def _patch_tensor_for_spyre():
     torch.Tensor._spyre_tensor_patched = True
     torch.Tensor.to = spyre_to
     torch.empty = spyre_empty
+
+    # ── SpyreTensorLayout Guard Extension ────────────
+    # Extends TENSOR_MATCH to guard on SpyreTensorLayout
+    # preventing wrong compiled graph reuse when layout
+    # changes.
+    # ─────────────────────────────────────────────────
+
+    _original_TENSOR_MATCH = GuardBuilder.TENSOR_MATCH
+
+    def _spyre_TENSOR_MATCH(self, guard, value=None):
+        # run original TENSOR_MATCH
+        _original_TENSOR_MATCH(self, guard, value=value)
+        # get tensor value
+        if value is None:
+            value = self.get(guard.name)
+        ## dereference WeakRef if needed
+        if isinstance(value, torch.utils.weak.TensorWeakRef):
+            value = value()
+
+        if value is None:
+            return
+
+        # not a Spyre tensor → skip
+        if not hasattr(value, "device_tensor_layout"):
+            return
+        # get layout safely
+        try:
+            expected_layout = value.device_tensor_layout()
+        except Exception:
+            return
+        # deepcopy
+        captured = copy.deepcopy(expected_layout)
+
+        # add lambda guard on tensor's child manager
+        # same node as TENSOR_MATCH!
+        tensor_guard_manager = self.get_guard_manager(guard)
+        tensor_guard_manager.add_lambda_guard(
+            lambda x: (
+                not hasattr(x, "device_tensor_layout") or
+                x.device_tensor_layout() == captured
+            ),
+            [f"SpyreTensorLayout({guard.name}) == {expected_layout}"],
+        )
+
+    GuardBuilder.TENSOR_MATCH = _spyre_TENSOR_MATCH
