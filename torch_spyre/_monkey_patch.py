@@ -15,7 +15,6 @@
 import copy
 
 from typing import Optional
-import torch._dynamo.guards as _dynamo_guards
 from torch._dynamo.guards import GuardBuilder
 from torch_spyre._C import get_spyre_tensor_layout, to_with_layout, empty_with_layout
 from torch_spyre._C import SpyreTensorLayout
@@ -128,12 +127,12 @@ def _patch_tensor_for_spyre():
             return
 
         # not a Spyre tensor → skip
-        if not hasattr(value, "device_tensor_layout"):
+        if value.device.type != "spyre":
             return
         # get layout safely
         try:
             expected_layout = value.device_tensor_layout()
-        except Exception:
+        except RuntimeError:
             return
         # deepcopy
         captured = copy.deepcopy(expected_layout)
