@@ -13,8 +13,8 @@
 # limitations under the License.
 
 import inspect
-import os
 from typing import Optional, Any, Callable, List
+from abc import abstractmethod
 
 import torch
 import torch.fx.graph
@@ -33,7 +33,9 @@ from .temp_passes import (
 from .stickify import propagate_spyre_tensor_layouts
 from .core_division import core_division_planning
 from .scratchpad import scratchpad_planning
+from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
+from . import config
 
 
 def _maybe_run_graph_pass(pass_fn, graph: torch.fx.graph.Graph) -> None:
@@ -65,7 +67,8 @@ class CustomPrePasses(CustomGraphPass):
 
     def uuid(self) -> Optional[Any]:
         files = [inspect.getfile(c) for c in CustomPrePasses.passes]
-        return get_hash_for_files(tuple(set(files + [__file__])))
+        # Use dict.fromkeys instead of set for deterministic order
+        return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))
 
 
 class CustomPostPasses(CustomGraphPass):
@@ -90,7 +93,8 @@ class CustomPostPasses(CustomGraphPass):
 
     def uuid(self) -> Optional[Any]:
         files = [inspect.getfile(c) for c in CustomPostPasses.passes]
-        return get_hash_for_files(tuple(set(files + [__file__])))
+        # Use dict.fromkeys instead of set for deterministic order
+        return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))
 
 
 def _maybe_run_scheduler_pass(
@@ -107,17 +111,47 @@ def _maybe_run_scheduler_pass(
     return nodes
 
 
-def scheduler_passes(nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+class CustomNodePassBase(CustomGraphPass):
+    def __call__(self, nodes: list[BaseSchedulerNode]) -> list[BaseSchedulerNode]:
+        for _pass in self.get_passes():
+            nodes = _maybe_run_scheduler_pass(_pass, nodes)
+        return nodes
+
+    @abstractmethod
+    def get_passes(
+        self,
+    ) -> list[Callable[[list[BaseSchedulerNode]], list[BaseSchedulerNode]]]:
+        pass
+
+    def uuid(self) -> Optional[Any]:
+        files = [inspect.getfile(c) for c in self.get_passes()]
+        return get_hash_for_files(tuple(dict.fromkeys(files + [__file__])))
+
+
+class CustomPreFusionPasses(CustomNodePassBase):
     """
     This inductor extension point enables Spyre-specific passes to run over
-    the graph of LoopLevelIR nodes immediately before fusion is applied.
+    the graph of LoopLevelIR nodes immediately before Inductor's fusion pass runs.
 
     The list of nodes is guarenteed by the caller to be in topological order.
     The returned list of nodes must also be in topological order.
     """
 
-    nodes = propagate_spyre_tensor_layouts(nodes)
-    nodes = core_division_planning(nodes)
-    if os.environ.get("LX_PLANNING", "0") == "1":
-        nodes = scratchpad_planning(nodes)
-    return nodes
+    def get_passes(self):
+        passes = [propagate_spyre_tensor_layouts, core_division_planning]
+        if config.lx_planning:
+            passes.append(scratchpad_planning)
+        return passes
+
+
+class CustomPostFusionPasses(CustomNodePassBase):
+    """
+    This inductor extension point enables Spyre-specific passes to run over
+    the graph of LoopLevelIR nodes immediately after Inductor's fusion pass runs.
+
+    The list of nodes is guarenteed by the caller to be in topological order.
+    The returned list of nodes must also be in topological order.
+    """
+
+    def get_passes(self):
+        return [spyre_fuse_nodes]

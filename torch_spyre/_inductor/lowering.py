@@ -17,7 +17,7 @@ from contextlib import contextmanager
 
 import torch
 
-from torch._inductor.ir import Reduction, Pointwise
+from torch._inductor.ir import ComputedBuffer, Reduction, Pointwise
 import torch._inductor.lowering as lowering
 
 from typing import Any, Callable, Union
@@ -239,8 +239,7 @@ def lower_mm(x, y):
 
     if reduction_numel == 1:
         # Reduction degenerates to a pointwise mul
-        # TODO: Arguments reversed to work around #1165
-        result = lowering.mul(y, x)
+        result = lowering.mul(x, y)
     else:
         result = Reduction.create(
             reduction_type=reduction_type,
@@ -311,8 +310,7 @@ def lower_bmm(x, y):
 
     if reduction_numel == 1:
         # Reduction degenerates to a pointwise mul
-        # TODO: Arguments reversed to work around #1165
-        result = lowering.mul(y, x)
+        result = lowering.mul(x, y)
     else:
         result = Reduction.create(
             reduction_type=BATCH_MATMUL_OP,
@@ -503,3 +501,43 @@ def clone(x, *, memory_format=None):
         result.realize()
         result.freeze_layout_with_stride_order(stride_order)
     return result
+
+
+@register_spyre_lowering(torch.ops.spyre.overwrite)
+def lower_overwrite(input, output, dim, offset):
+    fn = lowering.ops_wrapper(torch.ops.spyre.overwrite.__name__)
+
+    def inner_fn(index):
+        return fn(
+            input.make_loader()(index),
+            int(output.get_layout().stride[dim]),
+            offset,
+            int(output.get_layout().size[dim] - input.get_layout().size[dim]),
+        )
+
+    inp = Pointwise(
+        device=input.get_device(),
+        dtype=input.get_dtype(),
+        inner_fn=inner_fn,
+        ranges=input.get_size(),
+    )
+
+    output.realize()
+
+    try:
+        from torch._inductor.ir import MutationLayoutSHOULDREMOVE
+    except ImportError:
+        raise RuntimeError(
+            "spyre::overwrite lowering: MutationLayoutSHOULDREMOVE is not available. "
+            "Upstream likely removed/renamed it."
+        )
+
+    buffer = ComputedBuffer(
+        name=None,
+        layout=MutationLayoutSHOULDREMOVE(output),
+        data=inp,
+    )
+    buffer.name = V.graph.register_buffer(buffer)
+    V.graph.register_operation(buffer)
+
+    return output
