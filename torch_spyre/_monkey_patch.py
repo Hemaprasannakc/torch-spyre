@@ -33,7 +33,7 @@ def _patch_tensor_for_spyre():
 
     def spyre_aware_repr(self):
         dev = getattr(self, "device", None)
-        if dev is not None and dev.type == "spyre":
+        if dev is not None and dev.type == DEVICE_NAME:
             try:
                 s = orig_repr(self.to("cpu"))
             except Exception:
@@ -55,7 +55,7 @@ def _patch_tensor_for_spyre():
         return orig_repr(self)
 
     def device_tensor_layout(self: torch.Tensor) -> Optional[SpyreTensorLayout]:
-        if self.device is not None and self.device.type == "spyre":
+        if self.device is not None and self.device.type == DEVICE_NAME:
             return get_spyre_tensor_layout(self)
         else:
             return None
