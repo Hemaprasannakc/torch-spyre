@@ -130,11 +130,12 @@ def _patch_tensor_for_spyre():
         # not a Spyre tensor → skip
         if value.device.type != DEVICE_NAME:
             return
-        # get layout safely
-        try:
-            expected_layout = value.device_tensor_layout()
-        except RuntimeError:
+        # catch FakeTensor BEFORE calling device_tensor_layout()
+        if isinstance(value, torch._subclasses.FakeTensor):
             return
+            
+        # get layout safely
+        expected_layout = value.device_tensor_layout()
 
         # add lambda guard on tensor's child manager
         # same node as TENSOR_MATCH!
