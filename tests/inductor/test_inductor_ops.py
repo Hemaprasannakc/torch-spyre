@@ -183,6 +183,13 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((2, 99, 1), (2, 1, 55)),
                     ((2, 99, 1), (1, 55)),
                     ((2, 3, 99, 1), (2, 3, 1, 55)),
+                    # Test padding for mm/bmm.
+                    ((55, 2), (2, 99)),
+                    ((99, 65), (65, 55)),
+                    ((2, 55, 2), (2, 2, 99)),
+                    ((2, 99, 65), (2, 65, 55)),
+                    ((2, 3, 55, 2), (2, 3, 2, 99)),
+                    ((2, 3, 99, 65), (2, 3, 65, 55)),
                 ]
             ),
         },
@@ -815,6 +822,34 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     3,
                     cached_randn((2, 4, 8, 64), dtype=torch.float16),
                     cached_randn((2, 4, 8, 128), dtype=torch.float16),
+                ),
+                "4d_dim3_fp32": (
+                    3,
+                    cached_randn((2, 4, 3, 64), dtype=torch.float32),
+                    cached_randn((2, 4, 3, 32), dtype=torch.float32),
+                ),
+            },
+        },
+        (
+            "test_pad",
+            "test_pad_cpu",
+        ): {
+            "param_sets": {
+                "2d_last_dim_right": (
+                    cached_randn((3, 64), dtype=torch.float16),
+                    (0, 64),
+                ),
+                "2d_both_dims": (
+                    cached_randn((3, 64), dtype=torch.float16),
+                    (0, 64, 0, 2),
+                ),
+                "3d_last_dim_right": (
+                    cached_randn((2, 3, 64), dtype=torch.float16),
+                    (0, 64),
+                ),
+                "3d_dim1_right": (
+                    cached_randn((2, 3, 64), dtype=torch.float16),
+                    (0, 0, 0, 2),
                 ),
             },
         },
@@ -1800,6 +1835,30 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             return torch.cat(tensors, dim=dim)
 
         compare_with_cpu(fn, *tensors)
+
+    @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
+    def test_pad_cpu(self, x, pad):
+        """Compiled torch.nn.functional.pad (constant zero) on Spyre matches CPU."""
+
+        def fn(x):
+            return torch.nn.functional.pad(x, pad)
+
+        compare_with_cpu(fn, x)
+
+    def test_pad_unsupported(self):
+        """Padding cases that raise Unsupported due to logical decomposition constraints."""
+        from torch_spyre._inductor.errors import Unsupported
+
+        unsupported_cases = [
+            # Negative padding (cropping).
+            (cached_randn((3, 64), dtype=torch.float16), (0, -32)),
+            (cached_randn((4, 64), dtype=torch.float16), (0, 0, 0, -2)),
+        ]
+        from torch_spyre._inductor.decompositions import pad_decomp
+
+        for x, pad in unsupported_cases:
+            with pytest.raises(Unsupported):
+                pad_decomp(x, list(pad))
 
     @pytest.mark.filterwarnings("ignore::torch_spyre.ops.fallbacks.FallbackWarning")
     def test_full_cpu(self, *args):
