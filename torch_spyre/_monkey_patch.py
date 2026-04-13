@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+from torch_spyre.constants import DEVICE_NAME
 
 from typing import Optional
 from torch._dynamo.guards import GuardBuilder
@@ -142,7 +143,7 @@ def _patch_tensor_for_spyre():
         tensor_guard_manager = self.get_guard_manager(guard)
         tensor_guard_manager.add_lambda_guard(
             lambda x: (
-                not hasattr(x, "device_tensor_layout") or
+                x.device.type != DEVICE_NAME or
                 x.device_tensor_layout() == captured
             ),
             [f"SpyreTensorLayout({guard.name}) == {expected_layout}"],
