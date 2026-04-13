@@ -119,7 +119,7 @@ def _patch_tensor_for_spyre():
         _original_TENSOR_MATCH(self, guard, value=value)
         # get tensor value
         if value is None:
-            value = self.get(guard.name)
+            value = self.get(guard)
         ## dereference WeakRef if needed
         if isinstance(value, torch.utils.weak.TensorWeakRef):
             value = value()
