@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
+
 from torch_spyre.constants import DEVICE_NAME
 
 from typing import Optional
@@ -135,8 +135,6 @@ def _patch_tensor_for_spyre():
             expected_layout = value.device_tensor_layout()
         except RuntimeError:
             return
-        # deepcopy
-        captured = copy.deepcopy(expected_layout)
 
         # add lambda guard on tensor's child manager
         # same node as TENSOR_MATCH!
@@ -144,7 +142,7 @@ def _patch_tensor_for_spyre():
         tensor_guard_manager.add_lambda_guard(
             lambda x: (
                 x.device.type != DEVICE_NAME or
-                x.device_tensor_layout() == captured
+                x.device_tensor_layout() == expected_layout
             ),
             [f"SpyreTensorLayout({guard.name}) == {expected_layout}"],
         )
