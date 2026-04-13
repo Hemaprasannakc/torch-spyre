@@ -128,7 +128,7 @@ def _patch_tensor_for_spyre():
             return
 
         # not a Spyre tensor → skip
-        if value.device.type != "spyre":
+        if value.device.type != DEVICE_NAME:
             return
         # get layout safely
         try:
