@@ -57,7 +57,7 @@ def _patch_tensor_for_spyre():
     def device_tensor_layout(self: torch.Tensor) -> Optional[SpyreTensorLayout]:
         if self.device is not None and self.device.type == DEVICE_NAME:
             if isinstance(self, torch._subclasses.FakeTensor):
-                return None # catch FakeTensor BEFORE calling device_tensor_layout()
+                return None  # catch FakeTensor BEFORE calling device_tensor_layout()
             return get_spyre_tensor_layout(self)
         else:
             return None
@@ -132,7 +132,7 @@ def _patch_tensor_for_spyre():
         # not a Spyre tensor → skip
         if value.device.type != DEVICE_NAME:
             return
-            
+
         # get layout safely
         expected_layout = value.device_tensor_layout()
         if expected_layout is None:
@@ -143,8 +143,8 @@ def _patch_tensor_for_spyre():
         tensor_guard_manager = self.get_guard_manager(guard)
         tensor_guard_manager.add_lambda_guard(
             lambda x: (
-                x.device.type != DEVICE_NAME or
-                x.device_tensor_layout() == expected_layout
+                x.device.type != DEVICE_NAME
+                or x.device_tensor_layout() == expected_layout
             ),
             [f"SpyreTensorLayout({guard.name}) == {expected_layout}"],
         )
