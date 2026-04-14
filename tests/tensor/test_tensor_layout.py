@@ -193,6 +193,39 @@ class TestSpyreTensorLayout(TestCase):
             str(context.exception),
         )
 
+    def test_spyre_tensor_layout_guard(self):
+        """
+        Verify that torch.compile recompiles when SpyreTensorLayout changes
+        between calls. Two tensors with same shape but different layout must
+        produce separate compiled graphs — regression test for issue #1297.
+        """
+        x = torch.rand([512, 256], dtype=torch.float16)
+        stl_default = SpyreTensorLayout([512, 256], torch.float16)
+        stl_custom = SpyreTensorLayout(x.size(), x.stride(), torch.float16, [1, 0])
+        _ = x.to("spyre")  # required for lazy device initialization
+
+        tensor_default = x.to(device_layout=stl_default)
+        tensor_custom = x.to(device_layout=stl_custom)
+
+        def simple_add(a):
+            return a + a
+
+        torch._dynamo.reset()
+        torch._dynamo.utils.counters.clear()
+        compiled = torch.compile(simple_add)
+
+        compiled(tensor_default)
+        count_after_default = torch._dynamo.utils.counters["stats"]["calls_captured"]
+
+        compiled(tensor_custom)
+        count_after_custom = torch._dynamo.utils.counters["stats"]["calls_captured"]
+
+        self.assertGreater(
+            count_after_custom,
+            count_after_default,
+            "Expected recompilation when SpyreTensorLayout changes between calls",
+        )
+
 
 if __name__ == "__main__":
     run_tests()
