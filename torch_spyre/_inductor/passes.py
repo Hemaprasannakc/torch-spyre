@@ -42,6 +42,7 @@ from .core_division import core_division_planning
 from .scratchpad import scratchpad_planning
 from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
+from .deadcode_elimination import deadcode_elimination
 
 
 logger = get_inductor_logger("passes")
@@ -57,7 +58,6 @@ def _format_operations(operations: list[Operation]) -> str:
                 buf.write(f"\n  allocation={allocation}")
             if splits := getattr(op, "op_it_space_splits", None):
                 buf.write(f"\n  op_it_space_splits={splits}")
-                buf.write(f"\n  op_it_space_sizes={op.op_it_space_sizes}")
             buf.write(f"\n  {op.data}")
         buf.write("\n\n")
     return buf.getvalue()
@@ -210,6 +210,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         if logger.isEnabledFor(logging.INFO):
             logger.info("BEFORE PRE-SCHEDULING\n%s", _format_operations(operations))
 
+        deadcode_elimination(operations)
         propagate_spyre_tensor_layouts(operations)
         insert_restickify(operations)
         core_division_planning(operations)
@@ -221,6 +222,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
 
     def uuid(self) -> Optional[Any]:
         files = [
+            inspect.getfile(deadcode_elimination),
             inspect.getfile(propagate_spyre_tensor_layouts),
             inspect.getfile(insert_restickify),
             inspect.getfile(core_division_planning),
