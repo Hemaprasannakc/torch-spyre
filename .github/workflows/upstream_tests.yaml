@@ -91,7 +91,7 @@ jobs:
 
       - name: Restore PyTorch source from cache
         id: pytorch-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: pytorch
           key: pytorch-${{ steps.pytorch-branch.outputs.branch }}-${{ steps.pytorch-sha.outputs.sha }}
@@ -108,26 +108,17 @@ jobs:
       - name: Set TORCH_ROOT
         run: echo "TORCH_ROOT=$GITHUB_WORKSPACE/pytorch" >> "$GITHUB_ENV"
 
-      - name: Gather environment info
-        run: |
-          echo 'gather info start'
-          pwd
-          ls -la
-          whoami
-          id
-          echo "GHA_RUNNER_POD_NODE_NAME $GHA_RUNNER_POD_NODE_NAME"
-          echo "PATH $PATH"
-          echo "HOME $HOME"
-          echo "TORCH_ROOT $TORCH_ROOT"
-          python3 --version
-          python3 -c 'import sys; print(sys.path)'
-          echo 'gather info end'
+      - name: Set up uv
+        uses: astral-sh/setup-uv@6ee6290f1cbc4156c0bdd66691b2c144ef8df19a # v7.1.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            torch-spyre/uv.lock
+            torch-spyre/pyproject.toml
 
       - name: Install torch-spyre package and dependencies
         working-directory: torch-spyre
         run: |
-          echo 'installing with dependencies, this could take a while...'
-          pip install uv
           uv sync --all-extras --active --inexact --reinstall-package torch-spyre -v
           uv pip install pydantic
 
