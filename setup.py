@@ -12,10 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
+import hashlib
 import os
 import shutil
 from pathlib import Path
-from typing import cast
 
 os.environ.setdefault(
     "TORCH_DEVICE_BACKEND_AUTOLOAD", "0"
@@ -34,11 +35,12 @@ PACKAGE_NAME = "torch_spyre"
 
 
 def get_torch_spyre_version() -> str:
-    version_ns: dict[str, object] = {}
+    """Extract __version__ from version.py without executing arbitrary code."""
     with open(f"{PATH_NAME}/version.py") as f:
-        exec(f.read(), version_ns)
-        version = cast(str, version_ns["__version__"])
-    return version
+        for line in f:
+            if line.startswith("__version__"):
+                return ast.literal_eval(line.split("=", 1)[1].strip())
+    raise RuntimeError("Unable to find __version__ in version.py")
 
 
 version = get_torch_spyre_version()
@@ -69,11 +71,25 @@ def maybe_download_nlohmann_json():
     NLOHMANN_INC_DIR = SHARED_PATH / "nlohmann" / "include"
     NLOHMANN_DIR = NLOHMANN_INC_DIR / "nlohmann"
 
+    # SHA-256 digest of the expected file content (v3.11.2).
+    NLOHMANN_SHA256 = "665fa14b8af3837966949e8eb0052d583e2ac105d3438baba9951785512cf921"
+
     NLOHMANN_HEADER = os.path.join(NLOHMANN_DIR, "json.hpp")
     if not os.path.exists(NLOHMANN_HEADER):
         os.makedirs(NLOHMANN_DIR, exist_ok=True)
         print("Downloading nlohmann/json.hpp...")
         urllib.request.urlretrieve(NLOHMANN_URL, NLOHMANN_HEADER)
+
+    # Verify integrity of the downloaded (or pre-existing) header.
+    with open(NLOHMANN_HEADER, "rb") as fh:
+        actual_hash = hashlib.sha256(fh.read()).hexdigest()
+    if actual_hash != NLOHMANN_SHA256:
+        os.remove(NLOHMANN_HEADER)
+        raise RuntimeError(
+            f"Hash mismatch for nlohmann/json.hpp: "
+            f"expected {NLOHMANN_SHA256}, got {actual_hash}"
+        )
+
     return NLOHMANN_INC_DIR
 
 
