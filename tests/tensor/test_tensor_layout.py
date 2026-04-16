@@ -214,16 +214,29 @@ class TestSpyreTensorLayout(TestCase):
         torch._dynamo.utils.counters.clear()
         compiled = torch.compile(simple_add)
 
+        # call 1 — default layout → compiles new graph
         compiled(tensor_default)
         count_after_default = torch._dynamo.utils.counters["stats"]["calls_captured"]
 
+        # call 2 — different layout → guard fails → recompile expected
         compiled(tensor_custom)
         count_after_custom = torch._dynamo.utils.counters["stats"]["calls_captured"]
 
-        self.assertGreater(
+        self.assertEqual(
             count_after_custom,
-            count_after_default,
+            count_after_default + 1,
             "Expected recompilation when SpyreTensorLayout changes between calls",
+        )
+
+        # call 3 — same custom layout again → cache hit → no recompile expected
+        compiled(tensor_custom)
+        count_after_custom_second = torch._dynamo.utils.counters["stats"][
+            "calls_captured"
+        ]
+        self.assertEqual(
+            count_after_custom_second,
+            count_after_custom,
+            "Expected cache hit when SpyreTensorLayout is the same as previous call",
         )
 
 
