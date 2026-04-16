@@ -386,6 +386,126 @@ class TestSpyre(TestCase):
         cls = ns["_TestMROCheckPRIVATEUSE1"]
         assert issubclass(cls, TestCase)
 
+    def test_test_spyre_model_ops_inherits_from_testcase(self):
+        """Regression test: TestSpyreModelOps must inherit from TestCase,
+        not from PrivateUse1TestBase.
+
+        Commit e5d4344 ("[test] fix inappropriate inheritance in
+        TestSpyreModelOps (#1517)") changed the base class from
+        PrivateUse1TestBase to TestCase to avoid an MRO conflict when
+        instantiate_device_type_tests creates a dynamic subclass.
+
+        This test statically inspects tests/models/test_model_ops.py via
+        the ``ast`` module so it works without importing the heavy
+        model-testing dependencies (model_cases_loader, runner, etc.).
+        """
+        import ast
+        from pathlib import Path
+
+        src = (
+            Path(__file__).resolve().parent / "models" / "test_model_ops.py"
+        ).read_text()
+        tree = ast.parse(src, filename="test_model_ops.py")
+
+        # Locate the TestSpyreModelOps class definition
+        cls_node = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "TestSpyreModelOps":
+                cls_node = node
+                break
+
+        assert cls_node is not None, (
+            "TestSpyreModelOps class not found in test_model_ops.py"
+        )
+
+        base_names = []
+        for base in cls_node.bases:
+            if isinstance(base, ast.Name):
+                base_names.append(base.id)
+            elif isinstance(base, ast.Attribute):
+                base_names.append(base.attr)
+
+        # Must inherit from TestCase
+        assert "TestCase" in base_names, (
+            f"TestSpyreModelOps should inherit from TestCase, "
+            f"but bases are: {base_names}"
+        )
+
+        # Must NOT inherit from PrivateUse1TestBase (the old, broken base)
+        assert "PrivateUse1TestBase" not in base_names, (
+            "TestSpyreModelOps must not inherit from PrivateUse1TestBase "
+            "(causes MRO conflict with instantiate_device_type_tests)"
+        )
+
+    def test_test_spyre_model_ops_instantiate_uses_only_for(self):
+        """Regression test: instantiate_device_type_tests for
+        TestSpyreModelOps must use only_for=("privateuse1",).
+
+        Without only_for, a TestCase-based class would be instantiated
+        for every available device type instead of only for Spyre.
+        """
+        import ast
+        from pathlib import Path
+
+        src = (
+            Path(__file__).resolve().parent / "models" / "test_model_ops.py"
+        ).read_text()
+        tree = ast.parse(src, filename="test_model_ops.py")
+
+        # Find all top-level calls to instantiate_device_type_tests
+        found_call = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = None
+            if isinstance(func, ast.Name):
+                name = func.id
+            elif isinstance(func, ast.Attribute):
+                name = func.attr
+            if name != "instantiate_device_type_tests":
+                continue
+
+            # Check if the first positional arg references TestSpyreModelOps
+            if not node.args:
+                continue
+            first_arg = node.args[0]
+            arg_name = None
+            if isinstance(first_arg, ast.Name):
+                arg_name = first_arg.id
+            if arg_name != "TestSpyreModelOps":
+                continue
+
+            found_call = True
+
+            # Verify only_for keyword argument is present
+            only_for_kw = None
+            for kw in node.keywords:
+                if kw.arg == "only_for":
+                    only_for_kw = kw
+                    break
+
+            assert only_for_kw is not None, (
+                "instantiate_device_type_tests(TestSpyreModelOps, ...) "
+                "must include only_for keyword argument"
+            )
+
+            # Verify only_for contains "privateuse1"
+            if isinstance(only_for_kw.value, ast.Tuple):
+                elts = [
+                    e.value
+                    for e in only_for_kw.value.elts
+                    if isinstance(e, ast.Constant)
+                ]
+                assert "privateuse1" in elts, (
+                    f"only_for should contain 'privateuse1', got {elts}"
+                )
+
+        assert found_call, (
+            "No call to instantiate_device_type_tests(TestSpyreModelOps, ...) "
+            "found in test_model_ops.py"
+        )
+
 
 if __name__ == "__main__":
     run_tests()
