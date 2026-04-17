@@ -55,6 +55,7 @@ def _make_2d_tensors(s1, s2):
 SIZES_2D_FULL = [
     (256, 128),
     (128, 256),
+    (128, 128),
     (64, 128),
     (128, 64),
 ]
@@ -136,6 +137,15 @@ def test_4arg_x_at_y_bt(tensors_multiarg):
 def test_4arg_at_x_y_bt(tensors_multiarg):
     A, B, X, Y = tensors_multiarg
     _compare(lambda a, b, x, y: a.t() + x + y + b.t(), A, B, X, Y)
+
+
+def test_4arg_a_bt_c_d_square():
+    s = 128
+    A = torch.randn((s, s), dtype=torch.float16)
+    B = torch.randn((s, s), dtype=torch.float16)
+    C = torch.randn((s, s), dtype=torch.float16)
+    D = torch.randn((s, s), dtype=torch.float16)
+    _compare(lambda a, b, c, d: a + b.t() + c + d, A, B, C, D)
 
 
 # 3D tests
