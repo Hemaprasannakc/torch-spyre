@@ -503,6 +503,11 @@ def clone(x, *, memory_format=None):
     return result
 
 
+@register_spyre_lowering(torch.ops.spyre.copy_from_d2d)
+def lower_spyre_from_d2d(src, dst):
+    lowering.mutate_to(dst, src)
+
+
 @register_spyre_lowering(torch.ops.spyre.overwrite)
 def lower_overwrite(input, output, dims, offsets):
     fn = lowering.ops_wrapper(torch.ops.spyre.overwrite.__name__)
@@ -577,3 +582,9 @@ def lower_restickify(x):
 
     pw.realize()
     return pw
+
+
+@register_spyre_lowering(torch.ops.aten.slice.Tensor, type_promotion_kind=None)
+def lower_slice(x, dim=0, start=None, end=None, step=1):
+    result = lowering.slice_(x, dim=dim, start=start, end=end, step=step)
+    return clone(result, memory_format=torch.contiguous_format)
