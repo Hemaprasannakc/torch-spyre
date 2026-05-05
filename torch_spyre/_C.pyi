@@ -17,10 +17,8 @@ __all__: list[str] = [
     "set_current_stream",
     "synchronize",
     "as_strided_with_layout",
-    "convert_artifacts",
     "empty_with_layout",
-    "copy_device_to_host",
-    "copy_host_to_device",
+    "copy_tensor",
     "encode_constant",
     "free_runtime",
     "get_device_dtype",
@@ -240,24 +238,14 @@ def as_strided_with_layout(
     arg3: typing.SupportsInt | None,
     arg4: SpyreTensorLayout,
 ) -> torch.Tensor: ...
-def convert_artifacts(arg0: str) -> None: ...
-def copy_host_to_device(self: torch.Tensor, dst: torch.Tensor) -> None:
+def copy_tensor(
+    self: torch.Tensor, dst: torch.Tensor, non_blocking: bool = False
+) -> None:
     """
-    Copy tensor from host to device using DMA.
+    Copy tensor
 
     Args:
-        self: Source tensor on CPU
-        dst: Destination tensor on Spyre device
-    """
-    ...
-
-def copy_device_to_host(self: torch.Tensor, dst: torch.Tensor) -> None:
-    """
-    Copy tensor from device to host using DMA.
-
-    Args:
-        self: Source tensor on Spyre device
-        dst: Destination tensor on CPU
+        self or dst: one of that must be on spyre device
     """
     ...
 
@@ -279,7 +267,9 @@ def get_downcast_warning() -> bool:
 
 def get_elem_in_stick(arg0: torch.dtype) -> int: ...
 def get_spyre_tensor_layout(arg0: torch.Tensor) -> SpyreTensorLayout: ...
-def launch_kernel(arg0: str, arg1: collections.abc.Sequence[torch.Tensor]) -> None: ...
+def launch_kernel(
+    code_dir: str, args: collections.abc.Sequence[torch.Tensor]
+) -> None: ...
 def set_downcast_warning(arg0: bool) -> None:
     """
     Enable/disable downcast warnings for this process.
