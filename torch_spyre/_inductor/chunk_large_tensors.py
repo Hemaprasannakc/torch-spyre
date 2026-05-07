@@ -12,17 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Split pointwise ops whose device memory exceeds the hardware span limit.
+"""Split oversized pointwise ops into memory-safe chunks.
 
-Runs after ``propagate_spyre_tensor_layouts`` and ``insert_restickify`` so
-that every ``ComputedBuffer`` already carries a ``FixedTiledLayout``.
-``core_division_planning`` sees the resulting chunks as normal ops.
+Runs after ``propagate_spyre_tensor_layouts`` / ``insert_restickify`` and
+before ``core_division_planning``.  Each chunk becomes a normal
+``ComputedBuffer`` that core-division handles without special-casing.
 """
 
 import math
 
 import torch
-import torch._inductor.lowering as ind_lowering
+from torch._inductor import lowering as ind_lowering
 from torch._inductor.ir import (
     ComputedBuffer,
     MutationLayoutSHOULDREMOVE,
@@ -40,38 +40,40 @@ from .logging_utils import get_inductor_logger
 logger = get_inductor_logger("chunk_large_tensors")
 
 
-def _needs_chunking(op: ComputedBuffer, max_cores: int) -> int | None:
-    """Return total device bytes when they exceed *MAX_SPAN_BYTES * max_cores*.
-
-    ``op.layout`` is already a ``FixedTiledLayout`` at this point so we can
-    read ``device_size`` directly.  Returns ``None`` when chunking is not
-    needed.
-    """
-    device_layout = op.layout.device_layout
-    total_bytes = (
-        math.prod(int(s) for s in device_layout.device_size) * op.layout.dtype.itemsize
-    )
-    return total_bytes if total_bytes > MAX_SPAN_BYTES * max_cores else None
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 
-def _find_split_dim(op: ComputedBuffer) -> int:
-    """Return the host dimension index to split on.
-
-    Walks device dimensions outermost-to-innermost (skipping the last
-    within-stick dimension) and returns the first host dimension whose
-    stride matches and whose size is greater than one.
-    """
+def _needs_chunking(
+    op: ComputedBuffer, max_cores: int
+) -> tuple[int, FixedTiledLayout] | None:
+    """Return ``(total_device_bytes, layout)`` when the op exceeds capacity."""
     layout = op.layout
-    device_layout = layout.device_layout
+    device_size = layout.device_layout.device_size
+    total_bytes = math.prod(int(s) for s in device_size) * layout.dtype.itemsize
+    if total_bytes > MAX_SPAN_BYTES * max_cores:
+        return total_bytes, layout
+    return None
+
+
+def _find_split_dim(layout: FixedTiledLayout) -> int:
+    """Pick the host dimension to split along.
+
+    Walks device dims outermost-first (skipping the within-stick dim) and
+    returns the first host dim whose size > 1.  Falls back to the largest
+    host dim.
+    """
+    stl = layout.device_layout
     host_size = [int(s) for s in layout.size]
     host_stride = [int(s) for s in layout.stride]
 
-    for device_dim in range(len(device_layout.device_size) - 1):
-        stride_val = int(device_layout.stride_map[device_dim])
-        if stride_val <= 0:
+    for device_dim in range(len(stl.device_size) - 1):
+        sm = int(stl.stride_map[device_dim])
+        if sm <= 0:
             continue
         host_dim = next(
-            (d for d, s in enumerate(host_stride) if s == stride_val),
+            (d for d, s in enumerate(host_stride) if s == sm),
             None,
         )
         if host_dim is not None and host_size[host_dim] > 1:
@@ -82,38 +84,31 @@ def _find_split_dim(op: ComputedBuffer) -> int:
 
 def _make_chunk_layout(
     original_ftl: FixedTiledLayout,
-    split_dim: int,
+    split_dim_idx: int,
     chunk_size: int,
 ) -> FixedTiledLayout:
-    """Build a ``FixedTiledLayout`` for a single chunk.
-
-    The host size along *split_dim* is shrunk to *chunk_size*; strides are
-    recomputed for a contiguous layout.
-    """
+    """Build a ``FixedTiledLayout`` for a single chunk."""
     from torch_spyre._C import SpyreTensorLayout
 
-    chunk_host_size = list(original_ftl.size)
-    chunk_host_size[split_dim] = chunk_size
+    host_size = [int(s) for s in original_ftl.size]
+    host_size[split_dim_idx] = chunk_size
 
-    chunk_stride = [1] * len(chunk_host_size)
-    for d in range(len(chunk_host_size) - 2, -1, -1):
-        chunk_stride[d] = chunk_stride[d + 1] * chunk_host_size[d + 1]
+    host_stride = [1] * len(host_size)
+    for d in range(len(host_size) - 2, -1, -1):
+        host_stride[d] = host_stride[d + 1] * host_size[d + 1]
 
-    chunk_stl = SpyreTensorLayout(
-        [int(s) for s in chunk_host_size],
-        original_ftl.dtype,
-    )
+    stl = SpyreTensorLayout(host_size, original_ftl.dtype)
     return FixedTiledLayout(
         original_ftl.device,
         original_ftl.dtype,
-        chunk_host_size,
-        chunk_stride,
-        chunk_stl,
+        host_size,
+        host_stride,
+        stl,
     )
 
 
-def _make_chunk_inner_fn(orig_fn, dim: int, offset: int):
-    """Return an ``inner_fn`` that shifts *dim* by *offset*."""
+def _make_chunk_fn(orig_fn, dim: int, offset: int):
+    """Return an ``inner_fn`` that reads from *orig_fn* with *offset* on *dim*."""
 
     def inner_fn(index):
         idx = list(index)
@@ -123,41 +118,45 @@ def _make_chunk_inner_fn(orig_fn, dim: int, offset: int):
     return inner_fn
 
 
-def _make_overwrite_inner_fn(loader, overwrite_fn):
-    """Return an ``inner_fn`` wrapping *loader* through the overwrite op."""
+def _make_overwrite_fn(overwrite_op, loader, offset: int, split_dim: int):
+    """Return ``(inner_fn, output_indexer)`` for an overwrite-scatter."""
 
     def inner_fn(index):
-        return overwrite_fn(loader(index))
-
-    return inner_fn
-
-
-def _make_output_indexer(dim: int, offset: int):
-    """Return an ``output_indexer`` that shifts *dim* by *offset*."""
+        return overwrite_op(loader(index))
 
     def output_indexer(index):
-        out_index = [*index]
-        out_index[dim] += offset
-        return out_index
+        out = list(index)
+        out[split_dim] = out[split_dim] + offset
+        return out
 
-    return output_indexer
+    return inner_fn, output_indexer
 
 
-def _insert_op(
+def _register_and_insert(
     buf: ComputedBuffer,
+    op: ComputedBuffer,
     operations: list[Operation],
     insert_pos: int,
 ) -> int:
-    """Register *buf* in the graph and insert it into *operations*.
+    """Register *buf* in the graph and insert it at *insert_pos*.
 
-    Returns the next insertion position.
+    ``V.graph.register_operation`` appends to the same ``operations`` list,
+    so the duplicate is removed before the positioned insert.
+
+    Returns the next insert position.
     """
     buf.name = V.graph.register_buffer(buf)
     V.graph.register_operation(buf)
+    buf.origins = op.origins
     if buf in operations:
         operations.remove(buf)
     operations.insert(insert_pos, buf)
     return insert_pos + 1
+
+
+# ---------------------------------------------------------------------------
+# Core chunking logic
+# ---------------------------------------------------------------------------
 
 
 def _chunk_op(
@@ -166,24 +165,22 @@ def _chunk_op(
     operations: list[Operation],
     op_index: int,
     total_bytes: int,
+    original_ftl: FixedTiledLayout,
 ) -> None:
-    """Split *op* into chunks along the best device dimension."""
-    original_ftl = op.layout
     original_ranges = list(op.data.ranges)
     original_inner_fn = op.data.inner_fn
 
-    split_dim = _find_split_dim(op)
-    full_size = int(original_ranges[split_dim])
-    chunk_size = math.ceil(
-        full_size / math.ceil(total_bytes / (MAX_SPAN_BYTES * max_cores))
-    )
+    split_dim_idx = _find_split_dim(original_ftl)
+    full_size = int(original_ranges[split_dim_idx])
+    num_chunks = math.ceil(total_bytes / (MAX_SPAN_BYTES * max_cores))
+    chunk_size = math.ceil(full_size / num_chunks)
     num_chunks = math.ceil(full_size / chunk_size)
 
     logger.info(
         "Chunking %s: dim=%d, full_size=%d, num_chunks=%d, "
         "chunk_size=%d, total_bytes=%.2fGB",
         op.get_name(),
-        split_dim,
+        split_dim_idx,
         full_size,
         num_chunks,
         chunk_size,
@@ -192,66 +189,69 @@ def _chunk_op(
 
     overwrite_fn = ind_lowering.ops_wrapper(torch.ops.spyre.overwrite.__name__)
 
-    # --- chunk 0: shrink the original op's ranges in-place ---
-    # The layout stays full-size so the buffer storage is allocated at the
-    # original size; chunk 0 writes the first ``chunk_size`` rows directly.
+    # --- chunk 0: shrink the original op in-place -------------------------
+    # Layout stays full-size (buf0 is allocated at full size); only the
+    # iteration ranges are reduced so chunk 0 computes rows 0..chunk_size-1.
     chunk0_size = min(chunk_size, full_size)
     chunk0_ranges = list(original_ranges)
-    chunk0_ranges[split_dim] = chunk0_size
+    chunk0_ranges[split_dim_idx] = chunk0_size
     object.__setattr__(op.data, "ranges", chunk0_ranges)
 
-    # --- chunks 1..N-1: new compute buffer + overwrite into buf0 ---
+    # --- chunks 1..N-1: new compute + overwrite-scatter buffers -----------
     insert_pos = op_index + 1
+    mutation_target = op
 
     for c in range(1, num_chunks):
         offset = c * chunk_size
         this_chunk_size = min(chunk_size, full_size - offset)
-
         chunk_ranges = list(original_ranges)
-        chunk_ranges[split_dim] = this_chunk_size
+        chunk_ranges[split_dim_idx] = this_chunk_size
 
-        # -- pointwise compute for this chunk --
+        # -- compute buffer --
         chunk_pw = Pointwise(
             device=op.data.device,
             dtype=op.data.dtype,
-            inner_fn=_make_chunk_inner_fn(original_inner_fn, split_dim, offset),
+            inner_fn=_make_chunk_fn(original_inner_fn, split_dim_idx, offset),
             ranges=chunk_ranges,
         )
         object.__setattr__(chunk_pw, "origins", op.data.origins)
         object.__setattr__(chunk_pw, "traceback", op.data.traceback)
 
-        chunk_layout = _make_chunk_layout(original_ftl, split_dim, this_chunk_size)
+        chunk_layout = _make_chunk_layout(original_ftl, split_dim_idx, this_chunk_size)
         chunk_buf = ComputedBuffer(name=None, layout=chunk_layout, data=chunk_pw)
-        chunk_buf.origins = op.origins
-        insert_pos = _insert_op(chunk_buf, operations, insert_pos)
+        chunk_buf.origin_node = op.origin_node
+        insert_pos = _register_and_insert(chunk_buf, op, operations, insert_pos)
 
-        # -- scatter-overwrite into the original full-size buffer --
-        chunk_loader = chunk_buf.make_loader()
+        # -- overwrite-scatter buffer --
+        overwrite_inner, overwrite_indexer = _make_overwrite_fn(
+            overwrite_fn, chunk_buf.make_loader(), offset, split_dim_idx
+        )
         overwrite_data = Scatter(
             device=op.data.device,
             dtype=op.data.dtype,
-            inner_fn=_make_overwrite_inner_fn(chunk_loader, overwrite_fn),
+            inner_fn=overwrite_inner,
             ranges=chunk_ranges,
-            output_indexer=_make_output_indexer(split_dim, offset),
+            output_indexer=overwrite_indexer,
         )
-
         overwrite_buf = ComputedBuffer(
             name=None,
-            layout=MutationLayoutSHOULDREMOVE(op),
+            layout=MutationLayoutSHOULDREMOVE(mutation_target),
             data=overwrite_data,
         )
-        overwrite_buf.origins = op.origins
-        insert_pos = _insert_op(overwrite_buf, operations, insert_pos)
+        insert_pos = _register_and_insert(overwrite_buf, op, operations, insert_pos)
+        mutation_target = overwrite_buf
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 
 
 def chunk_large_tensors(operations: list[Operation]) -> None:
-    """Split pointwise ops whose device memory exceeds the hardware span limit.
+    """Split pointwise ops whose device footprint exceeds the hardware limit.
 
-    Only three-dimensional pointwise ``ComputedBuffer`` nodes with a
-    ``FixedTiledLayout`` are considered.  The pass runs **after**
-    ``propagate_spyre_tensor_layouts`` and ``insert_restickify`` so that
-    layouts are already assigned; ``core_division_planning`` runs afterwards
-    and treats the resulting chunks as ordinary operations.
+    Must run **after** ``propagate_spyre_tensor_layouts`` /
+    ``insert_restickify`` and **before** ``core_division_planning``.
     """
     max_cores = config.sencores
     i = 0
@@ -263,7 +263,8 @@ def chunk_large_tensors(operations: list[Operation]) -> None:
             and isinstance(op.layout, FixedTiledLayout)
             and len(op.data.ranges) == 3
         ):
-            total_bytes = _needs_chunking(op, max_cores)
-            if total_bytes is not None:
-                _chunk_op(op, max_cores, operations, i, total_bytes)
+            result = _needs_chunking(op, max_cores)
+            if result is not None:
+                total_bytes, layout = result
+                _chunk_op(op, max_cores, operations, i, total_bytes, layout)
         i += 1
