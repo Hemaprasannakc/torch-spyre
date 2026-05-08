@@ -54,6 +54,7 @@ from .fusion import spyre_fuse_nodes
 from .constants import DEVICE_NAME
 from .deadcode_elimination import deadcode_elimination
 from .dedup_constants import dedup_and_promote_constants
+from .chunk_large_tensors import chunk_large_tensors
 
 
 logger = get_inductor_logger("passes")
@@ -241,6 +242,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         insert_restickify(operations)
         insert_bmm_padding(operations)
         dedup_and_promote_constants(operations)
+        chunk_large_tensors(operations)
         span_reduction(operations)
         k_fast_ops = (
             k_fast_division(operations) if config.core_id_k_fast_emission else []
@@ -260,6 +262,7 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             inspect.getfile(optimize_restickify_locations),
             inspect.getfile(insert_restickify),
             inspect.getfile(insert_bmm_padding),
+            inspect.getfile(chunk_large_tensors),
             inspect.getfile(span_reduction),
             inspect.getfile(work_distribution),
             inspect.getfile(k_fast_division),
