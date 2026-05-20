@@ -242,7 +242,8 @@ class CustomPreSchedulingPasses(CustomGraphPass):
         insert_restickify(operations)
         insert_bmm_padding(operations)
         dedup_and_promote_constants(operations)
-        chunk_large_tensors(operations)
+        if config.chunk_large_tensors:
+            chunk_large_tensors(operations)
         span_reduction(operations)
         k_fast_ops = (
             k_fast_division(operations) if config.core_id_k_fast_emission else []
