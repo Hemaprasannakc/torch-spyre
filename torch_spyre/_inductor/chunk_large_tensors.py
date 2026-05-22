@@ -343,7 +343,7 @@ def _chunk_op(
     op_index: int,
     chunking_info: ChunkingInfo,
     original_ftl: FixedTiledLayout,
-) -> None:
+) -> int:
     """Split *op* into memory-safe chunks along the controlling dim.
 
     Chunk 0 is the original op shrunk in-place (ranges only; layout
@@ -398,6 +398,7 @@ def _chunk_op(
     object.__setattr__(op.data, "ranges", chunk0_ranges)
 
     insert_pos = op_index + 1
+    n_inserted = 0
 
     # -- Chunks 1..N-1: compute + overwrite-scatter pairs --
     for chunk_idx in range(1, num_chunks):
@@ -423,7 +424,7 @@ def _chunk_op(
         chunk_buf = ComputedBuffer(name=None, layout=chunk_layout, data=chunk_pw)
         chunk_buf.origin_node = op.origin_node
         insert_pos = _register_and_insert(chunk_buf, op, operations, insert_pos)
-
+        n_inserted += 1
         overwrite_inner, overwrite_indexer = _make_overwrite_fn(
             overwrite_fn,
             chunk_buf.make_loader(),
@@ -443,6 +444,8 @@ def _chunk_op(
             data=overwrite_data,
         )
         insert_pos = _register_and_insert(overwrite_buf, op, operations, insert_pos)
+        n_inserted += 1
+    return n_inserted
 
 
 def chunk_large_tensors(operations: list[Operation]) -> None:
@@ -458,7 +461,10 @@ def chunk_large_tensors(operations: list[Operation]) -> None:
     TODO: Use OpsHandler to verify output[i] only uses input[i].
     """
     max_cores = config.sencores
-    for i, op in enumerate(operations):
+    i = 0
+    while i < len(operations):
+        op = operations[i]
+
         if (
             isinstance(op, ComputedBuffer)
             and isinstance(op.data, Pointwise)
@@ -468,7 +474,7 @@ def chunk_large_tensors(operations: list[Operation]) -> None:
             controlling = _find_controlling_dim(op.layout, max_cores)
             chunking_info = _needs_chunking(op.layout, max_cores, controlling)
             if chunking_info is not None:
-                _chunk_op(
+                n_inserted = _chunk_op(
                     op,
                     max_cores,
                     operations,
@@ -476,3 +482,5 @@ def chunk_large_tensors(operations: list[Operation]) -> None:
                     chunking_info,
                     op.layout,
                 )
+                i += n_inserted
+            i += 1
