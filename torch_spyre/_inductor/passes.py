@@ -263,7 +263,6 @@ class CustomPreSchedulingPasses(CustomGraphPass):
             inspect.getfile(optimize_restickify_locations),
             inspect.getfile(insert_restickify),
             inspect.getfile(insert_bmm_padding),
-            inspect.getfile(insert_padding_ir),
             inspect.getfile(chunk_large_tensors),
             inspect.getfile(span_reduction),
             inspect.getfile(work_distribution),
