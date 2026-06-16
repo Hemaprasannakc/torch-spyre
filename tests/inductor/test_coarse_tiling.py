@@ -72,6 +72,7 @@ from torch_spyre._inductor.coarse_tile import (
     _REDUCTION_FREE_SYMS_KEY,
     _divide_ranges,
     coarse_tile,
+    span_overflow_groups,
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, TensorArg, UnimplementedOp
 from torch_spyre._inductor.scheduler import (
@@ -2961,6 +2962,249 @@ class TestReductionIdentityValues(unittest.TestCase):
         from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 
         self.assertEqual(self._identity(BATCH_MATMUL_OP), 0)
+
+
+# ===========================================================================
+# TestSpanOverflowGroups
+# ===========================================================================
+
+
+def _make_ftl(host_size, host_stride, dtype=torch.float16):
+    """Return a FixedTiledLayout with a SpyreTensorLayout built from host_size."""
+    from torch_spyre._C import SpyreTensorLayout
+    from torch_spyre._inductor.ir import FixedTiledLayout
+
+    stl = SpyreTensorLayout(host_size, dtype)
+    return FixedTiledLayout(
+        device=torch.device("cpu"),  # device is irrelevant for unit tests
+        dtype=dtype,
+        size=host_size,
+        stride=host_stride,
+        device_layout=stl,
+    )
+
+
+def _make_overflow_op(host_size, data_type="pointwise", name="op0"):
+    """Return a mock ComputedBuffer that overflows the 256 MB span limit.
+
+    host_size must be large enough that the device footprint exceeds 256 MB.
+    Contiguous strides are computed automatically.
+
+    data_type: "pointwise" or "reduction".  For "reduction", the last host
+    dim is treated as a reduction dim and is NOT reflected in op_out_coords;
+    a separate reduction_ranges list is attached to op.data.
+    """
+    from unittest.mock import MagicMock
+
+    import sympy
+    from torch._inductor.ir import ComputedBuffer, Pointwise, Reduction
+
+    # Contiguous host strides
+    stride = [1] * len(host_size)
+    for d in range(len(host_size) - 2, -1, -1):
+        stride[d] = stride[d + 1] * host_size[d + 1]
+
+    layout = _make_ftl(host_size, stride)
+
+    if data_type == "pointwise":
+        data = MagicMock(spec=Pointwise)
+        data.ranges = [sympy.Integer(s) for s in host_size]
+    else:
+        data = MagicMock(spec=Reduction)
+        # outer ranges = all but last dim; reduction_ranges = last dim
+        data.ranges = [sympy.Integer(s) for s in host_size[:-1]]
+        data.reduction_ranges = [sympy.Integer(host_size[-1])]
+
+    op = MagicMock(spec=ComputedBuffer)
+    op.data = data
+    op.layout = layout
+    op.get_name.return_value = name
+    op.get_operation_name.return_value = name
+    del op.loop_info
+
+    # Expose _test_out_coords for patching op_out_coords in tests.
+    n_outer = len(host_size) if data_type == "pointwise" else len(host_size) - 1
+    op._test_out_coords = [sympy.Symbol(f"c{i}") for i in range(n_outer)]
+
+    return op, layout
+
+
+class TestSpanOverflowGroups(unittest.TestCase):
+    """Unit tests for span_overflow_groups().
+
+    span_overflow_groups() walks graph.operations, detects ops whose device
+    footprint exceeds MAX_SPAN_BYTES, synthesises DimHints, and returns a
+    groups list in the same format as hints_to_coarse_tile_groups().
+    """
+
+    # fp16 = 2 bytes/element; 256 MB = 134_217_728 elements total.
+    # With 32 cores the total-bytes threshold is 256 MB * 32 = 8 GB.
+    # [8192, 1048576] = 16 GB total → reliably triggers _needs_chunking.
+    _OVERFLOW_SIZE = [8192, 1048576]  # 16 GB fp16, reliably overflows with 32 cores
+
+    def _graph_with_op(self, op):
+        return _graph([op])
+
+    def _run(self, op):
+        """Call span_overflow_groups with op_out_coords patched to _test_out_coords."""
+        from unittest.mock import patch
+
+        import torch_spyre._inductor.coarse_tile as ct_mod
+
+        op_impl = op
+
+        def patched_op_out_coords(o):
+            if o is op_impl:
+                return o._test_out_coords
+            raise AssertionError(f"unexpected op in op_out_coords: {o}")
+
+        with patch.object(ct_mod, "op_out_coords", patched_op_out_coords):
+            return span_overflow_groups(self._graph_with_op(op))
+
+    # ------------------------------------------------------------------
+    # Basic detection
+    # ------------------------------------------------------------------
+
+    def test_no_overflow_returns_empty(self):
+        """A small tensor that fits within 256 MB produces no groups."""
+        from unittest.mock import MagicMock
+
+        import sympy
+        from torch._inductor.ir import ComputedBuffer, Pointwise
+
+        # [64, 64] fp16 = 8 KB — no overflow
+        host_size = [64, 64]
+        stride = [64, 1]
+        layout = _make_ftl(host_size, stride)
+        data = MagicMock(spec=Pointwise)
+        data.ranges = [sympy.Integer(s) for s in host_size]
+        op = MagicMock(spec=ComputedBuffer)
+        op.data = data
+        op.layout = layout
+        op.get_name.return_value = "small_op"
+        op.get_operation_name.return_value = "small_op"
+        op._test_out_coords = [sympy.Symbol(f"c{i}") for i in range(len(host_size))]
+
+        groups = self._run(op)
+        self.assertEqual(groups, [])
+
+    def test_overflow_pointwise_returns_one_group(self):
+        """A large Pointwise op produces exactly one group."""
+        op, _ = _make_overflow_op(self._OVERFLOW_SIZE, "pointwise")
+        groups = self._run(op)
+        self.assertEqual(len(groups), 1)
+
+    def test_overflow_reduction_returns_one_group(self):
+        """A large Reduction op (outer dim overflows) produces exactly one group."""
+        # Outer dims: [1024, 262144], reduction_dim: [64]
+        op, _ = _make_overflow_op(self._OVERFLOW_SIZE + [64], "reduction")
+        groups = self._run(op)
+        self.assertEqual(len(groups), 1)
+
+    # ------------------------------------------------------------------
+    # Group structure
+    # ------------------------------------------------------------------
+
+    def test_group_structure(self):
+        """Each group is ([op], [(hint_id, trip_count, is_reduction_level)])."""
+        op, _ = _make_overflow_op(self._OVERFLOW_SIZE, "pointwise")
+        groups = self._run(op)
+        self.assertEqual(len(groups), 1)
+        ops_list, levels = groups[0]
+        self.assertEqual(len(ops_list), 1)
+        self.assertIs(ops_list[0], op)
+        self.assertEqual(len(levels), 1)
+        hint_id, count, is_reduction_level = levels[0]
+        self.assertEqual(hint_id, 0)
+        self.assertIsInstance(count, sympy.Integer)
+        self.assertGreater(int(count), 1)
+        self.assertFalse(is_reduction_level)
+
+    def test_dim_hint_attached_to_op(self):
+        """span_overflow_groups() attaches a DimHint to op.dim_hints."""
+        from torch_spyre._inductor.propagate_hints import DimHint
+
+        op, _ = _make_overflow_op(self._OVERFLOW_SIZE, "pointwise")
+        self._run(op)
+        self.assertTrue(hasattr(op, "dim_hints"))
+        self.assertEqual(len(op.dim_hints), 1)
+        h = op.dim_hints[0]
+        self.assertIsInstance(h, DimHint)
+        self.assertIsNotNone(h.loop_var)
+        self.assertEqual(h.hint_id, 0)
+        self.assertFalse(h.is_reduction)
+
+    def test_trip_count_matches_level_and_hint(self):
+        """The trip count on the DimHint matches the level count in the group."""
+        op, _ = _make_overflow_op(self._OVERFLOW_SIZE, "pointwise")
+        groups = self._run(op)
+        _, levels = groups[0]
+        _, level_count, _ = levels[0]
+        self.assertEqual(op.dim_hints[0].split_count, int(level_count))
+
+    # ------------------------------------------------------------------
+    # Multiple ops: one group per op
+    # ------------------------------------------------------------------
+
+    def test_two_overflow_ops_produce_two_groups(self):
+        """Two independent overflowing ops produce two separate groups."""
+        from unittest.mock import patch
+
+        import torch_spyre._inductor.coarse_tile as ct_mod
+
+        op0, _ = _make_overflow_op(self._OVERFLOW_SIZE, "pointwise", "op0")
+        op1, _ = _make_overflow_op(self._OVERFLOW_SIZE, "pointwise", "op1")
+
+        def patched_op_out_coords(o):
+            if o is op0:
+                return op0._test_out_coords
+            if o is op1:
+                return op1._test_out_coords
+            raise AssertionError(f"unexpected op: {o}")
+
+        with patch.object(ct_mod, "op_out_coords", patched_op_out_coords):
+            groups = span_overflow_groups(_graph([op0, op1]))
+
+        self.assertEqual(len(groups), 2)
+        self.assertIs(groups[0][0][0], op0)
+        self.assertIs(groups[1][0][0], op1)
+
+    def test_non_spyre_layout_skipped(self):
+        """Ops without FixedTiledLayout are skipped even if data is large."""
+        from unittest.mock import MagicMock
+
+        import sympy
+        from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
+
+        op = MagicMock(spec=ComputedBuffer)
+        op.data = MagicMock(spec=Pointwise)
+        op.data.ranges = [sympy.Integer(1024), sympy.Integer(262144)]
+        op.layout = MagicMock(spec=FixedLayout)
+        op.get_name.return_value = "non_spyre"
+        op.get_operation_name.return_value = "non_spyre"
+
+        groups = span_overflow_groups(_graph([op]))
+        self.assertEqual(groups, [])
+
+    def test_chunk_large_tensors_config_suppresses_groups(self):
+        """When config.chunk_large_tensors is True, span_overflow_groups returns empty."""
+        from unittest.mock import patch
+
+        import torch_spyre._inductor.coarse_tile as ct_mod
+        import torch_spyre._inductor.config as spyre_config
+
+        op, _ = _make_overflow_op(self._OVERFLOW_SIZE, "pointwise")
+
+        def patched_op_out_coords(o):
+            if o is op:
+                return o._test_out_coords
+            raise AssertionError(f"unexpected op: {o}")
+
+        with patch.object(spyre_config, "chunk_large_tensors", True):
+            with patch.object(ct_mod, "op_out_coords", patched_op_out_coords):
+                groups = span_overflow_groups(self._graph_with_op(op))
+
+        self.assertEqual(groups, [])
 
 
 if __name__ == "__main__":
