@@ -91,7 +91,18 @@ class ChunkingInfo:
     selected_device_span_stride_elems: int
     selected_host_dim: int
     stick_elems: int
+    outer_device_span_prefix_elems: int = 1
     reason: str | None = None
+
+
+@dataclass(frozen=True)
+class SpanDimInfo:
+    selected_host_dim: int
+    selected_device_dim_size: int
+    selected_device_span_stride_elems: int
+    core_split_estimate: int
+    outer_device_span_prefix_elems: int = 1
+    skipped_outer_device_dims: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -160,7 +171,7 @@ def _find_max_divisible_core_split(dim_size: int, max_cores: int) -> int:
 def _find_outermost_span_reduction_dim(
     layout: FixedTiledLayout,
     max_cores: int,
-) -> tuple[int, int, int, int] | None:
+) -> SpanDimInfo | None:
     """Find the outermost splittable device dim and its best core split.
 
     Walks device dims outer-to-inner (skipping stick dim). For each
@@ -171,12 +182,11 @@ def _find_outermost_span_reduction_dim(
     Splitting inner dims increases parallelism but does NOT reduce span.
     Splitting the stick dim is not supported (atomic memory unit).
 
-    Returns
-    -------
-    (selected_host_dim_idx, selected_device_dim_size, selected_device_span_stride_elems, core_split_estimate)
-        where core_split_estimate is the largest divisor of selected_device_dim_size
-        that is <= max_cores.  Returns None if no valid splittable
-        dim is found.
+    Returns a ``SpanDimInfo`` with the selected host dim, selected physical dim,
+    inner physical stride, and the best core split.  If small unchunkable outer
+    device dims are skipped, their product is recorded as
+    ``outer_device_span_prefix_elems`` so later span math still accounts for
+    that outer span.  Returns None if no valid splittable dim is found.
 
     Example::
 
@@ -188,8 +198,10 @@ def _find_outermost_span_reduction_dim(
         8193 = 3 * 2731 -> core_split_estimate = 3 (largest divisor <= 32)
         selected_device_span_stride_elems = 28 * 32 * 64 = 57344
 
-        -> returns (selected_host_dim=1, selected_device_dim_size=8193,
-                    selected_device_span_stride_elems=57344, core_split_estimate=3)
+        -> returns SpanDimInfo(selected_host_dim=1,
+                                selected_device_dim_size=8193,
+                                selected_device_span_stride_elems=57344,
+                                core_split_estimate=3)
     """
     stl = layout.device_layout
     device_size = [int(s) for s in stl.device_size]
@@ -197,9 +209,14 @@ def _find_outermost_span_reduction_dim(
     host_stride = [int(s) for s in layout.stride]
     stick_elems = stl.elems_per_stick()
 
+    outer_device_span_prefix_elems = 1
+    skipped_outer_device_dims: list[int] = []
+
     for device_dim in range(len(device_size) - 1):  # skip last=stick
         sm = int(stl.stride_map[device_dim])
         if sm <= 0:
+            outer_device_span_prefix_elems *= device_size[device_dim]
+            skipped_outer_device_dims.append(device_dim)
             continue
 
         # Collect host dims matching this device stride.  For a non-stick
@@ -216,6 +233,8 @@ def _find_outermost_span_reduction_dim(
         ]
 
         if not matching_dims:
+            outer_device_span_prefix_elems *= device_size[device_dim]
+            skipped_outer_device_dims.append(device_dim)
             continue
 
         selected_host_dim = matching_dims[0]
@@ -227,31 +246,21 @@ def _find_outermost_span_reduction_dim(
         selected_device_span_stride_elems = math.prod(device_size[device_dim + 1 :])
 
         # Device dims smaller than one stick cannot produce stick-aligned
-        # chunks.  If such an outer dim already violates the span limit, inner
-        # dims cannot reduce that span; fail early instead of generating chunks
-        # that work_division will still reject.
+        # chunks on that dim.  Instead of failing immediately, carry their
+        # physical size as an outer prefix and keep walking inward.  A later
+        # chunkable dim can still make the whole prefixed span safe, e.g.
+        # attention layouts with heads=32 followed by a large sequence dim.
         if selected_device_dim_size < stick_elems:
-            unsplit_span = (
-                selected_device_dim_size
-                * selected_device_span_stride_elems
-                * layout.dtype.itemsize
-            )
-            if unsplit_span > MAX_SPAN_BYTES:
-                raise Unsupported(
-                    "Cannot chunk layout below the hardware memory span limit: "
-                    f"outer device_dim {device_dim} maps to host dim "
-                    f"{selected_host_dim} with physical size "
-                    f"{selected_device_dim_size} < stick_elems={stick_elems}, "
-                    f"but its unsplit span is {unsplit_span} bytes. "
-                    "Chunking inner dimensions cannot reduce this span."
-                )
+            outer_device_span_prefix_elems *= selected_device_dim_size
+            skipped_outer_device_dims.append(device_dim)
             logger.debug(
                 "Skipping device_dim %d: selected_host_dim %d size=%d "
-                "< stick_elems=%d, cannot chunk",
+                "< stick_elems=%d, carrying outer prefix=%d",
                 device_dim,
                 selected_host_dim,
                 host_size[selected_host_dim],
                 stick_elems,
+                outer_device_span_prefix_elems,
             )
             continue
 
@@ -261,11 +270,13 @@ def _find_outermost_span_reduction_dim(
         core_split_estimate = _find_max_divisible_core_split(
             selected_device_dim_size, max_cores
         )
-        return (
-            selected_host_dim,
-            selected_device_dim_size,
-            selected_device_span_stride_elems,
-            core_split_estimate,
+        return SpanDimInfo(
+            selected_host_dim=selected_host_dim,
+            selected_device_dim_size=selected_device_dim_size,
+            selected_device_span_stride_elems=selected_device_span_stride_elems,
+            core_split_estimate=core_split_estimate,
+            outer_device_span_prefix_elems=outer_device_span_prefix_elems,
+            skipped_outer_device_dims=tuple(skipped_outer_device_dims),
         )
 
     return None
@@ -274,10 +285,21 @@ def _find_outermost_span_reduction_dim(
 def _choose_sticks_per_chunk(total_sticks: int, min_sticks: int) -> int:
     """Choose a stick chunk size with regular geometry when possible.
 
-    Prefer a divisor of ``total_sticks`` so chunks have equal stick counts.  Do
-    not choose ``total_sticks`` when the caller asked for multiple chunks, and
-    do not fall back to a tiny divisor that would create a very large number of
-    chunks for prime-like sizes.
+    ``min_sticks`` is the smallest chunk size implied by the required chunk
+    count, usually ``ceil(total_sticks / num_chunks)``.  This helper keeps that
+    as the lower safety target, then looks for a nearby divisor of
+    ``total_sticks`` so chunk sizes are regular.
+
+    Example: ``total_sticks=100`` and ``num_chunks=6`` gives
+    ``min_sticks=17``.  Using 17 would produce chunk stick counts
+    ``17, 17, 17, 17, 17, 15``.  This helper prefers 20 because it divides 100,
+    producing ``20, 20, 20, 20, 20``.  Later safety caps can still reduce the
+    chosen size if this regular chunk would violate span limits.
+
+    If no divisor exists at or above ``min_sticks``, try a nearby smaller
+    divisor, but not so small that it explodes the number of chunks for
+    prime-like sizes.  Fall back to ``min_sticks`` when no regular option is
+    available.
     """
     if min_sticks >= total_sticks:
         return total_sticks
@@ -320,11 +342,313 @@ def _compute_num_chunks(
     return max(num_from_span, num_from_unsplit_span, num_from_total)
 
 
+def _cap_chunk_size_for_unsplit_span(
+    chunking_info: ChunkingInfo,
+    original_ftl: FixedTiledLayout,
+    split_dim_full_size: int,
+    chunk_size: int,
+) -> tuple[int, int]:
+    """Cap host chunk size for the no-extra-core-split case.
+
+    The flow is:
+
+    1. ``_chunk_op`` chooses a split dimension.
+    2. ``_chunk_op`` chooses an initial, regular, stick-aligned ``chunk_size``
+       for that dimension.
+    3. This helper asks whether that chunk would still fit under the 256MB
+       hardware span limit if work division does not split this same dimension
+       any further.
+    4. If the chunk is already safe, keep ``chunk_size`` unchanged.
+    5. If the chunk is too large, reduce ``chunk_size`` to the largest host
+       element count that is physically safe.
+    6. Recompute and return ``num_chunks`` from the final ``chunk_size``.
+
+    The selected split dim comes from host/output ranges, so ``chunk_size`` is
+    measured in logical host elements.  The hardware span limit is measured in
+    the physical device layout.  This helper converts the physical 256MB span
+    limit back to host elements for the selected split dimension.
+
+    This is called the unsplit-span cap because it assumes work division cannot
+    spend additional cores on this same selected dimension after chunking.  If a
+    chunk is safe under that pessimistic assumption, it is also safe when work
+    division later does add a useful split.
+
+    Two common mappings exist:
+    - host dim and selected device dim have the same size, so one physical unit
+      corresponds to one host element;
+    - selected device dim is stick-packed, so one physical unit corresponds to
+      one stick, i.e. ``stick_elems`` host elements.
+    """
+    if (
+        chunking_info.selected_device_dim_size == 0
+        or chunking_info.selected_device_span_stride_elems == 0
+    ):
+        return chunk_size, math.ceil(split_dim_full_size / chunk_size)
+
+    stick_elems = chunking_info.stick_elems
+    host_elems_per_selected_device_unit = (
+        1
+        if chunking_info.selected_device_dim_size == split_dim_full_size
+        else stick_elems
+    )
+    # If we skipped small outer device dims before selecting this chunkable
+    # dim, every unit of the selected dim still carries that outer physical
+    # prefix.  Include it when converting the 256MB span limit into host elems.
+    bytes_per_selected_device_unit = (
+        chunking_info.outer_device_span_prefix_elems
+        * chunking_info.selected_device_span_stride_elems
+        * original_ftl.dtype.itemsize
+    )
+    max_safe_device_units_per_chunk = max(
+        1,
+        MAX_SPAN_BYTES // bytes_per_selected_device_unit,
+    )
+    max_safe_host_elems = (
+        max_safe_device_units_per_chunk * host_elems_per_selected_device_unit
+    )
+    if chunk_size > max_safe_host_elems:
+        chunk_size = max_safe_host_elems
+    num_chunks = math.ceil(split_dim_full_size / chunk_size)
+    return chunk_size, num_chunks
+
+
+def _cap_reduction_chunk_size_for_input_span(
+    reduction: Reduction,
+    original_ranges: list[int],
+    split_dim_idx: int,
+    split_dim_full_size: int,
+    stick_elems: int,
+    chunk_size: int,
+) -> tuple[int, int]:
+    """Cap reduction chunk size so input reads fit within 256MB.
+
+    The unsplit-span cap protects the chunk's selected output/write layout.  A
+    reduction also has input-read pressure: each output element reads all
+    ``reduction_ranges`` elements.  For one unit of the selected output split
+    dim, the input read covers:
+
+    ``product(other output ranges) * product(reduction_ranges)`` elements.
+
+    This helper converts that read volume into a maximum safe host chunk size,
+    keeps nonzero offsets stick-aligned, and returns the updated chunk count.
+    """
+    itemsize = reduction.dtype.itemsize
+    reduction_elems = math.prod(int(r) for r in reduction.reduction_ranges)
+    non_split_output_elems = math.prod(
+        size for dim, size in enumerate(original_ranges) if dim != split_dim_idx
+    )
+    input_elems_per_split_dim_unit = max(1, non_split_output_elems * reduction_elems)
+    max_chunk_size_for_input_span = max(
+        1, MAX_SPAN_BYTES // (input_elems_per_split_dim_unit * itemsize)
+    )
+    if chunk_size > max_chunk_size_for_input_span:
+        stick_aligned_max_chunk_size = max(
+            1, (max_chunk_size_for_input_span // stick_elems) * stick_elems
+        )
+        chunk_size = min(chunk_size, stick_aligned_max_chunk_size)
+    num_chunks = math.ceil(split_dim_full_size / chunk_size)
+    return chunk_size, num_chunks
+
+
+def _add_reduction_secondary_chunk_plans(
+    *,
+    op_name: str,
+    reduction: Reduction,
+    original_ranges: list[int],
+    original_ftl: FixedTiledLayout,
+    max_cores: int,
+    primary_split_dim_idx: int,
+    per_dim_chunk_plans: list[list[tuple[int, int]]],
+    stick_elems: int,
+) -> None:
+    """Add secondary output-dim chunks needed for reduction input reads.
+
+    ``primary_split_dim_idx`` is the main dimension chosen before entering
+    ``_chunk_op``.  It may have been chosen from either output-span pressure or
+    input-read pressure, but it is always an output dimension because reductions
+    only chunk ``Reduction.ranges``.
+
+    After the primary dimension is chunked, earlier output dims are still full
+    size by default.  For scalar reductions that can still make the input read
+    span exceed 256MB because the input keeps the original full-output stride
+    and also carries ``reduction_ranges``.
+
+    Before adding manual secondary chunks, estimate whether work_division can
+    split that earlier dim across SENCORES.  If that split would already bring
+    the input-read span under 256MB, leave the dim whole.  This avoids exploding
+    the chunk grid from ``primary_chunks`` to
+    ``primary_chunks * secondary_chunks`` when the scheduler can handle the
+    secondary dimension naturally.
+
+    Secondary chunking is limited to dims before the primary dim because the
+    chunk grid is built around the primary span-reduction dim.  That is why the
+    caller prefers the later dim as primary when input and output span analysis
+    choose different dims.
+    """
+    itemsize = reduction.dtype.itemsize
+    reduction_elems = math.prod(int(r) for r in reduction.reduction_ranges)
+
+    for secondary_dim_idx in range(primary_split_dim_idx):
+        secondary_dim_size = original_ranges[secondary_dim_idx]
+        if secondary_dim_size <= 1:
+            continue
+
+        # ``stride[secondary_dim_idx]`` says how many output elements are
+        # covered/skipped by one step in this dim.  For reductions, each of
+        # those output elements also reads every element in ``reduction_ranges``.
+        # Together, this is the input read span caused by one unit of this
+        # secondary dim.
+        input_read_elems_per_secondary_unit = (
+            int(original_ftl.stride[secondary_dim_idx]) * reduction_elems
+        )
+        full_secondary_input_span = (
+            secondary_dim_size * input_read_elems_per_secondary_unit * itemsize
+        )
+        if full_secondary_input_span <= MAX_SPAN_BYTES:
+            continue
+
+        best_secondary_core_split = _find_max_divisible_core_split(
+            secondary_dim_size,
+            max_cores,
+        )
+        per_core_secondary_input_span = (
+            math.ceil(secondary_dim_size / best_secondary_core_split)
+            * input_read_elems_per_secondary_unit
+            * itemsize
+        )
+        if per_core_secondary_input_span <= MAX_SPAN_BYTES:
+            logger.info(
+                "Skipping reduction input-span secondary chunking %s: "
+                "dim=%d full_size=%d full_input_span=%.2fMB "
+                "estimated_work_division_split=%d estimated_per_core_span=%.2fMB",
+                op_name,
+                secondary_dim_idx,
+                secondary_dim_size,
+                full_secondary_input_span / (1024**2),
+                best_secondary_core_split,
+                per_core_secondary_input_span / (1024**2),
+            )
+            continue
+
+        max_safe_secondary_chunk_size = max(
+            1,
+            MAX_SPAN_BYTES // (input_read_elems_per_secondary_unit * itemsize),
+        )
+        secondary_chunk_size = min(
+            secondary_dim_size,
+            max_safe_secondary_chunk_size,
+        )
+
+        # If this output dimension's row stride is not stick-aligned, arbitrary
+        # chunk offsets on the dim become non-stick-aligned storage offsets. That
+        # lowers to unsupported stick coordinates like ``Mod(d1, 64) + k``. Keep
+        # every nonzero offset a multiple of a full stick so the within-stick
+        # coordinate stays ``Mod(var,64)``.
+        if int(original_ftl.stride[secondary_dim_idx]) % stick_elems != 0:
+            aligned_chunk_size = (
+                max_safe_secondary_chunk_size // stick_elems
+            ) * stick_elems
+            if aligned_chunk_size < 1:
+                raise Unsupported(
+                    f"Cannot chunk {op_name} (reduction:"
+                    f"{reduction.reduction_type}) along dim "
+                    f"{secondary_dim_idx}: max safe chunk size "
+                    f"{max_safe_secondary_chunk_size} is smaller than stick "
+                    f"size {stick_elems}, and stride "
+                    f"{int(original_ftl.stride[secondary_dim_idx])} is not "
+                    "stick-aligned."
+                )
+            secondary_chunk_size = min(secondary_dim_size, aligned_chunk_size)
+
+        secondary_dim_chunk_plan: list[tuple[int, int]] = []
+        for offset in range(0, secondary_dim_size, secondary_chunk_size):
+            secondary_dim_chunk_plan.append(
+                (
+                    offset,
+                    min(secondary_chunk_size, secondary_dim_size - offset),
+                )
+            )
+        per_dim_chunk_plans[secondary_dim_idx] = secondary_dim_chunk_plan
+
+        logger.info(
+            "Reduction input-span secondary chunking %s: dim=%d full_size=%d "
+            "chunk_size=%d num_chunks=%d full_input_span=%.2fMB",
+            op_name,
+            secondary_dim_idx,
+            secondary_dim_size,
+            secondary_chunk_size,
+            len(secondary_dim_chunk_plan),
+            full_secondary_input_span / (1024**2),
+        )
+
+
+def _full_destination_write_span_failure(
+    layout: FixedTiledLayout,
+    max_cores: int,
+) -> str | None:
+    """Return a reason if a full-layout mutation write cannot fit.
+
+    Chunking shrinks loop ranges, but chunk 0 and Scatter mutation chunks still
+    write through the original destination layout.  work_division currently
+    checks that full physical layout, not the smaller Scatter slice.  This guard
+    models the outermost write-coordinate span that work_division must satisfy
+    before inner dimensions can help.
+    """
+    device_size = [int(s) for s in layout.device_layout.device_size]
+    itemsize = layout.dtype.itemsize
+
+    # This is intentionally conservative.  The failing mutation-layout path is
+    # the full-destination write span, and observed work_division behavior for
+    # these scatter writes may reserve/distribute cores so the outer write coord
+    # only gets a 4-way split even when SENCORES is larger.  Using all
+    # ``max_cores`` here would miss the exact failure we are trying to report
+    # early.  If work_division becomes Scatter-slice-aware, this guard can go
+    # away.
+    max_full_write_coord_split = min(max_cores, 4)
+
+    for device_dim, dim_size in enumerate(device_size[:-1]):
+        if dim_size <= 1:
+            continue
+
+        best_split = _find_max_divisible_core_split(
+            dim_size,
+            max_full_write_coord_split,
+        )
+        per_core_span = (
+            math.ceil(dim_size / best_split)
+            * math.prod(device_size[device_dim + 1 :])
+            * itemsize
+        )
+        if per_core_span <= MAX_SPAN_BYTES:
+            return None
+
+        return (
+            f"full destination write layout still has per-core span "
+            f"{per_core_span} bytes after best split d{device_dim}:{best_split}; "
+            f"limit is {MAX_SPAN_BYTES} bytes. device_size={device_size}"
+        )
+
+    total_bytes = math.prod(device_size) * itemsize
+    if total_bytes > MAX_SPAN_BYTES * max_cores:
+        return (
+            f"full destination write layout has total size {total_bytes} bytes; "
+            f"limit is {MAX_SPAN_BYTES * max_cores} bytes for SENCORES={max_cores}. "
+            f"device_size={device_size}"
+        )
+    return None
+
+
 def _chunk_bytes_fit(
     layout: FixedTiledLayout,
     max_cores: int,
 ) -> bool:
-    """Return True if a chunk layout fits the hardware span/total limits."""
+    """Return True if a planned chunk is already small enough.
+
+    Chunk planning is intentionally done once: pick chunk sizes, build the full
+    chunk grid, then validate every generated chunk.  If this returns False, the
+    planned chunk would still trigger ``_needs_chunking`` and we fail with a
+    clear ``Unsupported`` instead of recursively chunking a chunk.
+    """
     layout_span_reduction_dim_info = _find_outermost_span_reduction_dim(
         layout, max_cores
     )
@@ -341,7 +665,7 @@ def _chunk_bytes_fit(
 def _needs_chunking(
     layout: FixedTiledLayout,
     max_cores: int,
-    span_reduction_dim_info: tuple[int, int, int, int] | None,
+    span_reduction_dim_info: SpanDimInfo | None,
     *,
     op_name: str | None = None,
     trigger: str = "output_span",
@@ -384,6 +708,7 @@ def _needs_chunking(
                 selected_device_span_stride_elems=0,
                 selected_host_dim=fallback_selected_host_dim,
                 stick_elems=stick_elems,
+                outer_device_span_prefix_elems=1,
                 reason=(
                     "no device dimension could be mapped to a splittable "
                     "host dimension via stride_map; using largest host dim "
@@ -392,20 +717,27 @@ def _needs_chunking(
             )
         return None
 
-    (
-        selected_host_dim,
-        selected_device_dim_size,
-        selected_device_span_stride_elems,
-        core_split_estimate,
-    ) = span_reduction_dim_info
+    selected_host_dim = span_reduction_dim_info.selected_host_dim
+    selected_device_dim_size = span_reduction_dim_info.selected_device_dim_size
+    selected_device_span_stride_elems = (
+        span_reduction_dim_info.selected_device_span_stride_elems
+    )
+    core_split_estimate = span_reduction_dim_info.core_split_estimate
+    outer_device_span_prefix_elems = (
+        span_reduction_dim_info.outer_device_span_prefix_elems
+    )
 
     per_core_span = (
-        math.ceil(selected_device_dim_size / core_split_estimate)
+        outer_device_span_prefix_elems
+        * math.ceil(selected_device_dim_size / core_split_estimate)
         * selected_device_span_stride_elems
         * itemsize
     )
     unsplit_per_core_span = (
-        selected_device_dim_size * selected_device_span_stride_elems * itemsize
+        outer_device_span_prefix_elems
+        * selected_device_dim_size
+        * selected_device_span_stride_elems
+        * itemsize
     )
 
     needs_chunk_for_span = per_core_span > MAX_SPAN_BYTES
@@ -416,6 +748,7 @@ def _needs_chunking(
         logger.info(
             "[chunk_large_tensors] trigger=%s op=%s "
             "selected_host_dim=%d selected_device_dim_size=%d selected_device_span_stride_elems=%d "
+            "outer_device_span_prefix_elems=%d skipped_outer_device_dims=%s "
             "core_split_estimate=%d per_core_span=%.2f MB unsplit_per_core_span=%.2f MB "
             "total=%.2f GB (shape=%s, dtype=%s, device_size=%s, "
             "span_limit=%.2f MB, total_limit=%.2f GB)",
@@ -424,6 +757,8 @@ def _needs_chunking(
             selected_host_dim,
             selected_device_dim_size,
             selected_device_span_stride_elems,
+            outer_device_span_prefix_elems,
+            span_reduction_dim_info.skipped_outer_device_dims,
             core_split_estimate,
             per_core_span / (1024**2),
             unsplit_per_core_span / (1024**2),
@@ -443,6 +778,14 @@ def _needs_chunking(
             selected_device_span_stride_elems=selected_device_span_stride_elems,
             selected_host_dim=selected_host_dim,
             stick_elems=stick_elems,
+            outer_device_span_prefix_elems=outer_device_span_prefix_elems,
+            reason=(
+                "skipped unchunkable outer device dims "
+                f"{span_reduction_dim_info.skipped_outer_device_dims} with "
+                f"outer prefix {outer_device_span_prefix_elems}"
+                if span_reduction_dim_info.skipped_outer_device_dims
+                else None
+            ),
         )
     return None
 
@@ -492,7 +835,7 @@ def _output_dim_for_input_selected_host_dim(
 def _reduction_input_span_chunking(
     op: ComputedBuffer,
     max_cores: int,
-    output_span_reduction_dim_info: tuple[int, int, int, int] | None,
+    output_span_reduction_dim_info: SpanDimInfo | None,
 ) -> ChunkingInfo | None:
     """Return chunking info when a reduction input span exceeds limits.
 
@@ -552,7 +895,7 @@ def _reduction_input_span_chunking(
     selected_host_dim = None
 
     if input_span_reduction_dim_info is not None:
-        input_selected_host_dim, _, _, _ = input_span_reduction_dim_info
+        input_selected_host_dim = input_span_reduction_dim_info.selected_host_dim
         output_selected_host_dim = _output_dim_for_input_selected_host_dim(
             op, largest_input, input_selected_host_dim
         )
@@ -574,9 +917,9 @@ def _reduction_input_span_chunking(
             )
 
         if output_span_reduction_dim_info is not None:
-            selected_host_dim, dim_size, _, core_split_estimate = (
-                output_span_reduction_dim_info
-            )
+            selected_host_dim = output_span_reduction_dim_info.selected_host_dim
+            dim_size = output_span_reduction_dim_info.selected_device_dim_size
+            core_split_estimate = output_span_reduction_dim_info.core_split_estimate
         else:
             dim_size, selected_host_dim = max(candidates)
             core_split_estimate = 1
@@ -632,6 +975,7 @@ def _reduction_input_span_chunking(
         ),
         selected_host_dim=selected_host_dim,
         stick_elems=stick_elems,
+        outer_device_span_prefix_elems=1,
         reason=mapping_note,
     )
 
@@ -861,6 +1205,7 @@ def _chunk_op(
     operations: list[Operation],
     op_index: int,
     chunking_info: ChunkingInfo,
+    num_chunks: int,
     original_ftl: FixedTiledLayout,
 ) -> int:
     """Split *op* into memory-safe chunks along the span-reduction dim.
@@ -882,67 +1227,41 @@ def _chunk_op(
     pointwise = cast(Pointwise, data) if not is_reduction else None
     original_ranges = [int(r) for r in data.ranges]
     original_inner_fn = data.inner_fn
-    split_dim_idx = chunking_info.selected_host_dim
-    split_dim_full_size = int(original_ranges[split_dim_idx])
+    primary_split_dim_idx = chunking_info.selected_host_dim
+    primary_split_dim_full_size = int(original_ranges[primary_split_dim_idx])
     stick_elems = chunking_info.stick_elems
 
-    # -- Step 1: decide number of chunks for the span-reduction dim --
-    num_chunks = _compute_num_chunks(chunking_info, max_cores)
-
-    # -- Step 2: stick-aligned chunk size on the primary dim --
-    total_sticks = math.ceil(split_dim_full_size / stick_elems)
+    # The caller already selected num_chunks while choosing between output-span
+    # and reduction-input-span chunking plans.
+    # -- Step 1: stick-aligned chunk size on the primary dim --
+    total_sticks = math.ceil(primary_split_dim_full_size / stick_elems)
     min_sticks_per_chunk = math.ceil(total_sticks / num_chunks)
     sticks_per_chunk = _choose_sticks_per_chunk(total_sticks, min_sticks_per_chunk)
     chunk_size = sticks_per_chunk * stick_elems
 
     # The regular-geometry preference above may choose a larger divisor and
-    # reduce the effective chunk count.  Keep a hard cap from the unsplit span
-    # estimate so each generated chunk is safe even if work_division cannot
-    # spend cores on this dimension.
-    selected_device_units_per_host_chunk_unit = (
-        1
-        if chunking_info.selected_device_dim_size == split_dim_full_size
-        else stick_elems
+    # reduce the effective chunk count.  Cap it so each generated chunk is safe
+    # even if work_division cannot spend cores on this dimension.
+    chunk_size, num_chunks = _cap_chunk_size_for_unsplit_span(
+        chunking_info,
+        original_ftl,
+        primary_split_dim_full_size,
+        chunk_size,
     )
-    max_device_units_per_chunk = max(
-        1,
-        MAX_SPAN_BYTES
-        // (
-            chunking_info.selected_device_span_stride_elems
-            * original_ftl.dtype.itemsize
-        ),
-    )
-    max_chunk_size_for_unsplit_span = (
-        max_device_units_per_chunk * selected_device_units_per_host_chunk_unit
-    )
-    if chunk_size > max_chunk_size_for_unsplit_span:
-        chunk_size = max_chunk_size_for_unsplit_span
-
-    num_chunks = math.ceil(split_dim_full_size / chunk_size)
 
     if reduction is not None:
-        itemsize = reduction.dtype.itemsize
-        reduction_elems = math.prod(int(r) for r in reduction.reduction_ranges)
-        non_split_output_elems = math.prod(
-            size for dim, size in enumerate(original_ranges) if dim != split_dim_idx
+        chunk_size, num_chunks = _cap_reduction_chunk_size_for_input_span(
+            reduction,
+            original_ranges,
+            primary_split_dim_idx,
+            primary_split_dim_full_size,
+            stick_elems,
+            chunk_size,
         )
-        input_elems_per_split_dim_unit = max(
-            1, non_split_output_elems * reduction_elems
-        )
-        max_chunk_size_for_input_span = max(
-            1, MAX_SPAN_BYTES // (input_elems_per_split_dim_unit * itemsize)
-        )
-        if chunk_size > max_chunk_size_for_input_span:
-            stick_aligned_max_chunk_size = max(
-                1, (max_chunk_size_for_input_span // stick_elems) * stick_elems
-            )
-            chunk_size = min(chunk_size, stick_aligned_max_chunk_size)
-            num_chunks = math.ceil(split_dim_full_size / chunk_size)
-
-    split_dim_chunk_plan: list[tuple[int, int]] = []
+    primary_split_dim_chunk_plan: list[tuple[int, int]] = []
     for chunk_idx in range(num_chunks):
         chunk_offset = chunk_idx * chunk_size
-        remaining_elems = max(0, split_dim_full_size - chunk_offset)
+        remaining_elems = max(0, primary_split_dim_full_size - chunk_offset)
         if remaining_elems == 0:
             continue
         # Keep logical ranges within the original tensor size.  The chunk
@@ -950,70 +1269,30 @@ def _chunk_op(
         # but op.data.ranges and scatter ranges must not iterate over padded
         # logical elements.
         this_chunk_size = min(remaining_elems, chunk_size)
-        split_dim_chunk_plan.append((chunk_offset, this_chunk_size))
+        primary_split_dim_chunk_plan.append((chunk_offset, this_chunk_size))
 
     per_dim_chunk_plans: list[list[tuple[int, int]]] = [
         [(0, size)] for size in original_ranges
     ]
-    per_dim_chunk_plans[split_dim_idx] = split_dim_chunk_plan
+    per_dim_chunk_plans[primary_split_dim_idx] = primary_split_dim_chunk_plan
 
     if reduction is not None:
-        itemsize = reduction.dtype.itemsize
-        reduction_elems = math.prod(int(r) for r in reduction.reduction_ranges)
+        _add_reduction_secondary_chunk_plans(
+            op_name=op.get_name(),
+            reduction=reduction,
+            original_ranges=original_ranges,
+            original_ftl=original_ftl,
+            max_cores=max_cores,
+            primary_split_dim_idx=primary_split_dim_idx,
+            per_dim_chunk_plans=per_dim_chunk_plans,
+            stick_elems=stick_elems,
+        )
 
-        for dim in range(split_dim_idx):
-            dim_size = original_ranges[dim]
-            if dim_size <= 1:
-                continue
-
-            # Conservative input span estimate.  The input tensor keeps the
-            # original full output stride, and scalar reductions also carry the
-            # reduced dimension(s) inside that row span.  Do not assume work
-            # division will spend cores on this dim; for low SENCORES it may use
-            # them on the primary span-reduction dim instead.
-            input_span_stride_for_dim = int(original_ftl.stride[dim]) * reduction_elems
-            input_span_for_dim = dim_size * input_span_stride_for_dim * itemsize
-            if input_span_for_dim <= MAX_SPAN_BYTES:
-                continue
-
-            max_dim_chunk_size = max(
-                1, MAX_SPAN_BYTES // (input_span_stride_for_dim * itemsize)
-            )
-            dim_chunk_size = min(dim_size, max_dim_chunk_size)
-
-            # If this output dimension's row stride is not stick-aligned,
-            # arbitrary chunk offsets on the dim become non-stick-aligned
-            # storage offsets.  That lowers to unsupported stick coordinates
-            # like ``Mod(d1, 64) + k``.  Keep every nonzero offset a multiple of
-            # a full stick so the within-stick coordinate stays ``Mod(var,64)``.
-            if int(original_ftl.stride[dim]) % stick_elems != 0:
-                aligned_chunk_size = (max_dim_chunk_size // stick_elems) * stick_elems
-                if aligned_chunk_size < 1:
-                    raise Unsupported(
-                        f"Cannot chunk {op.get_name()} (reduction:"
-                        f"{reduction.reduction_type}) along dim {dim}: "
-                        f"max safe chunk size {max_dim_chunk_size} is smaller "
-                        f"than stick size {stick_elems}, and stride "
-                        f"{int(original_ftl.stride[dim])} is not stick-aligned."
-                    )
-                dim_chunk_size = min(dim_size, aligned_chunk_size)
-
-            dim_chunk_plan: list[tuple[int, int]] = []
-            for offset in range(0, dim_size, dim_chunk_size):
-                dim_chunk_plan.append((offset, min(dim_chunk_size, dim_size - offset)))
-            per_dim_chunk_plans[dim] = dim_chunk_plan
-
-            logger.info(
-                "Reduction input-span chunking %s: dim=%d full_size=%d "
-                "chunk_size=%d num_chunks=%d per_core_span=%.2fMB",
-                op.get_name(),
-                dim,
-                dim_size,
-                dim_chunk_size,
-                len(dim_chunk_plan),
-                input_span_for_dim / (1024**2),
-            )
-
+    # ``per_dim_chunk_plans`` is one independent plan per output dimension.
+    # Convert it into concrete output tiles by taking the cartesian product:
+    # every dim-0 chunk with every dim-1 chunk, and so on.  Each entry in
+    # ``chunk_grid`` is one real chunk operation with offsets/sizes for all
+    # output dims.
     chunk_grid = []
     for entries in itertools.product(*per_dim_chunk_plans):
         offsets = [offset for offset, _ in entries]
@@ -1022,6 +1301,36 @@ def _chunk_op(
 
     failure_reason = f" Reason: {chunking_info.reason}." if chunking_info.reason else ""
 
+    # If chunking skipped a small outer physical dimension and split an inner
+    # dimension instead, the compute ranges may be safe while the write-back
+    # still goes through the full destination layout.  work_division is not
+    # Scatter-slice-aware today, so fail here with the real boundary instead of
+    # generating many chunks that fail later during scheduling.
+    if len(chunk_grid) > 1:
+        write_span_failure = _full_destination_write_span_failure(
+            original_ftl,
+            max_cores,
+        )
+        if write_span_failure is not None:
+            op_kind = (
+                f"reduction:{reduction.reduction_type}"
+                if reduction is not None
+                else "pointwise"
+            )
+            raise Unsupported(
+                f"Cannot chunk {op.get_name()} ({op_kind}) below the "
+                "hardware memory span limit: generated chunks have smaller "
+                "logical ranges, but chunk 0 and Scatter mutation chunks still "
+                "write through the full output layout. work_division currently "
+                "checks that full destination layout rather than the Scatter "
+                "slice range/output_indexer. "
+                f"{write_span_failure}{failure_reason}"
+            )
+
+    # Final guardrail: rebuild the physical layout for each planned tile and
+    # verify it no longer needs chunking.  This catches cases where the primary
+    # and secondary plans still cannot satisfy span/total limits.  We raise
+    # instead of recursively chunking again so the pass remains predictable.
     for offsets, sizes in chunk_grid:
         chunk_layout = _make_layout_for_size(original_ftl, sizes)
         if not _chunk_bytes_fit(chunk_layout, max_cores):
@@ -1047,8 +1356,8 @@ def _chunk_op(
         "per_dim_chunk_plans=%s",
         op.get_name(),
         "reduction" if is_reduction else "pointwise",
-        split_dim_idx,
-        split_dim_full_size,
+        primary_split_dim_idx,
+        primary_split_dim_full_size,
         chunk_size,
         len(chunk_grid),
         chunking_info.total_bytes / (1024**3),
@@ -1111,12 +1420,12 @@ def _chunk_op(
                 dtype=pointwise.dtype,
                 inner_fn=_make_chunk_fn(
                     original_inner_fn,
-                    split_dim_idx,
-                    offsets[split_dim_idx],
+                    primary_split_dim_idx,
+                    offsets[primary_split_dim_idx],
                 ),
                 ranges=chunk_ranges,
                 output_indexer=_make_output_indexer(
-                    offsets[split_dim_idx], split_dim_idx
+                    offsets[primary_split_dim_idx], primary_split_dim_idx
                 ),
             )
 
@@ -1173,17 +1482,26 @@ def chunk_large_tensors(graph: GraphLowering) -> None:
             op_name=op.get_name(),
         )
         final_span_chunking_info = output_span_chunking_info
+        final_num_chunks = (
+            _compute_num_chunks(output_span_chunking_info, max_cores)
+            if output_span_chunking_info is not None
+            else None
+        )
         if isinstance(op.data, Reduction):
             input_span_chunking_info = _reduction_input_span_chunking(
                 op, max_cores, output_span_reduction_dim_info
             )
             if final_span_chunking_info is None:
                 final_span_chunking_info = input_span_chunking_info
+                final_num_chunks = (
+                    _compute_num_chunks(input_span_chunking_info, max_cores)
+                    if input_span_chunking_info is not None
+                    else None
+                )
             elif input_span_chunking_info is not None:
                 assert output_span_chunking_info is not None
-                output_chunks = _compute_num_chunks(
-                    output_span_chunking_info, max_cores
-                )
+                assert final_num_chunks is not None
+                output_chunks = final_num_chunks
                 input_chunks = _compute_num_chunks(input_span_chunking_info, max_cores)
                 # _chunk_op can add secondary plans only for dimensions before
                 # the primary split dim.  Prefer the later output dimension when
@@ -1206,13 +1524,16 @@ def chunk_large_tensors(graph: GraphLowering) -> None:
                         output_chunks,
                     )
                     final_span_chunking_info = input_span_chunking_info
+                    final_num_chunks = input_chunks
         if final_span_chunking_info is not None:
+            assert final_num_chunks is not None
             n_inserted = _chunk_op(
                 op,
                 max_cores,
                 operations,
                 i,
                 final_span_chunking_info,
+                final_num_chunks,
                 op.layout,
             )
             i += n_inserted
