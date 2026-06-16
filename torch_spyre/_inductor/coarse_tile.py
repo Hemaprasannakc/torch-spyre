@@ -268,6 +268,9 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
     """
     from . import config
 
+    if config.chunk_large_tensors:
+        return []
+
     max_cores = config.sencores
     groups: list[tuple] = []
 
@@ -322,6 +325,7 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
             is_reduction=False,
             hint_id=0,
         )
+        # Safe to clobber: this function only runs when no spyre_hint annotations exist.
         op.dim_hints = [hint]  # type: ignore[attr-defined]
 
         level = (0, sympy.Integer(trip_count), False)
