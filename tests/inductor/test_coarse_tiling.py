@@ -2994,8 +2994,6 @@ def _make_overflow_op(host_size, data_type="pointwise", name="op0"):
     dim is treated as a reduction dim and is NOT reflected in op_out_coords;
     a separate reduction_ranges list is attached to op.data.
     """
-    from unittest.mock import MagicMock
-
     import sympy
     from torch._inductor.ir import ComputedBuffer, Pointwise, Reduction
 
@@ -3040,15 +3038,16 @@ class TestSpanOverflowGroups(unittest.TestCase):
     # fp16 = 2 bytes/element; 256 MB = 134_217_728 elements total.
     # With 32 cores the total-bytes threshold is 256 MB * 32 = 8 GB.
     # [8192, 1048576] = 16 GB total → reliably triggers _needs_chunking.
-    _OVERFLOW_SIZE = [8192, 1048576]  # 16 GB fp16, reliably overflows with 32 cores
+    _OVERFLOW_SIZE = [
+        8192,
+        1048576,
+    ]  # 16 GB fp16; total > 8 GB threshold (256 MB × 32 cores)
 
     def _graph_with_op(self, op):
         return _graph([op])
 
     def _run(self, op):
         """Call span_overflow_groups with op_out_coords patched to _test_out_coords."""
-        from unittest.mock import patch
-
         import torch_spyre._inductor.coarse_tile as ct_mod
 
         op_impl = op
@@ -3067,8 +3066,6 @@ class TestSpanOverflowGroups(unittest.TestCase):
 
     def test_no_overflow_returns_empty(self):
         """A small tensor that fits within 256 MB produces no groups."""
-        from unittest.mock import MagicMock
-
         import sympy
         from torch._inductor.ir import ComputedBuffer, Pointwise
 
@@ -3133,6 +3130,7 @@ class TestSpanOverflowGroups(unittest.TestCase):
         self.assertIsNotNone(h.loop_var)
         self.assertEqual(h.hint_id, 0)
         self.assertFalse(h.is_reduction)
+        self.assertEqual(h.dim_names, ["_span_overflow"])
 
     def test_trip_count_matches_level_and_hint(self):
         """The trip count on the DimHint matches the level count in the group."""
@@ -3148,8 +3146,6 @@ class TestSpanOverflowGroups(unittest.TestCase):
 
     def test_two_overflow_ops_produce_two_groups(self):
         """Two independent overflowing ops produce two separate groups."""
-        from unittest.mock import patch
-
         import torch_spyre._inductor.coarse_tile as ct_mod
 
         op0, _ = _make_overflow_op(self._OVERFLOW_SIZE, "pointwise", "op0")
@@ -3171,8 +3167,6 @@ class TestSpanOverflowGroups(unittest.TestCase):
 
     def test_non_spyre_layout_skipped(self):
         """Ops without FixedTiledLayout are skipped even if data is large."""
-        from unittest.mock import MagicMock
-
         import sympy
         from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
 
@@ -3188,8 +3182,6 @@ class TestSpanOverflowGroups(unittest.TestCase):
 
     def test_chunk_large_tensors_config_suppresses_groups(self):
         """When config.chunk_large_tensors is True, span_overflow_groups returns empty."""
-        from unittest.mock import patch
-
         import torch_spyre._inductor.coarse_tile as ct_mod
         import torch_spyre._inductor.config as spyre_config
 
