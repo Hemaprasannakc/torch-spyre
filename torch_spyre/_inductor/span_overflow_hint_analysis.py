@@ -46,6 +46,7 @@ class ChunkingInfo:
     the corresponding physical dim and inner physical stride used to estimate
     work_division's per-core address span.
     """
+
     total_bytes: int
     per_core_span: int
     core_split_estimate: int
@@ -64,6 +65,7 @@ class SpanOverflowTilePlan:
     ``selected_host_dim=1, split_count=5`` means tile output dim 1 into five
     coarse-tile loop iterations.
     """
+
     selected_host_dim: int
     split_count: int
     is_reduction: bool
@@ -74,6 +76,7 @@ class SpanOverflowTilePlan:
 @dataclass(frozen=True)
 class SpanDimInfo:
     """Mapping from the first span-controlling device dim to a host dim."""
+
     selected_host_dim: int
     selected_device_dim_size: int
     selected_device_span_stride_elems: int
@@ -135,9 +138,7 @@ def _find_outermost_span_dim(
         return SpanDimInfo(
             selected_host_dim=matching_dims[0],
             selected_device_dim_size=selected_device_dim_size,
-            selected_device_span_stride_elems=math.prod(
-                device_size[device_dim + 1 :]
-            ),
+            selected_device_span_stride_elems=math.prod(device_size[device_dim + 1 :]),
             core_split_estimate=_find_max_divisible_core_split(
                 selected_device_dim_size, max_cores
             ),
@@ -251,9 +252,7 @@ def _post_tile_layout(
         within_stick_dim = len(new_size_ints) - 1
 
     ndim = len(new_size_ints)
-    dim_order = [i for i in range(ndim) if i != within_stick_dim] + [
-        within_stick_dim
-    ]
+    dim_order = [i for i in range(ndim) if i != within_stick_dim] + [within_stick_dim]
     device_layout = SpyreTensorLayout(
         new_size_ints,
         new_strides_ints,
