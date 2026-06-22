@@ -26,6 +26,53 @@ span_overflow_hint_analysis
   -> LoopSpec codegen
 ```
 
+
+## Entry Point and Pass Integration
+
+The planner entry point is:
+
+```python
+from torch_spyre._inductor.span_overflow_hint_analysis import plan_span_overflow_tile
+
+plan = plan_span_overflow_tile(op, max_cores=config.sencores)
+```
+
+`plan_span_overflow_tile()` is intentionally side-effect free: it inspects one
+`ComputedBuffer` and returns either a `SpanOverflowTilePlan` or `None`.  It does
+not attach hints, rewrite ranges, mutate layouts, or insert loop metadata.
+
+The compiler consumes the planner through the coarse-tiling adapter:
+
+```python
+from torch_spyre._inductor.coarse_tile import span_overflow_groups
+
+groups = span_overflow_groups(graph)
+```
+
+`span_overflow_groups(graph)` walks `graph.operations`, calls the planner for
+each eligible op, attaches a synthetic `DimHint` to planned ops, and returns
+groups in the exact format consumed by `coarse_tile()`:
+
+```python
+[([op], [(hint_id, split_count, is_reduction_level)])]
+```
+
+`passes.py` wires this into `_maybe_coarse_tile()` after user hint grouping:
+
+```python
+groups = hints_to_coarse_tile_groups(graph)
+if not groups:
+    groups = span_overflow_groups(graph)
+if groups:
+    coarse_tile(graph, groups=groups)
+```
+
+This ordering is important.  User-authored `spyre_hint` groups take precedence;
+automatic span-overflow hints are only generated when no user coarse-tiling
+groups exist for the graph.  From `coarse_tile()` onward, automatic groups and
+manual `spyre_hint` groups share the same IR stamping, scheduler wrapping, and
+`LoopSpec` codegen path.
+
 ## Scope
 
 The initial pass is deliberately conservative:
@@ -285,10 +332,26 @@ Recommended coverage:
 
 ## Current Limitations
 
-- Only pointwise ops are planned automatically.
-- Only one output dimension is tiled.
-- Exact divisibility is required by the current `coarse_tile` range rewrite.
-- If one selected dimension is insufficient, the pass raises `Unsupported`; it
-  does not yet emit nested multi-dimensional tile plans.
-- Reduction output-range tiling and reduction-range tiling are future work.
+The pointwise implementation is intentionally narrow for the first PR:
 
+- Only `ComputedBuffer` ops whose `data` is `Pointwise` are planned
+  automatically.
+- The op must have a `FixedTiledLayout`; the policy depends on Spyre physical
+  `device_size` and `stride_map`.
+- The planner emits one coarse-tile level over one output/host dimension.
+- `span_overflow_groups()` emits one group per planned op; it does not yet try
+  to coalesce producer/consumer chains into a shared automatic group.
+- The selected output coordinate must resolve to exactly one loop symbol through
+  `op_out_coords(op)`, so the adapter can create a valid synthetic `DimHint`.
+- Exact divisibility is required because current `coarse_tile` range rewriting
+  divides `op.data.ranges` and `op.layout.size` by the loop count.
+- If no divisor of the selected dimension makes the post-tile layout safe, the
+  pass raises `Unsupported`; it does not yet emit nested multi-dimensional tile
+  plans.
+- If `config.chunk_large_tensors` is enabled, `span_overflow_groups()` returns
+  no groups so the legacy chunking path remains in control.
+- Reduction output-range tiling and reduction-range tiling are follow-up work.
+  The planned reduction phase should start conservatively with scalar
+  reductions whose output ranges can be tiled without splitting
+  `reduction_ranges`; reduction-dimension tiling needs separate policy and
+  validation.
