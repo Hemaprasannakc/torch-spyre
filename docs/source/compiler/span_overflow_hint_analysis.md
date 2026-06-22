@@ -26,7 +26,6 @@ span_overflow_hint_analysis
   -> LoopSpec codegen
 ```
 
-
 ## Entry Point and Pass Integration
 
 The planner entry point is:
@@ -316,8 +315,6 @@ Recommended coverage:
    `LoopSpec` count.
 5. **One E2E smoke test:** use a real large pointwise tensor and compare Spyre
    output against CPU.
-
-
 
 ## Key Files
 
