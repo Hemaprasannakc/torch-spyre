@@ -72,11 +72,7 @@ from .logging_utils import get_inductor_logger
 from .loop_info import CoarseTileInfo
 from .propagate_hints import get_op_hints, DimHint
 from .pass_utils import op_out_coords
-from .chunk_large_tensors import (
-    _find_controlling_dim,
-    _needs_chunking,
-    _compute_num_chunks,
-)
+from .span_overflow_hint_analysis import plan_span_overflow_tile
 from .ir import FixedTiledLayout
 
 logger = get_inductor_logger("coarse_tile")
@@ -230,49 +226,24 @@ def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
 
 
 def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
-    """Build coarse_tile() groups for ops whose device span exceeds 256 MB.
+    """Build coarse_tile() groups from automatic span-overflow plans.
 
-    Fallback pass: runs only when hints_to_coarse_tile_groups() returns empty
-    (i.e. no spyre_hint annotations are present in the graph).
+    This is the adapter layer between span_overflow_hint_analysis and
+    coarse_tile.  It converts a SpanOverflowTilePlan into the same structure
+    produced by user spyre_hint annotations:
 
-    For each ComputedBuffer op with a FixedTiledLayout whose per-core device
-    span exceeds MAX_SPAN_BYTES (256 MB), this function:
+        [([op], [(hint_id, split_count, is_reduction)])]
 
-    1. Reuses _find_controlling_dim() and _needs_chunking() from
-       chunk_large_tensors.py to detect the overflow and compute a trip count
-       via _compute_num_chunks().  The detection logic is intentionally kept
-       identical to chunk_large_tensors so the two passes agree on which ops
-       need remediation.
-
-    2. Synthesises a DimHint for the controlling host dimension, resolving the
-       loop_var symbol from op_out_coords() so _stamp_group() can find and
-       divide the correct data.ranges entry.
-
-    3. Returns a groups list in the same (ops, levels) format that
-       hints_to_coarse_tile_groups() returns, suitable for passing directly to
-       coarse_tile().
-
-    Both Pointwise and Reduction ops are handled.  For a Reduction, the
-    controlling dim is always an outer (non-reduction) dimension — _find_
-    controlling_dim() skips the stick dim and iterates device dims outer-to-
-    inner using stride_map, which maps to host dims in data.ranges regardless
-    of whether the op is a Pointwise or Reduction.
-
-    TODO: consecutive ops that overflow and share a compatible controlling dim
-    (same host_dim index, same controlling device-dim size) should ideally be
-    merged into a single group so they share one loop nest — analogous to how
-    hints_to_coarse_tile_groups() merges consecutive hint-annotated ops into
-    groups.  For now, each overflowing op gets its own single-op group.  This
-    is safe but produces more loop nests than necessary when a run of adjacent
-    ops all overflow on the same dimension.
+    It also attaches a synthetic DimHint to the op so _stamp_group can resolve
+    the selected loop variable and divide the correct data.ranges entry.
     """
     from . import config
 
     if config.chunk_large_tensors:
         return []
 
-    max_cores = config.sencores
     groups: list[tuple] = []
+    next_hint_id = 10000
 
     for op in graph.operations:
         if not isinstance(op, ComputedBuffer):
@@ -282,16 +253,11 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
         if not isinstance(op.layout, FixedTiledLayout):
             continue
 
-        controlling = _find_controlling_dim(op.layout, max_cores)
-        chunking_info = _needs_chunking(op.layout, max_cores, controlling)
-        if chunking_info is None:
+        plan = plan_span_overflow_tile(op, config.sencores)
+        if plan is None:
             continue
 
-        trip_count = _compute_num_chunks(chunking_info, max_cores)
-        if trip_count <= 1:
-            continue
-
-        host_dim = chunking_info.host_dim
+        host_dim = plan.selected_host_dim
         out_coords = op_out_coords(op)
         if host_dim >= len(out_coords):
             logger.warning(
@@ -316,29 +282,30 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
             )
             continue
 
+        hint_id = next_hint_id
+        next_hint_id += 1
         loop_var = next(iter(free))
-
         hint = DimHint(
             dim_names=["_span_overflow"],
-            split_count=trip_count,
+            split_count=plan.split_count,
             loop_var=loop_var,
-            is_reduction=False,
-            hint_id=0,
+            is_reduction=plan.is_reduction,
+            hint_id=hint_id,
         )
-        # Safe to clobber: this function only runs when no spyre_hint annotations exist.
         op.dim_hints = [hint]  # type: ignore[attr-defined]
 
-        level = (0, sympy.Integer(trip_count), False)
-        groups.append(([op], [level]))
+        level = (hint_id, sympy.Integer(plan.split_count), plan.is_reduction)
+        group = ([op], [level])
+        groups.append(group)
 
         logger.info(
-            "span_overflow_groups: op %s host_dim=%d trip_count=%d "
+            "span_overflow_groups: op %s host_dim=%d split_count=%d "
             "total=%.2fGB per_core_span=%.2fMB",
             op.get_name(),
             host_dim,
-            trip_count,
-            chunking_info.total_bytes / (1024**3),
-            chunking_info.per_core_span / (1024**2),
+            plan.split_count,
+            plan.chunking_info.total_bytes / (1024**3),
+            plan.chunking_info.per_core_span / (1024**2),
         )
 
     return groups
