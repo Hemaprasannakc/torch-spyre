@@ -21,6 +21,17 @@ These tests intentionally mirror the compiler layers used by user
 2. Adapter: span_overflow_groups creates a synthetic DimHint/group.
 3. Coarse-tile IR: coarse_tile consumes the group and stamps CoarseTileInfo.
 4. Scheduler/codegen: generated source contains the expected LoopSpec count.
+
+Coverage in this file:
+
+- no-op behavior for small tensors and non-FixedTiledLayout ops;
+- automatic group/DimHint structure, including the reserved hint-id sentinel;
+- multiple independent overflowing pointwise ops producing separate groups;
+- planner boundary errors when no legal divisor validates post-tile span;
+- total-size fallback when no device dim maps through stride_map;
+- adapter mapping with both constant and symbolic batch output coordinates;
+- coarse_tile stamping of ranges/layout/CoarseTileInfo;
+- equivalence between auto span-overflow hints and manual spyre_hint codegen.
 """
 
 from types import SimpleNamespace
@@ -35,8 +46,10 @@ from torch._inductor.utils import run_and_get_code
 
 from torch_spyre._C import SpyreTensorLayout
 from torch_spyre._inductor import config
+from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.propagate_hints import DimHint
 from torch_spyre._inductor.coarse_tile import (
+    _SPAN_OVERFLOW_HINT_ID,
     coarse_tile,
     span_overflow_groups,
 )
@@ -88,6 +101,16 @@ def _out_coords_for_bhld(_op):
     """Coordinates for shape [B, H, L, D] with B size 1 in these tests."""
     return [
         sympy.Integer(0),
+        sympy.Symbol("h"),
+        sympy.Symbol("l"),
+        sympy.Symbol("d"),
+    ]
+
+
+def _out_coords_for_symbolic_bhld(_op):
+    """Coordinates for shape [B, H, L, D] with B as a real loop var."""
+    return [
+        sympy.Symbol("b"),
         sympy.Symbol("h"),
         sympy.Symbol("l"),
         sympy.Symbol("d"),
@@ -172,10 +195,27 @@ class TestSpanOverflowGroups(InductorTestCase):
         self.assertEqual(ops_list, [op])
         self.assertEqual(len(levels), 1)
         hint_id, count, is_reduction_level = levels[0]
+        self.assertEqual(hint_id, _SPAN_OVERFLOW_HINT_ID)
         self.assertIsInstance(count, sympy.Integer)
         self.assertEqual(count, sympy.Integer(_E2E_SPLIT_COUNT))
         self.assertFalse(is_reduction_level)
         self.assertEqual(hint_id, op.dim_hints[0].hint_id)
+
+    def test_two_overflow_ops_produce_two_groups(self):
+        op0 = _pointwise_op(_E2E_SHAPE, name="buf0")
+        op1 = _pointwise_op(_E2E_SHAPE, name="buf1")
+
+        with patch(
+            "torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld
+        ):
+            with config.patch({"sencores": 4, "chunk_large_tensors": False}):
+                groups = span_overflow_groups(_graph([op0, op1]))
+
+        self.assertEqual(len(groups), 2)
+        self.assertIs(groups[0][0][0], op0)
+        self.assertIs(groups[1][0][0], op1)
+        self.assertEqual(groups[0][1][0][0], _SPAN_OVERFLOW_HINT_ID)
+        self.assertEqual(groups[1][1][0][0], _SPAN_OVERFLOW_HINT_ID + 1)
 
     def test_dim_hint_attached_to_op(self):
         from torch_spyre._inductor.propagate_hints import DimHint
@@ -245,6 +285,36 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertFalse(plan.is_reduction)
         self.assertEqual(plan.chunking_info.selected_device_dim_size, _E2E_SHAPE[1])
 
+    @patch("torch_spyre._inductor.span_overflow_hint_analysis._post_tile_span_ok")
+    def test_planner_raises_when_no_divisor_satisfies_post_tile_span(
+        self,
+        mock_post_tile_span_ok,
+    ):
+        mock_post_tile_span_ok.return_value = False
+        op = _pointwise_op(_E2E_SHAPE)
+
+        with self.assertRaisesRegex(Unsupported, "no divisor"):
+            plan_span_overflow_tile(op, max_cores=4)
+
+    @patch("torch_spyre._inductor.span_overflow_hint_analysis._post_tile_span_ok")
+    @patch("torch_spyre._inductor.span_overflow_hint_analysis._find_outermost_span_dim")
+    @patch("torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES", 1024)
+    def test_planner_falls_back_to_largest_host_dim_when_no_device_dim_maps(
+        self,
+        mock_find_outermost_span_dim,
+        mock_post_tile_span_ok,
+    ):
+        mock_find_outermost_span_dim.return_value = None
+        mock_post_tile_span_ok.return_value = True
+        op = _pointwise_op((4, 8, 16, 64))
+
+        plan = plan_span_overflow_tile(op, max_cores=1)
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.selected_host_dim, 3)
+        self.assertEqual(plan.chunking_info.selected_device_dim_size, 0)
+        self.assertIn("no device dimension", plan.chunking_info.reason)
+
     @patch("torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld)
     def test_adapter_creates_dim_hint_and_group(self):
         op = _pointwise_op(_E2E_SHAPE)
@@ -260,6 +330,23 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertEqual(len(op.dim_hints), 1)
         self.assertEqual(op.dim_hints[0].split_count, _E2E_SPLIT_COUNT)
         self.assertEqual(op.dim_hints[0].loop_var, sympy.Symbol("h"))
+
+    @patch(
+        "torch_spyre._inductor.coarse_tile.op_out_coords",
+        _out_coords_for_symbolic_bhld,
+    )
+    def test_adapter_handles_nontrivial_batch_coord(self):
+        op = _pointwise_op((4, 8195, 256, 64))
+
+        with config.patch({"sencores": 4, "chunk_large_tensors": False}):
+            groups = span_overflow_groups(_graph([op]))
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(op.dim_hints), 1)
+        # Batch is a real loop var in this test, but this shape's span-driving
+        # physical dim still maps to H, so the adapter should choose h.
+        self.assertEqual(op.dim_hints[0].loop_var, sympy.Symbol("h"))
+        self.assertEqual(groups[0][1][0][1], sympy.Integer(_E2E_SPLIT_COUNT))
 
     @patch("torch_spyre._inductor.coarse_tile.insert_tiling_propagation")
     @patch("torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld)
@@ -346,7 +433,9 @@ class TestSpanOverflowLargeShapeContract(InductorTestCase):
 
         auto_snode = _scheduler_node_for_op(auto_op, "auto_snode")
         manual_snode = _scheduler_node_for_op(manual_op, "manual_snode")
-        with patch.object(CountedLoopSchedulerNode, "create", staticmethod(fake_create)):
+        with patch.object(
+            CountedLoopSchedulerNode, "create", staticmethod(fake_create)
+        ):
             auto_wrapped = build_loop_scheduler_nodes([auto_snode])
             manual_wrapped = build_loop_scheduler_nodes([manual_snode])
 
@@ -437,4 +526,3 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         self.assertIn("sympify('4')", manual_src)
         self.assertIn("op='add'", auto_src)
         self.assertIn("op='add'", manual_src)
-
