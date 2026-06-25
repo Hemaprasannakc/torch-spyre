@@ -26,6 +26,22 @@ span_overflow_hint_analysis
   -> LoopSpec codegen
 ```
 
+## Mental Model
+
+Think of the pass as an automatic `spyre_hint` author.  It does not tile
+tensors directly and it does not create a separate execution path.  It only:
+
+1. detects that the current physical layout can exceed the 256 MB per-core span
+   limit;
+2. picks the output dimension that controls that span;
+3. computes the smallest legal coarse-tile count for that dimension;
+4. validates the real post-tile physical layout; and
+5. hands the result to `coarse_tile` as a synthetic `DimHint`.
+
+That means the correctness contract is small: if the planner returns a
+`SpanOverflowTilePlan`, the downstream code should behave like a user had
+written the equivalent `spyre_hint`.
+
 ## Entry Point and Pass Integration
 
 The planner entry point is:
@@ -206,6 +222,26 @@ If the required count is not itself a divisor, the pass tries the next larger
 divisor.  If no divisor on the selected dimension can satisfy the constraints,
 the pass raises `Unsupported` rather than emitting a plan that still overflows.
 
+## Internal Planner Flow
+
+The pointwise planner follows this path:
+
+```text
+plan_span_overflow_tile()
+  -> _plan_pointwise_span_overflow_tile()
+       -> _find_outermost_span_dim()
+       -> _needs_chunking()
+       -> _compute_num_chunks()
+       -> _post_tile_validated_split_count()
+            -> _choose_divisible_split_count()
+            -> _post_tile_span_ok()
+                 -> _post_tile_layout()
+```
+
+The important detail is that `_post_tile_validated_split_count()` is not just a
+rounding helper.  It is the guardrail that keeps the planner from accepting a
+split count until the rebuilt per-tile `SpyreTensorLayout` is safe.
+
 ## Post-Tile Validation
 
 The initial span estimate is not the final check.  Before returning a plan, the
@@ -237,7 +273,8 @@ For every returned plan, the adapter:
 
 1. maps `selected_host_dim` to the concrete output loop symbol via
    `op_out_coords(op)`;
-2. creates a synthetic `DimHint` with a private hint id;
+2. creates a synthetic `DimHint` with a reserved automatic hint id starting at
+   `_SPAN_OVERFLOW_HINT_ID = 10000`;
 3. attaches that hint to the op as `op.dim_hints`;
 4. returns a group shaped like user-hint output:
 
@@ -300,6 +337,23 @@ LoopSpec(
 
 This is intentionally the same loop structure produced by the equivalent
 manual `spyre_hint`.
+
+## Failure Policy
+
+The pass raises `Unsupported` when automatic tiling would need behavior outside
+the current pointwise contract.  Common cases are:
+
+- the selected host dimension is not present in `op.data.ranges`;
+- the selected range is symbolic or otherwise not an integer size;
+- the selected range is size 1 and cannot be tiled;
+- the required split count is larger than the selected dimension;
+- no divisor of the selected dimension makes the post-tile layout safe; or
+- the adapter cannot map the selected output coordinate to exactly one loop
+  symbol.
+
+These failures are intentional.  They prevent the pass from silently emitting a
+coarse-tile group that still violates the hardware span limit or cannot be
+represented by the existing `coarse_tile` machinery.
 
 ## Validation Strategy
 
