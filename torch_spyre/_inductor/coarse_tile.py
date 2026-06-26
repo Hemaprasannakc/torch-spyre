@@ -379,11 +379,11 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
 
     This adapter converts a SpanOverflowTilePlan into the same group shape as
     user spyre_hint annotations: ``[([op], [(hint_id, count, is_reduction)])]``.
-    It only runs when user hints did not already form coarse-tile groups.
+    Ops that already carry user hints are left for the user-hint grouping path.
     """
     from . import config
 
-    if config.chunk_large_tensors:
+    if config.chunk_large_tensors or getattr(config, "ignore_wsr_hints", False):
         return []
 
     groups: list[tuple] = []
@@ -392,9 +392,11 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
     for op in graph.operations:
         if not isinstance(op, ComputedBuffer):
             continue
-        if not isinstance(op.data, (Pointwise, Reduction)):
+        if not isinstance(op.data, Pointwise):
             continue
         if not isinstance(op.layout, FixedTiledLayout):
+            continue
+        if getattr(op, "dim_hints", []):
             continue
 
         plan = plan_span_overflow_tile(op, config.sencores)
@@ -406,20 +408,7 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
         levels: list[tuple] = []
         level_summary: list[tuple[int, int]] = []
 
-        tile_levels = getattr(plan, "tile_levels", None)
-        if tile_levels:
-            planned_levels = [
-                (
-                    level.selected_host_dim,
-                    level.split_count,
-                    level.is_reduction,
-                )
-                for level in tile_levels
-            ]
-        else:
-            planned_levels = [
-                (plan.selected_host_dim, plan.split_count, plan.is_reduction)
-            ]
+        planned_levels = [(plan.selected_host_dim, plan.split_count, plan.is_reduction)]
 
         for host_dim, split_count, is_reduction in planned_levels:
             if host_dim >= len(out_coords):

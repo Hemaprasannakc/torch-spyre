@@ -59,6 +59,7 @@ from torch_spyre._inductor.scheduler import (
     build_loop_scheduler_nodes,
 )
 from torch_spyre._inductor.span_overflow_hint_analysis import (
+    _find_outermost_span_dim,
     plan_span_overflow_tile,
 )
 import torch_spyre._inductor.propagate_named_dims as _pnd
@@ -262,10 +263,51 @@ class TestSpanOverflowGroups(InductorTestCase):
 
         self.assertEqual(groups, [])
 
+    def test_symbolic_layout_skipped(self):
+        op = _pointwise_op(_E2E_SHAPE)
+        op.layout.size[1] = sympy.Symbol("s0")
+
+        with config.patch({"sencores": 4, "chunk_large_tensors": False}):
+            groups = span_overflow_groups(_graph([op]))
+
+        self.assertEqual(groups, [])
+
     def test_chunk_large_tensors_config_suppresses_groups(self):
         op = _pointwise_op(_E2E_SHAPE)
 
         with config.patch({"sencores": 4, "chunk_large_tensors": True}):
+            groups = _run_span_overflow_groups(op)
+
+        self.assertEqual(groups, [])
+
+    def test_user_hinted_ops_do_not_block_unhinted_auto_groups(self):
+        hinted_op = _pointwise_op(_E2E_SHAPE, name="hinted")
+        hinted_op.dim_hints = [
+            DimHint(
+                dim_names=["H"],
+                split_count=5,
+                loop_var=sympy.Symbol("h"),
+                is_reduction=False,
+                hint_id=1,
+            )
+        ]
+        unhinted_op = _pointwise_op(_E2E_SHAPE, name="unhinted")
+
+        with config.patch({"sencores": 4, "chunk_large_tensors": False}):
+            with patch(
+                "torch_spyre._inductor.coarse_tile.op_out_coords",
+                _out_coords_for_bhld,
+            ):
+                groups = span_overflow_groups(_graph([hinted_op, unhinted_op]))
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0][0], [unhinted_op])
+        self.assertEqual(getattr(hinted_op, "dim_hints")[0].hint_id, 1)
+
+    def test_ignore_wsr_hints_config_suppresses_groups(self):
+        op = _pointwise_op(_E2E_SHAPE)
+
+        with config.patch({"sencores": 4, "ignore_wsr_hints": True}):
             groups = _run_span_overflow_groups(op)
 
         self.assertEqual(groups, [])
@@ -285,6 +327,39 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertFalse(plan.is_reduction)
         self.assertEqual(plan.chunking_info.selected_device_dim_size, _E2E_SHAPE[1])
 
+    def test_planner_skips_size_one_device_dims(self):
+        layout = SimpleNamespace(
+            size=[1, 8195, 256, 64],
+            stride=[8195 * 256 * 64, 256 * 64, 64, 1],
+            device_layout=SimpleNamespace(
+                device_size=[1, 8195, 256, 64],
+                stride_map=[8195 * 256 * 64, 256 * 64, 64, 1],
+                elems_per_stick=lambda: 64,
+            ),
+        )
+
+        span_dim = _find_outermost_span_dim(layout, max_cores=4)
+
+        self.assertIsNotNone(span_dim)
+        self.assertEqual(span_dim.selected_device_dim_size, 8195)
+        self.assertEqual(span_dim.selected_host_dim, 1)
+
+    def test_planner_prefers_exact_stride_match(self):
+        layout = SimpleNamespace(
+            size=[4, 8, 64],
+            stride=[64, 8, 1],
+            device_layout=SimpleNamespace(
+                device_size=[4, 8, 64],
+                stride_map=[64, 8, 1],
+                elems_per_stick=lambda: 64,
+            ),
+        )
+
+        span_dim = _find_outermost_span_dim(layout, max_cores=4)
+
+        self.assertIsNotNone(span_dim)
+        self.assertEqual(span_dim.selected_host_dim, 0)
+
     def test_planner_rejects_when_stick_dim_tile_is_unaligned(self):
         # Granite-like vocab dim: 49159 is not 64-aligned.  The outermost
         # span dim maps to the vocab/within-stick host dim and would choose
@@ -296,17 +371,16 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         with self.assertRaisesRegex(Unsupported, "stick alignment"):
             plan_span_overflow_tile(op, max_cores=4)
 
-    def test_planner_rejects_excessive_split_count(self):
-        # Prime/non-friendly dims can require a legal divisor far larger than
-        # the split actually needed for span safety.  Reject instead of
-        # generating thousands of LoopSpec iterations / SDSC files.
+    def test_planner_allows_full_size_exact_divisor(self):
         op = _pointwise_op((1, 17, 16, 64))
 
         with patch(
             "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES", 32768
         ):
-            with self.assertRaisesRegex(Unsupported, "over-split cap"):
-                plan_span_overflow_tile(op, max_cores=4)
+            plan = plan_span_overflow_tile(op, max_cores=4)
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.split_count, 17)
 
     @patch("torch_spyre._inductor.span_overflow_hint_analysis._post_tile_span_ok")
     def test_planner_raises_when_no_divisor_satisfies_post_tile_span(

@@ -72,21 +72,23 @@ groups in the exact format consumed by `coarse_tile()`:
 [([op], [(hint_id, split_count, is_reduction_level)])]
 ```
 
-`passes.py` wires this into `_maybe_coarse_tile()` after user hint grouping:
+`passes.py` wires this into `_maybe_coarse_tile()` after honoring the coarse-tiling debug flag:
 
 ```python
-groups = hints_to_coarse_tile_groups(graph)
-if not groups:
-    groups = span_overflow_groups(graph)
+if config.ignore_wsr_hints:
+    return
+
+groups = hints_to_coarse_tile_groups(graph) + span_overflow_groups(graph)
 if groups:
+    groups.sort(key=graph_order)
     coarse_tile(graph, groups=groups)
 ```
 
-This ordering is important.  User-authored `spyre_hint` groups take precedence;
-automatic span-overflow hints are only generated when no user coarse-tiling
-groups exist for the graph.  From `coarse_tile()` onward, automatic groups and
-manual `spyre_hint` groups share the same IR stamping, scheduler wrapping, and
-`LoopSpec` codegen path.
+This ordering is important.  User-authored `spyre_hint` groups take precedence
+per operation; automatic span-overflow hints are generated only for eligible ops
+that do not already carry user dim hints.  From `coarse_tile()` onward,
+automatic groups and manual `spyre_hint` groups share the same IR stamping,
+scheduler wrapping, and `LoopSpec` codegen path.
 
 ## Scope
 
@@ -95,10 +97,10 @@ The pass is deliberately conservative:
 - supports `ComputedBuffer` operations whose `data` is `Pointwise`;
 - requires a `FixedTiledLayout`, because decisions are based on Spyre physical
   device layout;
+- requires concrete/static layout metadata; symbolic layouts are skipped;
 - produces one coarse-tile level over one selected output dimension;
 - requires the split count to exactly divide that selected dimension;
 - rejects candidates that would cut through physical sticks;
-- caps the split count to avoid excessive `LoopSpec` / SDSC generation;
 - raises `Unsupported` if the selected dimension cannot be tiled safely;
 - does not auto-tile reductions or reduction ranges.
 
@@ -146,9 +148,11 @@ tile.
 
 ## Choosing the Controlling Dimension
 
-The pass walks physical device dimensions from outer to inner, skipping the
-final stick dimension.  For each device dimension, it uses `stride_map` to find
-the corresponding logical host/output dimension.
+The pass walks physical device dimensions from outer to inner, skipping size-1
+physical dimensions and the final stick dimension.  For each remaining device
+dimension, it uses `stride_map` to find the corresponding logical host/output
+dimension.  Exact host-stride matches are preferred over stick-scaled matches so
+ambiguous non-standard strides do not select the wrong host dimension.
 
 For a shape like `[1, 8195, 256, 64]`, the physical layout may expose:
 
@@ -185,8 +189,8 @@ per_core_span = (
 where:
 
 - `selected_device_dim_size` is the physical extent of the selected device dim;
-- `core_split_estimate` is the largest divisor of that extent no larger than
-  `SENCORES`;
+- `core_split_estimate` comes from `work_division.core_split`, so analysis and
+  work division use the same core-split estimate;
 - `selected_device_span_stride_elems` is the product of all inner physical dims,
   including the stick dim;
 - `itemsize` is the dtype size in bytes.
@@ -225,16 +229,10 @@ per-tile host size     = 1639
 ```
 
 If the required count is not itself a divisor, the pass considers larger exact
-divisors up to this cap:
-
-```python
-max_reasonable_split = required_count * max_cores
-```
-
-Candidates must also preserve physical stick alignment.  If every legal
-candidate either still overflows, cuts through a stick, or exceeds the cap, the
-pass raises `Unsupported` rather than emitting a plan that still overflows or
-would generate excessive `LoopSpec` / SDSC iterations.
+divisors of the selected dimension.  Candidates must also preserve physical
+stick alignment.  If every legal candidate either still overflows or cuts
+through a stick, the pass raises `Unsupported` rather than emitting a plan that
+still overflows or would corrupt physical stick addressing.
 
 ## Internal Planner Flow
 
@@ -255,8 +253,8 @@ plan_span_overflow_tile()
 
 The important detail is that `_post_tile_validated_split_count()` is not just a
 rounding helper.  It is the guardrail that keeps the planner from accepting a
-split count until the candidate is exact-divisible, within the over-split cap,
-stick-aligned, and safe under the rebuilt per-tile `SpyreTensorLayout`.
+split count until the candidate is exact-divisible, stick-aligned, and safe
+under the rebuilt per-tile `SpyreTensorLayout`.
 
 ## Post-Tile Validation
 
@@ -273,18 +271,22 @@ split_count:  5
 after tiling: [1, 1639, 256, 64]
 ```
 
-Only if the candidate is exact-divisible, stick-aligned, within the split cap,
-and passes the post-tile span/total checks does the planner return the split
-count.  This prevents the analysis from approving a tile count that looks safe
-in the original layout but is unsafe after Spyre layout reconstruction.
+Only if the candidate is exact-divisible, stick-aligned, and passes the
+post-tile span/total checks does the planner return the split count.  This
+prevents the analysis from approving a tile count that looks safe in the
+original layout but is unsafe after Spyre layout reconstruction.
 
 ## Adapter and Coarse-Tile Consumption
 
 The adapter lives in `coarse_tile.span_overflow_groups()`.
 
-When user `spyre_hint` groups exist, they take precedence.  Automatic
-span-overflow groups are only generated when no user coarse-tiling groups were
-found.
+User `spyre_hint` groups take precedence per operation.  Automatic
+span-overflow groups are generated only for eligible pointwise ops that do not
+already carry user `dim_hints`.  Mixed graphs can therefore contain both manual
+hint groups and automatic span-overflow groups in the same `coarse_tile()` call.
+
+`span_overflow_groups()` returns no groups when `config.chunk_large_tensors` or
+`config.ignore_wsr_hints` is enabled.
 
 For every returned plan, the adapter:
 
@@ -361,10 +363,10 @@ The pass raises `Unsupported` when automatic tiling would need behavior outside
 the current pointwise contract.  Common cases are:
 
 - the selected host dimension is not present in `op.data.ranges`;
+- the op has symbolic layout metadata, which is skipped before planning;
 - the selected range is symbolic or otherwise not an integer size;
 - the selected range is size 1 and cannot be tiled;
 - the required split count is larger than the selected dimension;
-- the smallest legal divisor exceeds the over-split cap;
 - every legal divisor cuts through physical sticks;
 - no divisor of the selected dimension makes the post-tile layout safe; or
 - the adapter cannot map the selected output coordinate to exactly one loop
@@ -395,7 +397,7 @@ Recommended coverage:
 |---|---|
 | `torch_spyre/_inductor/span_overflow_hint_analysis.py` | Pointwise planner: choose selected dim and split count |
 | `torch_spyre/_inductor/coarse_tile.py` | Adapter (`span_overflow_groups`) and coarse-tile IR stamping |
-| `torch_spyre/_inductor/passes.py` | Invokes automatic span-overflow groups when no user hint groups exist |
+| `torch_spyre/_inductor/passes.py` | Combines user hint groups and automatic span-overflow groups, then invokes coarse tiling |
 | `torch_spyre/_inductor/scheduler.py` | Wraps stamped ops in `CountedLoopSchedulerNode` |
 | `torch_spyre/_inductor/spyre_kernel.py` | Emits `LoopSpec` around generated `OpSpec` objects |
 | `tests/inductor/test_span_overflow_hint_analysis.py` | Unit/codegen coverage for the planner-to-LoopSpec path |
@@ -408,6 +410,8 @@ The pointwise implementation is intentionally narrow:
   automatically.
 - The op must have a `FixedTiledLayout`; the policy depends on Spyre physical
   `device_size` and `stride_map`.
+- Symbolic layout metadata is skipped because exact divisor selection and
+  post-tile layout validation require concrete sizes.
 - The planner emits one coarse-tile level over one output/host dimension.
 - `span_overflow_groups()` emits one group per planned op; it does not yet try
   to coalesce producer/consumer chains into a shared automatic group.
@@ -417,8 +421,6 @@ The pointwise implementation is intentionally narrow:
   divides `op.data.ranges` and `op.layout.size` by the loop count.
 - Candidate tiles must stay physical-stick aligned; the pass rejects candidates
   that would cut through sticks.
-- Candidate split counts are capped to avoid generating excessive `LoopSpec`
-  iterations and many SDSC files.
 - If no divisor of the selected dimension makes the post-tile layout safe, the
   pass raises `Unsupported`; it does not try a later mapped dimension, emit
   nested multi-dimensional tile plans, or search split combinations across

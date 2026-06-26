@@ -26,7 +26,7 @@ from torch_spyre._C import SpyreTensorLayout
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
-from .work_division import MAX_SPAN_BYTES
+from .work_division import MAX_SPAN_BYTES, core_split
 
 
 logger = get_inductor_logger("span_overflow_hint_analysis")
@@ -69,11 +69,25 @@ class SpanDimInfo:
 
 
 def _find_max_divisible_core_split(dim_size: int, max_cores: int) -> int:
-    """Return the largest core split that evenly divides the dim."""
-    for i in range(min(max_cores, dim_size), 0, -1):
-        if dim_size % i == 0:
-            return i
-    return 1
+    """Return the work-division core split estimate for one dim."""
+    return core_split(dim_size, max_cores)
+
+
+def _layout_has_static_span_metadata(layout: FixedTiledLayout) -> bool:
+    """Return True when span planning can use concrete layout metadata."""
+    try:
+        for values in (
+            layout.size,
+            layout.stride,
+            layout.device_layout.device_size,
+            layout.device_layout.stride_map,
+        ):
+            for value in values:
+                int(value)
+        int(layout.device_layout.elems_per_stick())
+    except (TypeError, ValueError):
+        return False
+    return True
 
 
 def _iter_span_dim_infos(
@@ -89,30 +103,31 @@ def _iter_span_dim_infos(
 
     infos: list[SpanDimInfo] = []
     skipped_outer_device_dims: list[int] = []
-    seen_host_dims: set[int] = set()
-
     for device_dim in range(len(device_size) - 1):
+        if device_size[device_dim] <= 1:
+            skipped_outer_device_dims.append(device_dim)
+            continue
+
         sm = int(stl.stride_map[device_dim])
         if sm <= 0:
             skipped_outer_device_dims.append(device_dim)
             continue
 
-        matching_dims = [
+        exact_matches = [
+            d for d, s in enumerate(host_stride) if host_size[d] > 1 and s == sm
+        ]
+        stick_scaled_matches = [
             d
             for d, s in enumerate(host_stride)
-            if host_size[d] > 1 and (s == sm or s * stick_elems == sm)
+            if host_size[d] > 1 and s * stick_elems == sm and d not in exact_matches
         ]
+        matching_dims = exact_matches or stick_scaled_matches
 
         if not matching_dims:
             skipped_outer_device_dims.append(device_dim)
             continue
 
         selected_host_dim = matching_dims[0]
-        if selected_host_dim in seen_host_dims:
-            skipped_outer_device_dims.append(device_dim)
-            continue
-        seen_host_dims.add(selected_host_dim)
-
         selected_device_dim_size = device_size[device_dim]
         infos.append(
             SpanDimInfo(
@@ -252,25 +267,6 @@ def _within_stick_host_dim(layout: FixedTiledLayout) -> int:
     )
 
 
-def _post_tile_stick_alignment_ok(
-    original_layout: FixedTiledLayout,
-    selected_host_dim: int,
-    split_count: int,
-) -> bool:
-    """Return whether the selected tile preserves physical stick alignment."""
-    if split_count <= 1:
-        return True
-
-    within_stick_dim = _within_stick_host_dim(original_layout)
-    if selected_host_dim != within_stick_dim:
-        return True
-
-    full_size = int(original_layout.size[selected_host_dim])
-    tile_size = full_size // split_count
-    stick_elems = original_layout.device_layout.elems_per_stick()
-    return tile_size % stick_elems == 0
-
-
 def _post_tile_stick_alignment_error(
     original_layout: FixedTiledLayout,
     selected_host_dim: int,
@@ -305,18 +301,6 @@ def _post_tile_span_ok(
     op_name: str,
 ) -> bool:
     """Return whether the post-tile layout fits span and total limits."""
-    if not _post_tile_stick_alignment_ok(
-        original_layout, selected_host_dim, split_count
-    ):
-        logger.debug(
-            "plan_span_overflow_tile: %s candidate=%d rejected because it "
-            "creates a non-stick-aligned tile on host dim %d",
-            op_name,
-            split_count,
-            selected_host_dim,
-        )
-        return False
-
     tiled_layout = _post_tile_layout(
         original_layout,
         selected_host_dim,
@@ -347,22 +331,13 @@ def _post_tile_validated_split_count(
     """Return the smallest bounded, stick-safe split count that validates."""
     initial = _choose_divisible_split_count(full_size, required_count)
     selected_host_dim = chunking_info.selected_host_dim
-    max_reasonable_split = required_count * max(1, max_cores)
-    if initial > max_reasonable_split:
-        raise Unsupported(
-            f"Cannot auto-tile {op_name}: selected host dim size {full_size} "
-            f"requires at least {required_count} tiles, but the smallest legal "
-            f"divisor is {initial}, which exceeds the over-split cap "
-            f"{max_reasonable_split}."
-        )
-
     candidates = sorted(
         {
             d
             for i in range(1, math.isqrt(full_size) + 1)
             if full_size % i == 0
             for d in (i, full_size // i)
-            if required_count <= d <= max_reasonable_split
+            if d >= required_count
         }
     )
 
@@ -518,6 +493,9 @@ def plan_span_overflow_tile(
         and isinstance(op.data, Pointwise)
         and isinstance(op.layout, FixedTiledLayout)
     ):
+        return None
+
+    if not _layout_has_static_span_metadata(op.layout):
         return None
 
     return _plan_pointwise_span_overflow_tile(op, max_cores)
