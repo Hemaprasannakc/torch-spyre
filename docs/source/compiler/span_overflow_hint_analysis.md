@@ -90,15 +90,17 @@ manual `spyre_hint` groups share the same IR stamping, scheduler wrapping, and
 
 ## Scope
 
-The initial pass is deliberately conservative:
+The pass is deliberately conservative:
 
 - supports `ComputedBuffer` operations whose `data` is `Pointwise`;
 - requires a `FixedTiledLayout`, because decisions are based on Spyre physical
   device layout;
-- produces one coarse-tile level over one output dimension;
-- raises `Unsupported` if the selected dimension cannot be tiled enough to make
-  the post-tile layout safe;
-- does not yet auto-tile reductions or reduction ranges.
+- produces one coarse-tile level over one selected output dimension;
+- requires the split count to exactly divide that selected dimension;
+- rejects candidates that would cut through physical sticks;
+- caps the split count to avoid excessive `LoopSpec` / SDSC generation;
+- raises `Unsupported` if the selected dimension cannot be tiled safely;
+- does not auto-tile reductions or reduction ranges.
 
 This keeps the pass as a planner.  Coarse tiling owns mutation of
 `op.data.ranges`, layout sizes, `CoarseTileInfo`, and scheduler/codegen loop
@@ -160,7 +162,11 @@ stride_map  = [16384, 64, 64, -1, 1]
 The first useful physical dimension has `stride_map=16384`, matching host dim
 1, so the selected dimension is the `H`-like dimension of size `8195`.
 
-Skipped outer device dimensions are kept only for debug context.  They do not
+The current policy uses this first mapped span-controlling dimension only.  If
+validation fails for that selected dimension, the planner raises `Unsupported`;
+it does not try the next mapped dimension or build a multi-dimensional tile plan.
+
+Skipped outer device dimensions are diagnostic context only.  They do not
 multiply the span calculation, because constant outer coordinates do not
 increase the per-core address span seen by `work_division`.
 
@@ -218,9 +224,17 @@ chosen split_count     = 5
 per-tile host size     = 1639
 ```
 
-If the required count is not itself a divisor, the pass tries the next larger
-divisor.  If no divisor on the selected dimension can satisfy the constraints,
-the pass raises `Unsupported` rather than emitting a plan that still overflows.
+If the required count is not itself a divisor, the pass considers larger exact
+divisors up to this cap:
+
+```python
+max_reasonable_split = required_count * max_cores
+```
+
+Candidates must also preserve physical stick alignment.  If every legal
+candidate either still overflows, cuts through a stick, or exceeds the cap, the
+pass raises `Unsupported` rather than emitting a plan that still overflows or
+would generate excessive `LoopSpec` / SDSC iterations.
 
 ## Internal Planner Flow
 
@@ -234,19 +248,22 @@ plan_span_overflow_tile()
        -> _compute_num_chunks()
        -> _post_tile_validated_split_count()
             -> _choose_divisible_split_count()
+            -> _post_tile_stick_alignment_error()
             -> _post_tile_span_ok()
                  -> _post_tile_layout()
 ```
 
 The important detail is that `_post_tile_validated_split_count()` is not just a
 rounding helper.  It is the guardrail that keeps the planner from accepting a
-split count until the rebuilt per-tile `SpyreTensorLayout` is safe.
+split count until the candidate is exact-divisible, within the over-split cap,
+stick-aligned, and safe under the rebuilt per-tile `SpyreTensorLayout`.
 
 ## Post-Tile Validation
 
 The initial span estimate is not the final check.  Before returning a plan, the
-pass rebuilds the per-tile `FixedTiledLayout` that coarse tiling will create and
-runs the span check again on that layout.
+pass rejects non-stick-aligned candidates, rebuilds the per-tile
+`FixedTiledLayout` that coarse tiling will create, and runs the span check again
+on that layout.
 
 For the `[1, 8195, 256, 64]` example:
 
@@ -256,10 +273,10 @@ split_count:  5
 after tiling: [1, 1639, 256, 64]
 ```
 
-Only if the post-tile physical layout passes the same span/total checks does the
-planner return the split count.  This prevents the analysis from approving a
-tile count that looks safe in the original layout but still violates the span
-limit after Spyre layout reconstruction.
+Only if the candidate is exact-divisible, stick-aligned, within the split cap,
+and passes the post-tile span/total checks does the planner return the split
+count.  This prevents the analysis from approving a tile count that looks safe
+in the original layout but is unsafe after Spyre layout reconstruction.
 
 ## Adapter and Coarse-Tile Consumption
 
@@ -347,6 +364,8 @@ the current pointwise contract.  Common cases are:
 - the selected range is symbolic or otherwise not an integer size;
 - the selected range is size 1 and cannot be tiled;
 - the required split count is larger than the selected dimension;
+- the smallest legal divisor exceeds the over-split cap;
+- every legal divisor cuts through physical sticks;
 - no divisor of the selected dimension makes the post-tile layout safe; or
 - the adapter cannot map the selected output coordinate to exactly one loop
   symbol.
@@ -383,7 +402,7 @@ Recommended coverage:
 
 ## Current Limitations
 
-The pointwise implementation is intentionally narrow for the first PR:
+The pointwise implementation is intentionally narrow:
 
 - Only `ComputedBuffer` ops whose `data` is `Pointwise` are planned
   automatically.
@@ -396,13 +415,14 @@ The pointwise implementation is intentionally narrow for the first PR:
   `op_out_coords(op)`, so the adapter can create a valid synthetic `DimHint`.
 - Exact divisibility is required because current `coarse_tile` range rewriting
   divides `op.data.ranges` and `op.layout.size` by the loop count.
+- Candidate tiles must stay physical-stick aligned; the pass rejects candidates
+  that would cut through sticks.
+- Candidate split counts are capped to avoid generating excessive `LoopSpec`
+  iterations and many SDSC files.
 - If no divisor of the selected dimension makes the post-tile layout safe, the
-  pass raises `Unsupported`; it does not yet emit nested multi-dimensional tile
-  plans.
+  pass raises `Unsupported`; it does not try a later mapped dimension, emit
+  nested multi-dimensional tile plans, or search split combinations across
+  multiple host dimensions.
 - If `config.chunk_large_tensors` is enabled, `span_overflow_groups()` returns
   no groups so the legacy chunking path remains in control.
 - Reduction output-range tiling and reduction-range tiling are follow-up work.
-  The planned reduction phase should start conservatively with scalar
-  reductions whose output ranges can be tiled without splitting
-  `reduction_ranges`; reduction-dimension tiling needs separate policy and
-  validation.

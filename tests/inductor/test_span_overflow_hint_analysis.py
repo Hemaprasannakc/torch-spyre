@@ -285,6 +285,29 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertFalse(plan.is_reduction)
         self.assertEqual(plan.chunking_info.selected_device_dim_size, _E2E_SHAPE[1])
 
+    def test_planner_rejects_when_stick_dim_tile_is_unaligned(self):
+        # Granite-like vocab dim: 49159 is not 64-aligned.  The outermost
+        # span dim maps to the vocab/within-stick host dim and would choose
+        # split_count=11, producing tile size 4469, which cuts through a
+        # physical stick.  The planner must reject this instead of emitting
+        # an unsafe plan or falling back to an unrelated dimension.
+        op = _pointwise_op((8192, 49159))
+
+        with self.assertRaisesRegex(Unsupported, "stick alignment"):
+            plan_span_overflow_tile(op, max_cores=4)
+
+    def test_planner_rejects_excessive_split_count(self):
+        # Prime/non-friendly dims can require a legal divisor far larger than
+        # the split actually needed for span safety.  Reject instead of
+        # generating thousands of LoopSpec iterations / SDSC files.
+        op = _pointwise_op((1, 17, 16, 64))
+
+        with patch(
+            "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES", 32768
+        ):
+            with self.assertRaisesRegex(Unsupported, "over-split cap"):
+                plan_span_overflow_tile(op, max_cores=4)
+
     @patch("torch_spyre._inductor.span_overflow_hint_analysis._post_tile_span_ok")
     def test_planner_raises_when_no_divisor_satisfies_post_tile_span(
         self,
@@ -298,7 +321,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
     @patch("torch_spyre._inductor.span_overflow_hint_analysis._post_tile_span_ok")
     @patch("torch_spyre._inductor.span_overflow_hint_analysis._find_outermost_span_dim")
-    @patch("torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES", 1024)
+    @patch("torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES", 8192)
     def test_planner_falls_back_to_largest_host_dim_when_no_device_dim_maps(
         self,
         mock_find_outermost_span_dim,
@@ -306,12 +329,12 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
     ):
         mock_find_outermost_span_dim.return_value = None
         mock_post_tile_span_ok.return_value = True
-        op = _pointwise_op((4, 8, 16, 64))
+        op = _pointwise_op((4, 128, 16, 64))
 
         plan = plan_span_overflow_tile(op, max_cores=1)
 
         self.assertIsNotNone(plan)
-        self.assertEqual(plan.selected_host_dim, 3)
+        self.assertEqual(plan.selected_host_dim, 1)
         self.assertEqual(plan.chunking_info.selected_device_dim_size, 0)
         self.assertIn("no device dimension", plan.chunking_info.reason)
 

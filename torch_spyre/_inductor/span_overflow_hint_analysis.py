@@ -12,12 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Span-overflow analysis for oversized pointwise ops.
-
-This module only decides whether a pointwise ComputedBuffer should be coarse
-tiled and what single output dimension/count should be used.  The actual
-DimHint/group adaptation and execution path live in coarse tiling.
-"""
+"""Span-overflow tile planning for oversized pointwise ops."""
 
 from __future__ import annotations
 
@@ -39,13 +34,7 @@ logger = get_inductor_logger("span_overflow_hint_analysis")
 
 @dataclass(frozen=True)
 class ChunkingInfo:
-    """Physical span facts for one op before coarse tiling.
-
-    ``selected_host_dim`` is the logical/output dim we can tile.
-    ``selected_device_dim_size`` and ``selected_device_span_stride_elems`` are
-    the corresponding physical dim and inner physical stride used to estimate
-    work_division's per-core address span.
-    """
+    """Physical span facts for one op before coarse tiling."""
 
     total_bytes: int
     per_core_span: int
@@ -59,12 +48,7 @@ class ChunkingInfo:
 
 @dataclass(frozen=True)
 class SpanOverflowTilePlan:
-    """Coarse-tiling request produced by span-overflow analysis.
-
-    The adapter layer turns this into a synthetic DimHint/group, e.g.
-    ``selected_host_dim=1, split_count=5`` means tile output dim 1 into five
-    coarse-tile loop iterations.
-    """
+    """Coarse-tiling request produced by span-overflow analysis."""
 
     selected_host_dim: int
     split_count: int
@@ -85,36 +69,27 @@ class SpanDimInfo:
 
 
 def _find_max_divisible_core_split(dim_size: int, max_cores: int) -> int:
-    """Return the best work_division split estimate for one physical dim.
-
-    Example: ``dim_size=8195, max_cores=4`` returns 1, while
-    ``dim_size=8196, max_cores=4`` returns 4.
-    """
+    """Return the largest core split that evenly divides the dim."""
     for i in range(min(max_cores, dim_size), 0, -1):
         if dim_size % i == 0:
             return i
     return 1
 
 
-def _find_outermost_span_dim(
+def _iter_span_dim_infos(
     layout: FixedTiledLayout,
     max_cores: int,
-) -> SpanDimInfo | None:
-    """Find the outermost mapped device dim that can reduce memory span.
-
-    Device dims are walked outer-to-inner, skipping the final stick dim.  Dims
-    that cannot be mapped to a splittable host dim are skipped for selection.
-    Span math intentionally does not multiply skipped outer dims: this mirrors
-    work_division.get_per_core_span(), where constant outer coordinates do not
-    contribute to the per-core address span.
-    """
+) -> list[SpanDimInfo]:
+    """Return mappable span-controlling dims in outer-to-inner order."""
     stl = layout.device_layout
     device_size = [int(s) for s in stl.device_size]
     host_size = [int(s) for s in layout.size]
     host_stride = [int(s) for s in layout.stride]
     stick_elems = stl.elems_per_stick()
 
+    infos: list[SpanDimInfo] = []
     skipped_outer_device_dims: list[int] = []
+    seen_host_dims: set[int] = set()
 
     for device_dim in range(len(device_size) - 1):
         sm = int(stl.stride_map[device_dim])
@@ -122,8 +97,6 @@ def _find_outermost_span_dim(
             skipped_outer_device_dims.append(device_dim)
             continue
 
-        # For a non-stick host dim, stride_map is the host stride.  For the
-        # outer-stick device dim, stride_map can be host_stride * stick_elems.
         matching_dims = [
             d
             for d, s in enumerate(host_stride)
@@ -134,30 +107,44 @@ def _find_outermost_span_dim(
             skipped_outer_device_dims.append(device_dim)
             continue
 
+        selected_host_dim = matching_dims[0]
+        if selected_host_dim in seen_host_dims:
+            skipped_outer_device_dims.append(device_dim)
+            continue
+        seen_host_dims.add(selected_host_dim)
+
         selected_device_dim_size = device_size[device_dim]
-        return SpanDimInfo(
-            selected_host_dim=matching_dims[0],
-            selected_device_dim_size=selected_device_dim_size,
-            selected_device_span_stride_elems=math.prod(device_size[device_dim + 1 :]),
-            core_split_estimate=_find_max_divisible_core_split(
-                selected_device_dim_size, max_cores
-            ),
-            skipped_outer_device_dims=tuple(skipped_outer_device_dims),
+        infos.append(
+            SpanDimInfo(
+                selected_host_dim=selected_host_dim,
+                selected_device_dim_size=selected_device_dim_size,
+                selected_device_span_stride_elems=math.prod(
+                    device_size[device_dim + 1 :]
+                ),
+                core_split_estimate=_find_max_divisible_core_split(
+                    selected_device_dim_size, max_cores
+                ),
+                skipped_outer_device_dims=tuple(skipped_outer_device_dims),
+            )
         )
 
-    return None
+    return infos
+
+
+def _find_outermost_span_dim(
+    layout: FixedTiledLayout,
+    max_cores: int,
+) -> SpanDimInfo | None:
+    """Find the outermost mapped device dim that can reduce memory span."""
+    infos = _iter_span_dim_infos(layout, max_cores)
+    return infos[0] if infos else None
 
 
 def _compute_num_chunks(
     chunking_info: ChunkingInfo,
     max_cores: int,
 ) -> int:
-    """Return the minimum coarse-tile count required by hardware limits.
-
-    ``num_from_span`` asks how many coarse tiles are needed so the selected
-    physical dim's per-core span is under 256 MB.  ``num_from_total`` is a
-    whole-tensor safety check against ``256 MB * SENCORES``.
-    """
+    """Return the minimum coarse-tile count required by span and total limits."""
     if chunking_info.selected_device_dim_size == 0:
         return max(
             1, math.ceil(chunking_info.total_bytes / (MAX_SPAN_BYTES * max_cores))
@@ -169,12 +156,7 @@ def _compute_num_chunks(
 
 
 def _choose_divisible_split_count(full_size: int, required_count: int) -> int:
-    """Choose the smallest legal coarse-tile count at least ``required_count``.
-
-    ``coarse_tile`` currently requires exact divisibility when it divides
-    op.data.ranges by the loop count.  Span analysis gives a minimum safe
-    count; this helper rounds that up to the smallest divisor of ``full_size``.
-    """
+    """Choose the smallest divisor of ``full_size`` at least ``required_count``."""
     if required_count <= 1:
         return 1
     if required_count > full_size:
@@ -201,13 +183,7 @@ def _post_tile_layout(
     split_count: int,
     op_name: str,
 ) -> FixedTiledLayout:
-    """Build the per-tile layout that coarse_tile._divide_ranges would create.
-
-    Example: shape ``[1, 8195, 256, 64]`` tiled on dim 1 by 5 becomes
-    ``[1, 1639, 256, 64]``.  We rebuild ``SpyreTensorLayout`` for that tile
-    shape so validation uses the same physical layout model as downstream
-    coarse tiling.
-    """
+    """Build the per-tile layout used for post-tile validation."""
     if split_count <= 0:
         raise Unsupported(
             f"Cannot auto-tile {op_name}: split_count must be positive, "
@@ -239,8 +215,6 @@ def _post_tile_layout(
     new_size[selected_host_dim] = full_size // split_count
     new_stride = list(FlexibleLayout.contiguous_strides(new_size))
 
-    # Mirror coarse_tile's range division closely enough for analysis: compute
-    # contiguous per-tile host strides, then rebuild the Spyre physical layout.
     orig_stl = original_layout.device_layout
     sm_last = int(list(orig_stl.stride_map)[-1])
     new_strides_ints = [int(s) for s in new_stride]
@@ -268,6 +242,61 @@ def _post_tile_layout(
     )
 
 
+def _within_stick_host_dim(layout: FixedTiledLayout) -> int:
+    """Return the host dim represented by the physical within-stick dim."""
+    sm_last = int(list(layout.device_layout.stride_map)[-1])
+    host_stride = [int(s) for s in layout.stride]
+    return next(
+        (i for i, s in enumerate(host_stride) if s == sm_last),
+        len(host_stride) - 1,
+    )
+
+
+def _post_tile_stick_alignment_ok(
+    original_layout: FixedTiledLayout,
+    selected_host_dim: int,
+    split_count: int,
+) -> bool:
+    """Return whether the selected tile preserves physical stick alignment."""
+    if split_count <= 1:
+        return True
+
+    within_stick_dim = _within_stick_host_dim(original_layout)
+    if selected_host_dim != within_stick_dim:
+        return True
+
+    full_size = int(original_layout.size[selected_host_dim])
+    tile_size = full_size // split_count
+    stick_elems = original_layout.device_layout.elems_per_stick()
+    return tile_size % stick_elems == 0
+
+
+def _post_tile_stick_alignment_error(
+    original_layout: FixedTiledLayout,
+    selected_host_dim: int,
+    split_count: int,
+) -> str | None:
+    """Return a diagnostic if coarse tiling cuts through physical sticks."""
+    if split_count <= 1:
+        return None
+
+    within_stick_dim = _within_stick_host_dim(original_layout)
+    if selected_host_dim != within_stick_dim:
+        return None
+
+    full_size = int(original_layout.size[selected_host_dim])
+    tile_size = full_size // split_count
+    stick_elems = original_layout.device_layout.elems_per_stick()
+    if tile_size % stick_elems == 0:
+        return None
+
+    return (
+        f"split_count {split_count} makes selected host dim {selected_host_dim} "
+        f"tile size {tile_size}, which is not aligned to Spyre stick size "
+        f"{stick_elems}; coarse-tile boundaries would cut through physical sticks"
+    )
+
+
 def _post_tile_span_ok(
     split_count: int,
     original_layout: FixedTiledLayout,
@@ -275,12 +304,19 @@ def _post_tile_span_ok(
     max_cores: int,
     op_name: str,
 ) -> bool:
-    """Return True if the post-coarse-tile layout no longer overflows.
+    """Return whether the post-tile layout fits span and total limits."""
+    if not _post_tile_stick_alignment_ok(
+        original_layout, selected_host_dim, split_count
+    ):
+        logger.debug(
+            "plan_span_overflow_tile: %s candidate=%d rejected because it "
+            "creates a non-stick-aligned tile on host dim %d",
+            op_name,
+            split_count,
+            selected_host_dim,
+        )
+        return False
 
-    This is the guardrail that keeps analysis honest: a candidate split count
-    is accepted only if the real per-tile physical layout would pass the same
-    span/total checks.
-    """
     tiled_layout = _post_tile_layout(
         original_layout,
         selected_host_dim,
@@ -308,43 +344,54 @@ def _post_tile_validated_split_count(
     original_layout: FixedTiledLayout,
     max_cores: int,
 ) -> int:
-    """Return the smallest legal split_count that makes the tiled layout safe.
-
-    The first candidate is the smallest divisor of ``full_size`` that is at
-    least the required count.  If that candidate still overflows after coarse
-    tile rebuilds the physical layout, walk larger divisors.  If no divisor on
-    this single selected dimension is sufficient, raise ``Unsupported`` instead
-    of emitting a tile plan that can still overflow.
-    """
+    """Return the smallest bounded, stick-safe split count that validates."""
     initial = _choose_divisible_split_count(full_size, required_count)
     selected_host_dim = chunking_info.selected_host_dim
+    max_reasonable_split = required_count * max(1, max_cores)
+    if initial > max_reasonable_split:
+        raise Unsupported(
+            f"Cannot auto-tile {op_name}: selected host dim size {full_size} "
+            f"requires at least {required_count} tiles, but the smallest legal "
+            f"divisor is {initial}, which exceeds the over-split cap "
+            f"{max_reasonable_split}."
+        )
 
-    if _post_tile_span_ok(
-        initial, original_layout, selected_host_dim, max_cores, op_name
-    ):
-        return initial
-
-    upper_divisors = sorted(
+    candidates = sorted(
         {
             d
             for i in range(1, math.isqrt(full_size) + 1)
             if full_size % i == 0
             for d in (i, full_size // i)
-            if d > initial
+            if required_count <= d <= max_reasonable_split
         }
     )
 
-    for candidate in upper_divisors:
+    stick_alignment_errors: list[str] = []
+    for candidate in candidates:
+        stick_error = _post_tile_stick_alignment_error(
+            original_layout, selected_host_dim, candidate
+        )
+        if stick_error is not None:
+            stick_alignment_errors.append(stick_error)
+            logger.debug(
+                "plan_span_overflow_tile: %s candidate=%d rejected: %s",
+                op_name,
+                candidate,
+                stick_error,
+            )
+            continue
+
         if _post_tile_span_ok(
             candidate, original_layout, selected_host_dim, max_cores, op_name
         ):
-            logger.debug(
-                "plan_span_overflow_tile: %s bumped split_count %d -> %d "
-                "after post-tile layout validation",
-                op_name,
-                initial,
-                candidate,
-            )
+            if candidate != initial:
+                logger.debug(
+                    "plan_span_overflow_tile: %s bumped split_count %d -> %d "
+                    "after post-tile layout validation",
+                    op_name,
+                    initial,
+                    candidate,
+                )
             return candidate
 
         logger.debug(
@@ -352,6 +399,14 @@ def _post_tile_validated_split_count(
             "post-tile layout validation; trying next divisor",
             op_name,
             candidate,
+        )
+
+    if stick_alignment_errors:
+        raise Unsupported(
+            f"Cannot auto-tile {op_name}: selected_host_dim size {full_size} "
+            f"has no legal split >= {required_count} that preserves Spyre "
+            f"stick alignment. First rejected candidate: "
+            f"{stick_alignment_errors[0]}."
         )
 
     raise Unsupported(
@@ -373,12 +428,7 @@ def _needs_chunking(
     op_name: str | None = None,
     trigger: str = "output_span",
 ) -> ChunkingInfo | None:
-    """Return chunking info if this layout exceeds span or total limits.
-
-    The span formula intentionally matches work_division's model:
-    ``ceil(selected_device_dim_size / core_split_estimate) * inner_stride *
-    itemsize``.  Skipped outer device dims are debug context, not multipliers.
-    """
+    """Return chunking info when the layout exceeds span or total limits."""
     device_size = [int(s) for s in layout.device_layout.device_size]
     itemsize = layout.dtype.itemsize
     total_bytes = math.prod(device_size) * itemsize
@@ -409,8 +459,6 @@ def _needs_chunking(
     selected_device_dim_size = span_dim_info.selected_device_dim_size
     selected_device_span_stride_elems = span_dim_info.selected_device_span_stride_elems
     core_split_estimate = span_dim_info.core_split_estimate
-    # Match work_division.get_per_core_span(): first varying physical dim's
-    # per-core extent times all inner physical dimensions, in bytes.
     per_core_span = (
         math.ceil(selected_device_dim_size / core_split_estimate)
         * selected_device_span_stride_elems
@@ -518,9 +566,6 @@ def _plan_pointwise_span_overflow_tile(
     if required_count <= 1:
         return None
 
-    # Keep v1 conservative: use one selected dim only.  If no divisor of that
-    # dim validates, _post_tile_validated_split_count raises Unsupported rather
-    # than trying a nested multi-dimensional tile plan.
     split_count = _post_tile_validated_split_count(
         op.get_name(), full_size, required_count, chunking_info, op.layout, max_cores
     )
