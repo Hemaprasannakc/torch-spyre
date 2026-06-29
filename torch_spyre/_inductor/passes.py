@@ -43,8 +43,11 @@ from .temp_passes import (
     mark_direct_unit_bmm_pass,
     mm_to_bmm_pass,
 )
-
-from .coarse_tile import hints_to_coarse_tile_groups, reorder_unhinted_interlopers, span_overflow_groups
+from .coarse_tile import (
+    hints_to_coarse_tile_groups,
+    reorder_unhinted_interlopers,
+    span_overflow_groups,
+)
 from . import config
 from .propagate_hints import (
     collect_spyre_hints,

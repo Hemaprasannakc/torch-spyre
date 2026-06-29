@@ -383,7 +383,7 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
     """
     from . import config
 
-    if config.chunk_large_tensors or getattr(config, "ignore_wsr_hints", False):
+    if config.chunk_large_tensors or config.ignore_span_overflow_hints:
         return []
 
     groups: list[tuple] = []

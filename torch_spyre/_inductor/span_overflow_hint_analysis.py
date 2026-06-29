@@ -230,6 +230,9 @@ def _post_tile_layout(
     new_size[selected_host_dim] = full_size // split_count
     new_stride = list(FlexibleLayout.contiguous_strides(new_size))
 
+    # TODO: Replace this copied coarse_tile layout-resize pattern with the
+    # _resize_device_layout helper from PR #2912 once it lands.  The helper is
+    # more robust for preserving Spyre physical layout details.
     orig_stl = original_layout.device_layout
     sm_last = int(list(orig_stl.stride_map)[-1])
     new_strides_ints = [int(s) for s in new_stride]

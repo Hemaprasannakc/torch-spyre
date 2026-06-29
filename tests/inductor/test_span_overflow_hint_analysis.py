@@ -304,10 +304,10 @@ class TestSpanOverflowGroups(InductorTestCase):
         self.assertEqual(groups[0][0], [unhinted_op])
         self.assertEqual(getattr(hinted_op, "dim_hints")[0].hint_id, 1)
 
-    def test_ignore_wsr_hints_config_suppresses_groups(self):
+    def test_ignore_span_overflow_hints_config_suppresses_groups(self):
         op = _pointwise_op(_E2E_SHAPE)
 
-        with config.patch({"sencores": 4, "ignore_wsr_hints": True}):
+        with config.patch({"sencores": 4, "ignore_span_overflow_hints": True}):
             groups = _run_span_overflow_groups(op)
 
         self.assertEqual(groups, [])
