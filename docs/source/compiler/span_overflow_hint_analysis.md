@@ -72,13 +72,15 @@ groups in the exact format consumed by `coarse_tile()`:
 [([op], [(hint_id, split_count, is_reduction_level)])]
 ```
 
-`passes.py` wires this into `_maybe_coarse_tile()` after honoring the coarse-tiling debug flag:
+`passes.py` wires this into `_maybe_coarse_tile()` alongside user coarse-tiling hints:
 
 ```python
-if config.ignore_wsr_hints:
-    return
-
-groups = hints_to_coarse_tile_groups(graph) + span_overflow_groups(graph)
+groups = []
+if not config.ignore_wsr_hints:
+    reorder_unhinted_interlopers(graph)
+    groups += hints_to_coarse_tile_groups(graph)
+if not config.ignore_span_overflow_hints:
+    groups += span_overflow_groups(graph)
 if groups:
     groups.sort(key=graph_order)
     coarse_tile(graph, groups=groups)
@@ -286,7 +288,7 @@ already carry user `dim_hints`.  Mixed graphs can therefore contain both manual
 hint groups and automatic span-overflow groups in the same `coarse_tile()` call.
 
 `span_overflow_groups()` returns no groups when `config.chunk_large_tensors` or
-`config.ignore_wsr_hints` is enabled.
+`config.ignore_span_overflow_hints` is enabled.
 
 For every returned plan, the adapter:
 
@@ -425,6 +427,6 @@ The pointwise implementation is intentionally narrow:
   pass raises `Unsupported`; it does not try a later mapped dimension, emit
   nested multi-dimensional tile plans, or search split combinations across
   multiple host dimensions.
-- If `config.chunk_large_tensors` is enabled, `span_overflow_groups()` returns
-  no groups so the legacy chunking path remains in control.
+- If `config.chunk_large_tensors` or `config.ignore_span_overflow_hints` is
+  enabled, `span_overflow_groups()` returns no groups.
 - Reduction output-range tiling and reduction-range tiling are follow-up work.
