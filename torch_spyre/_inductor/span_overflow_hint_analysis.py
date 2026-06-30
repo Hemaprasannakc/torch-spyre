@@ -26,6 +26,7 @@ from torch_spyre._C import SpyreTensorLayout
 from .errors import Unsupported
 from .ir import FixedTiledLayout
 from .logging_utils import get_inductor_logger
+from .pass_utils import indirect_info_from_op
 from .work_division import MAX_SPAN_BYTES, core_split
 
 
@@ -486,6 +487,15 @@ def _needs_chunking(
     )
 
 
+def _has_indirect_reads(op: ComputedBuffer) -> bool:
+    """Return True if the op uses indirect/gather-style input reads."""
+    try:
+        _, _, indirect_sizes = indirect_info_from_op(op)
+    except (AttributeError, RuntimeError, TypeError, Unsupported):
+        return False
+    return indirect_sizes is not None
+
+
 def plan_span_overflow_tile(
     op: ComputedBuffer,
     max_cores: int,
@@ -499,6 +509,12 @@ def plan_span_overflow_tile(
         return None
 
     if not _layout_has_static_span_metadata(op.layout):
+        return None
+
+    # Gather/indirect-access ops can lower as Pointwise ComputedBuffers, but
+    # they require the dedicated indirect-access SDSC path rather than automatic
+    # output coarse tiling.
+    if _has_indirect_reads(op):
         return None
 
     return _plan_pointwise_span_overflow_tile(op, max_cores)

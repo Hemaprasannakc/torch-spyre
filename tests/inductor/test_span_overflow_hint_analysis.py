@@ -329,6 +329,17 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertFalse(plan.is_reduction)
         self.assertEqual(plan.chunking_info.selected_device_dim_size, _E2E_SHAPE[1])
 
+    def test_planner_skips_pointwise_with_indirect_reads(self):
+        op = _pointwise_op(_E2E_SHAPE)
+
+        with patch(
+            "torch_spyre._inductor.span_overflow_hint_analysis.indirect_info_from_op",
+            return_value=({"arg1"}, {}, {sympy.Symbol("indirect0"): 8}),
+        ):
+            plan = plan_span_overflow_tile(op, max_cores=4)
+
+        self.assertIsNone(plan)
+
     def test_planner_skips_size_one_device_dims(self):
         layout = SimpleNamespace(
             size=[1, 8195, 256, 64],
