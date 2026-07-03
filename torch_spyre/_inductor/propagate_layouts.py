@@ -48,7 +48,6 @@ from torch_spyre._C import (
     get_elem_in_stick,
 )
 from .errors import Unsupported
-from . import config
 from .constants import (
     BATCH_MATMUL_OP,
     COPY_BACK_CANDIDATE_ATTR,
@@ -990,8 +989,6 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
         if not isinstance(producer, ComputedBuffer):
             continue
         if isinstance(producer.layout, MutationLayoutSHOULDREMOVE):
-            continue
-        if config.chunk_large_tensors and isinstance(producer.data, Pointwise):
             continue
         if write_counts[source.name] != 1:
             continue

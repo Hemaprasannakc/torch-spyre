@@ -39,13 +39,15 @@ from unittest.mock import MagicMock, patch
 
 import sympy
 import torch
-from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise
+from torch._inductor.dependencies import MemoryDep
+from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.test_case import TestCase as InductorTestCase
 from torch._inductor.utils import run_and_get_code
 
 from torch_spyre._C import SpyreTensorLayout
 from torch_spyre._inductor import config
+from torch_spyre._inductor.constants import BATCH_MATMUL_OP
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.propagate_hints import DimHint
 from torch_spyre._inductor.coarse_tile import (
@@ -59,10 +61,16 @@ from torch_spyre._inductor.scheduler import (
     build_loop_scheduler_nodes,
 )
 from torch_spyre._inductor.span_overflow_hint_analysis import (
+    _bmm_output_symbol_to_dim,
+    _candidate_host_dims,
     _find_outermost_span_dim,
+    _input_read_deps,
+    _input_span_infos_controlled_by_output_dims,
+    _input_stick_alignment_error,
     plan_span_overflow_tile,
 )
 import torch_spyre._inductor.propagate_named_dims as _pnd
+import torch_spyre._inductor.span_overflow_hint_analysis as soha
 
 
 _LAUNCH_JOBPLAN = "torch_spyre.execution.kernel_runner.launch_jobplan"
@@ -75,6 +83,10 @@ def _fixed_tiled_layout(shape, dtype=torch.float16):
     stride = list(FlexibleLayout.contiguous_strides(size))
     stride_ints = [int(s) for s in stride]
     size_ints = [int(s) for s in size]
+    if not size_ints:
+        device_layout = SpyreTensorLayout([], dtype)
+        return FixedTiledLayout("spyre:0", dtype, size, stride, device_layout)
+
     within_stick_dim = len(size_ints) - 1
     dim_order = [i for i in range(len(size_ints)) if i != within_stick_dim]
     dim_order.append(within_stick_dim)
@@ -86,6 +98,21 @@ def _pointwise_op(shape, name="buf0"):
     """Return a real ComputedBuffer with a lightweight Pointwise mock."""
     data = MagicMock(spec=Pointwise)
     data.ranges = list(shape)
+    op = ComputedBuffer(
+        name=name,
+        layout=_fixed_tiled_layout(shape),
+        data=data,
+    )
+    op.operation_name = name
+    return op
+
+
+def _reduction_op(shape, reduction_ranges=(64,), name="buf0", reduction_type="sum"):
+    """Return a ComputedBuffer with a lightweight Reduction mock."""
+    data = MagicMock(spec=Reduction)
+    data.ranges = list(shape)
+    data.reduction_ranges = list(reduction_ranges)
+    data.reduction_type = reduction_type
     op = ComputedBuffer(
         name=name,
         layout=_fixed_tiled_layout(shape),
@@ -172,7 +199,7 @@ class TestSpanOverflowGroups(InductorTestCase):
     def test_no_overflow_returns_empty(self):
         op = _pointwise_op((1, 2, 16, 64), name="small_op")
 
-        with config.patch({"sencores": 4, "chunk_large_tensors": False}):
+        with config.patch({"sencores": 4}):
             groups = _run_span_overflow_groups(op)
 
         self.assertEqual(groups, [])
@@ -180,16 +207,35 @@ class TestSpanOverflowGroups(InductorTestCase):
     def test_overflow_pointwise_returns_one_group(self):
         op = _pointwise_op(_E2E_SHAPE)
 
-        with config.patch({"sencores": 4, "chunk_large_tensors": False}):
+        with config.patch({"sencores": 4}):
             groups = _run_span_overflow_groups(op)
 
         self.assertEqual(len(groups), 1)
         self.assertIs(groups[0][0][0], op)
 
+    def test_overflow_reduction_output_returns_one_group(self):
+        op = _reduction_op(_E2E_SHAPE)
+
+        with config.patch({"sencores": 4}):
+            groups = _run_span_overflow_groups(op)
+
+        self.assertEqual(len(groups), 1)
+        self.assertIs(groups[0][0][0], op)
+        self.assertFalse(groups[0][1][0][2])
+        self.assertFalse(op.dim_hints[0].is_reduction)
+
+    def test_scalar_reduction_skipped(self):
+        op = _reduction_op((), reduction_ranges=(8195, 256, 64))
+
+        with config.patch({"sencores": 4}):
+            groups = span_overflow_groups(_graph([op]))
+
+        self.assertEqual(groups, [])
+
     def test_group_structure(self):
         op = _pointwise_op(_E2E_SHAPE)
 
-        with config.patch({"sencores": 4, "chunk_large_tensors": False}):
+        with config.patch({"sencores": 4}):
             groups = _run_span_overflow_groups(op)
 
         self.assertEqual(len(groups), 1)
@@ -210,7 +256,7 @@ class TestSpanOverflowGroups(InductorTestCase):
         with patch(
             "torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld
         ):
-            with config.patch({"sencores": 4, "chunk_large_tensors": False}):
+            with config.patch({"sencores": 4}):
                 groups = span_overflow_groups(_graph([op0, op1]))
 
         self.assertEqual(len(groups), 2)
@@ -224,7 +270,7 @@ class TestSpanOverflowGroups(InductorTestCase):
 
         op = _pointwise_op(_E2E_SHAPE)
 
-        with config.patch({"sencores": 4, "chunk_large_tensors": False}):
+        with config.patch({"sencores": 4}):
             _run_span_overflow_groups(op)
 
         self.assertTrue(hasattr(op, "dim_hints"))
@@ -239,7 +285,7 @@ class TestSpanOverflowGroups(InductorTestCase):
     def test_trip_count_matches_level_and_hint(self):
         op = _pointwise_op(_E2E_SHAPE)
 
-        with config.patch({"sencores": 4, "chunk_large_tensors": False}):
+        with config.patch({"sencores": 4}):
             groups = _run_span_overflow_groups(op)
 
         _, levels = groups[0]
@@ -259,7 +305,7 @@ class TestSpanOverflowGroups(InductorTestCase):
         op.get_name.return_value = "non_fixed_tiled"
         op.get_operation_name.return_value = "non_fixed_tiled"
 
-        with config.patch({"sencores": 4, "chunk_large_tensors": False}):
+        with config.patch({"sencores": 4}):
             groups = span_overflow_groups(_graph([op]))
 
         self.assertEqual(groups, [])
@@ -268,16 +314,8 @@ class TestSpanOverflowGroups(InductorTestCase):
         op = _pointwise_op(_E2E_SHAPE)
         op.layout.size[1] = sympy.Symbol("s0")
 
-        with config.patch({"sencores": 4, "chunk_large_tensors": False}):
+        with config.patch({"sencores": 4}):
             groups = span_overflow_groups(_graph([op]))
-
-        self.assertEqual(groups, [])
-
-    def test_chunk_large_tensors_config_suppresses_groups(self):
-        op = _pointwise_op(_E2E_SHAPE)
-
-        with config.patch({"sencores": 4, "chunk_large_tensors": True}):
-            groups = _run_span_overflow_groups(op)
 
         self.assertEqual(groups, [])
 
@@ -294,7 +332,7 @@ class TestSpanOverflowGroups(InductorTestCase):
         ]
         unhinted_op = _pointwise_op(_E2E_SHAPE, name="unhinted")
 
-        with config.patch({"sencores": 4, "chunk_large_tensors": False}):
+        with config.patch({"sencores": 4}):
             with patch(
                 "torch_spyre._inductor.coarse_tile.op_out_coords",
                 _out_coords_for_bhld,
@@ -305,10 +343,10 @@ class TestSpanOverflowGroups(InductorTestCase):
         self.assertEqual(groups[0][0], [unhinted_op])
         self.assertEqual(getattr(hinted_op, "dim_hints")[0].hint_id, 1)
 
-    def test_ignore_span_overflow_hints_config_suppresses_groups(self):
+    def test_ignore_wsr_hints_config_suppresses_groups(self):
         op = _pointwise_op(_E2E_SHAPE)
 
-        with config.patch({"sencores": 4, "ignore_span_overflow_hints": True}):
+        with config.patch({"sencores": 4, "ignore_wsr_hints": True}):
             groups = _run_span_overflow_groups(op)
 
         self.assertEqual(groups, [])
@@ -338,6 +376,252 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             plan = plan_span_overflow_tile(op, max_cores=4)
 
         self.assertIsNone(plan)
+
+    def test_reduction_output_planner_selects_dim_and_split_count(self):
+        op = _reduction_op(_E2E_SHAPE)
+
+        plan = plan_span_overflow_tile(op, max_cores=4)
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.selected_host_dim, 1)
+        self.assertEqual(plan.split_count, _E2E_SPLIT_COUNT)
+        self.assertFalse(plan.is_reduction)
+
+    def test_scalar_reduction_planner_skips(self):
+        op = _reduction_op((), reduction_ranges=(8195, 256, 64))
+
+        plan = plan_span_overflow_tile(op, max_cores=4)
+
+        self.assertIsNone(plan)
+
+    def test_reduction_input_span_controlled_by_output_dim_plans_tile(self):
+        op = _reduction_op((4_194_304,), reduction_ranges=(64,))
+        m, k = sympy.symbols("m k")
+        input_dep = MemoryDep(
+            "arg0",
+            m * 64 + k,
+            (m, k),
+            (4_194_304, 64),
+        )
+        input_layout = _fixed_tiled_layout((4_194_304, 64))
+
+        with (
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+                256 * 1024 * 1024,
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._output_span_candidates_from_op",
+                return_value=[],
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._input_read_deps",
+                return_value=[(input_dep, input_layout)],
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._output_symbol_to_dim",
+                return_value={m: 0},
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._remaining_span_candidates_after_tile",
+                return_value=[],
+            ),
+        ):
+            plan = plan_span_overflow_tile(op, max_cores=1)
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.selected_host_dim, 0)
+        self.assertEqual(plan.split_count, 2)
+        self.assertIn("input span overflow", plan.reason)
+
+    def test_reduction_input_span_controlled_by_reduction_dim_is_known_gap(self):
+        op = _reduction_op((64,), reduction_ranges=(65536,))
+        n, k = sympy.symbols("n k")
+        input_dep = MemoryDep(
+            "arg0",
+            k * 64 + n,
+            (k, n),
+            (65536, 64),
+        )
+        input_layout = _fixed_tiled_layout((65536, 64))
+
+        with (
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+                256 * 1024 * 1024,
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._input_read_deps",
+                return_value=[(input_dep, input_layout)],
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._output_symbol_to_dim",
+                return_value={n: 0},
+            ),
+        ):
+            infos = _input_span_infos_controlled_by_output_dims(op, max_cores=1)
+            plan = plan_span_overflow_tile(op, max_cores=1)
+
+        self.assertEqual(infos, [])
+        self.assertIsNone(plan)
+
+    def test_bmm_input_span_controlled_by_n_dim_plans_output_tile(self):
+        op = _reduction_op(
+            (1, 16, 4_194_304), reduction_ranges=(64,), reduction_type=BATCH_MATMUL_OP
+        )
+        b, m, n, k = sympy.symbols("b m n k")
+        rhs_dep = MemoryDep(
+            "rhs",
+            n * 64 + k,
+            (n, k),
+            (4_194_304, 64),
+        )
+        rhs_layout = _fixed_tiled_layout((4_194_304, 64))
+
+        with (
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+                256 * 1024 * 1024,
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._output_span_candidates_from_op",
+                return_value=[],
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._input_read_deps",
+                return_value=[(rhs_dep, rhs_layout)],
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._output_symbol_to_dim",
+                return_value={b: 0, m: 1, n: 2},
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._remaining_span_candidates_after_tile",
+                return_value=[],
+            ),
+        ):
+            plan = plan_span_overflow_tile(op, max_cores=1)
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.selected_host_dim, 2)
+        self.assertEqual(plan.split_count, 2)
+        self.assertFalse(plan.is_reduction)
+
+    def test_bmm_input_span_controlled_by_k_dim_skips(self):
+        op = _reduction_op(
+            (1, 1, 64), reduction_ranges=(65536,), reduction_type=BATCH_MATMUL_OP
+        )
+        b, m, n, k = sympy.symbols("b m n k")
+        lhs_dep = MemoryDep(
+            "lhs",
+            k * 64 + m,
+            (k, m),
+            (65536, 64),
+        )
+        lhs_layout = _fixed_tiled_layout((65536, 64))
+
+        with (
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+                256 * 1024 * 1024,
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._input_read_deps",
+                return_value=[(lhs_dep, lhs_layout)],
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._output_symbol_to_dim",
+                return_value={b: 0, m: 1, n: 2},
+            ),
+        ):
+            infos = _input_span_infos_controlled_by_output_dims(op, max_cores=1)
+            plan = plan_span_overflow_tile(op, max_cores=1)
+
+        self.assertEqual(infos, [])
+        self.assertIsNone(plan)
+
+    def test_reduction_output_and_input_span_different_dims_can_emit_multilevel_plan(
+        self,
+    ):
+        op = _reduction_op((8192, 8192), reduction_ranges=(64,))
+        output_info = SimpleNamespace(
+            total_bytes=512 * 1024 * 1024,
+            per_core_span=512 * 1024 * 1024,
+            core_split_estimate=1,
+            selected_device_dim_size=8192,
+            selected_device_span_stride_elems=32768,
+            selected_host_dim=0,
+            stick_elems=64,
+            reason="output span overflow",
+        )
+        input_info = SimpleNamespace(
+            total_bytes=512 * 1024 * 1024,
+            per_core_span=512 * 1024 * 1024,
+            core_split_estimate=1,
+            selected_device_dim_size=8192,
+            selected_device_span_stride_elems=32768,
+            selected_host_dim=1,
+            stick_elems=64,
+            reason="input span overflow for arg0",
+        )
+        output_candidate = SimpleNamespace(chunking_info=output_info, source="output")
+        input_candidate = SimpleNamespace(chunking_info=input_info, source="input:arg0")
+
+        def remaining_after_tile(_op, _max_cores, split_by_host_dim):
+            if set(split_by_host_dim) == {0, 1}:
+                return []
+            return [object()]
+
+        with (
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+                256 * 1024 * 1024,
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._output_span_candidates_from_op",
+                return_value=[output_candidate],
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._input_span_candidates",
+                return_value=[input_candidate],
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._remaining_span_candidates_after_tile",
+                side_effect=remaining_after_tile,
+            ),
+        ):
+            plan = plan_span_overflow_tile(op, max_cores=1)
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(len(plan.levels), 2)
+        self.assertEqual({level.selected_host_dim for level in plan.levels}, {0, 1})
+
+    def test_input_read_deps_skips_bad_inputs_individually(self):
+        op = MagicMock(spec=ComputedBuffer)
+        bad_sym, good_sym = sympy.symbols("bad good")
+        bad_dep = MemoryDep("bad", bad_sym, (bad_sym,), (16,))
+        good_dep = MemoryDep("good", good_sym, (good_sym,), (16,))
+        op.get_read_writes.return_value = SimpleNamespace(reads=[bad_dep, good_dep])
+        good_layout = _fixed_tiled_layout((16,))
+
+        def fake_fixed_read_layout(buf):
+            if buf == "bad":
+                raise RuntimeError("bad layout")
+            return good_layout
+
+        with (
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis.V",
+                SimpleNamespace(graph=SimpleNamespace(get_buffer=lambda name: name)),
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._fixed_read_layout",
+                side_effect=fake_fixed_read_layout,
+            ),
+        ):
+            deps = _input_read_deps(op)
+
+        self.assertEqual(deps, [(good_dep, good_layout)])
 
     def test_planner_skips_size_one_device_dims(self):
         layout = SimpleNamespace(
@@ -380,7 +664,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         # an unsafe plan or falling back to an unrelated dimension.
         op = _pointwise_op((8192, 49159))
 
-        with self.assertRaisesRegex(Unsupported, "stick alignment"):
+        with self.assertRaisesRegex(Unsupported, "no combined split"):
             plan_span_overflow_tile(op, max_cores=4)
 
     def test_planner_allows_full_size_exact_divisor(self):
@@ -394,41 +678,191 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertIsNotNone(plan)
         self.assertEqual(plan.split_count, 17)
 
-    @patch("torch_spyre._inductor.span_overflow_hint_analysis._post_tile_span_ok")
-    def test_planner_raises_when_no_divisor_satisfies_post_tile_span(
-        self,
-        mock_post_tile_span_ok,
-    ):
-        mock_post_tile_span_ok.return_value = False
+    def test_planner_raises_when_no_combined_split_satisfies_post_tile_span(self):
         op = _pointwise_op(_E2E_SHAPE)
 
-        with self.assertRaisesRegex(Unsupported, "no divisor"):
-            plan_span_overflow_tile(op, max_cores=4)
+        with patch(
+            "torch_spyre._inductor.span_overflow_hint_analysis._remaining_span_candidates_after_tile",
+            return_value=[object()],
+        ):
+            with self.assertRaisesRegex(Unsupported, "no combined split"):
+                plan_span_overflow_tile(op, max_cores=4)
 
-    @patch("torch_spyre._inductor.span_overflow_hint_analysis._post_tile_span_ok")
-    @patch("torch_spyre._inductor.span_overflow_hint_analysis._find_outermost_span_dim")
     @patch("torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES", 8192)
-    def test_planner_falls_back_to_largest_host_dim_when_no_device_dim_maps(
-        self,
-        mock_find_outermost_span_dim,
-        mock_post_tile_span_ok,
-    ):
-        mock_find_outermost_span_dim.return_value = None
-        mock_post_tile_span_ok.return_value = True
+    def test_planner_falls_back_to_largest_host_dim_when_no_device_dim_maps(self):
         op = _pointwise_op((4, 128, 16, 64))
 
-        plan = plan_span_overflow_tile(op, max_cores=1)
+        with (
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._output_write_dep",
+                return_value=None,
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._iter_span_dim_infos",
+                return_value=[],
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._remaining_span_candidates_after_tile",
+                return_value=[],
+            ),
+        ):
+            plan = plan_span_overflow_tile(op, max_cores=1)
 
         self.assertIsNotNone(plan)
         self.assertEqual(plan.selected_host_dim, 1)
         self.assertEqual(plan.chunking_info.selected_device_dim_size, 0)
-        self.assertIn("no device dimension", plan.chunking_info.reason)
+        self.assertIn("largest host dim", plan.chunking_info.reason)
+
+    def test_reduction_skips_indirect_reads_even_when_span_overflows(self):
+        op = _reduction_op(_E2E_SHAPE)
+
+        with patch(
+            "torch_spyre._inductor.span_overflow_hint_analysis.indirect_info_from_op",
+            return_value=({"arg1"}, {}, {sympy.Symbol("indirect0"): 8}),
+        ):
+            plan = plan_span_overflow_tile(op, max_cores=4)
+
+        self.assertIsNone(plan)
+
+    def test_reduction_indirect_guard_is_op_level_not_per_dim(self):
+        op = _reduction_op(_E2E_SHAPE, reduction_ranges=(64,))
+        m, n, k = sympy.symbols("m n k")
+        input_dep = MemoryDep(
+            "arg0",
+            m * 256 * 64 + n * 64 + k,
+            (m, n, k),
+            (8192, 256, 64),
+        )
+        input_layout = _fixed_tiled_layout((8192, 256, 64))
+
+        with (
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis.indirect_info_from_op",
+                return_value=({"arg0"}, {}, {sympy.Symbol("indirect0"): 8}),
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._input_read_deps",
+                return_value=[(input_dep, input_layout)],
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._output_symbol_to_dim",
+                return_value={m: 0, n: 1},
+            ),
+        ):
+            plan = plan_span_overflow_tile(op, max_cores=1)
+
+        self.assertIsNone(plan)
+
+    def test_input_span_scan_continues_after_reduction_controlled_dim(self):
+        op = _reduction_op((4_194_304, 64), reduction_ranges=(65536,))
+        k, m, n = sympy.symbols("k m n")
+        input_dep = MemoryDep(
+            "arg0",
+            k * 4_194_304 * 64 + m * 64 + n,
+            (k, m, n),
+            (65536, 4_194_304, 64),
+        )
+        input_layout = _fixed_tiled_layout((65536, 4_194_304, 64))
+
+        with (
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+                256 * 1024 * 1024,
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._input_read_deps",
+                return_value=[(input_dep, input_layout)],
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._output_symbol_to_dim",
+                return_value={m: 0, n: 1},
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._device_coordinates_for_span",
+                return_value=[k, m, n],
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._remaining_span_candidates_after_tile",
+                return_value=[],
+            ),
+        ):
+            infos = _input_span_infos_controlled_by_output_dims(op, max_cores=1)
+            plan = plan_span_overflow_tile(op, max_cores=1)
+
+        self.assertEqual(len(infos), 1)
+        self.assertEqual(infos[0].chunking_info.selected_host_dim, 0)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.selected_host_dim, 0)
+
+    def test_bmm_symbol_map_requires_exactly_one_reduction_symbol(self):
+        op = _reduction_op(
+            (1, 16, 64), reduction_ranges=(64,), reduction_type=BATCH_MATMUL_OP
+        )
+        b, m, n, k0, k1 = sympy.symbols("b m n k0 k1")
+        dep0 = MemoryDep("lhs", k0 * 16 + m, (k0, m), (64, 16))
+        dep1 = MemoryDep("rhs", k1 * 64 + n, (k1, n), (64, 64))
+
+        with patch(
+            "torch_spyre._inductor.span_overflow_hint_analysis._output_symbol_to_dim",
+            return_value={b: 0, m: 1, n: 2},
+        ):
+            symbol_to_dim = _bmm_output_symbol_to_dim(
+                op,
+                [
+                    (dep0, _fixed_tiled_layout((64, 16))),
+                    (dep1, _fixed_tiled_layout((64, 64))),
+                ],
+            )
+
+        self.assertEqual(symbol_to_dim, {})
+
+    def test_input_stick_alignment_rejects_split_legal_on_output_layout(self):
+        op = _reduction_op((8190, 64), reduction_ranges=(64,))
+        m, n, k = sympy.symbols("m n k")
+        input_dep = MemoryDep(
+            "transposed_rhs",
+            k * 64 * 8192 + n * 8192 + m,
+            (k, n, m),
+            (64, 64, 8192),
+        )
+        input_layout = _fixed_tiled_layout((64, 64, 8192))
+
+        with (
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._input_read_deps",
+                return_value=[(input_dep, input_layout)],
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._output_symbol_to_dim",
+                return_value={m: 0, n: 1},
+            ),
+        ):
+            error = _input_stick_alignment_error(op, host_dim=0, split_count=3)
+
+        self.assertIsNotNone(error)
+        self.assertIn("transposed_rhs", error)
+        self.assertIn("host dim 2", error)
+
+    def test_candidate_host_dims_orders_by_decreasing_span_pressure(self):
+        candidates = [
+            SimpleNamespace(
+                chunking_info=SimpleNamespace(selected_host_dim=1, per_core_span=512)
+            ),
+            SimpleNamespace(
+                chunking_info=SimpleNamespace(selected_host_dim=0, per_core_span=2048)
+            ),
+            SimpleNamespace(
+                chunking_info=SimpleNamespace(selected_host_dim=2, per_core_span=1024)
+            ),
+        ]
+
+        self.assertEqual(_candidate_host_dims(candidates), [0, 2, 1])
 
     @patch("torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld)
     def test_adapter_creates_dim_hint_and_group(self):
         op = _pointwise_op(_E2E_SHAPE)
 
-        with config.patch({"sencores": 4, "chunk_large_tensors": False}):
+        with config.patch({"sencores": 4}):
             groups = span_overflow_groups(_graph([op]))
 
         self.assertEqual(len(groups), 1)
@@ -447,7 +881,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
     def test_adapter_handles_nontrivial_batch_coord(self):
         op = _pointwise_op((4, 8195, 256, 64))
 
-        with config.patch({"sencores": 4, "chunk_large_tensors": False}):
+        with config.patch({"sencores": 4}):
             groups = span_overflow_groups(_graph([op]))
 
         self.assertEqual(len(groups), 1)
@@ -465,7 +899,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
     ):
         op = _pointwise_op(_E2E_SHAPE)
 
-        with config.patch({"sencores": 4, "chunk_large_tensors": False}):
+        with config.patch({"sencores": 4}):
             graph = _graph([op])
             groups = span_overflow_groups(graph)
             coarse_tile(graph, groups)
@@ -475,6 +909,212 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertEqual(op.loop_info.loop_count, [sympy.Integer(_E2E_SPLIT_COUNT)])
         self.assertEqual(op.loop_info.loop_tiled_dims, [[1]])
         self.assertEqual(op.loop_info.loop_tiled_reduction_dims, [[]])
+
+
+class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
+    def test_output_symbol_mapping_keepdim_false(self):
+        op = _reduction_op((1024, 4096), reduction_ranges=(128,))
+        b, s = sympy.symbols("b s")
+
+        with patch.object(soha, "op_out_coords", return_value=[b, s]):
+            symbol_to_dim = soha._output_symbol_to_dim(op)
+
+        self.assertEqual(symbol_to_dim[b], 0)
+        self.assertEqual(symbol_to_dim[s], 1)
+
+    def test_output_symbol_mapping_keepdim_true(self):
+        op = _reduction_op((1024, 4096, 1), reduction_ranges=(128,))
+        b, s = sympy.symbols("b s")
+
+        with patch.object(soha, "op_out_coords", return_value=[b, s, sympy.Integer(0)]):
+            symbol_to_dim = soha._output_symbol_to_dim(op)
+
+        self.assertEqual(symbol_to_dim[b], 0)
+        self.assertEqual(symbol_to_dim[s], 1)
+        self.assertNotIn(sympy.Integer(0), symbol_to_dim)
+
+    def test_single_reduction_dim_output_controlled_input_span_plans(self):
+        op = _reduction_op((4_194_304,), reduction_ranges=(64,))
+        m, k = sympy.symbols("m k")
+        dep = MemoryDep("arg0", m * 64 + k, (m, k), (4_194_304, 64))
+        layout = _fixed_tiled_layout((4_194_304, 64))
+
+        with (
+            patch.object(soha, "MAX_SPAN_BYTES", 256 * 1024 * 1024),
+            patch.object(soha, "_output_span_candidates_from_op", return_value=[]),
+            patch.object(soha, "_input_read_deps", return_value=[(dep, layout)]),
+            patch.object(soha, "_output_symbol_to_dim", return_value={m: 0}),
+            patch.object(
+                soha, "_remaining_span_candidates_after_tile", return_value=[]
+            ),
+        ):
+            plan = plan_span_overflow_tile(op, max_cores=1)
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.selected_host_dim, 0)
+        self.assertEqual(plan.split_count, 2)
+
+    def test_multiple_reduction_dims_are_skipped_as_known_limitation(self):
+        op = _reduction_op((64,), reduction_ranges=(8192, 8192))
+        n, k0, k1 = sympy.symbols("n k0 k1")
+        dep = MemoryDep(
+            "arg0",
+            k0 * 8192 * 64 + k1 * 64 + n,
+            (k0, k1, n),
+            (8192, 8192, 64),
+        )
+        layout = _fixed_tiled_layout((8192, 8192, 64))
+
+        with (
+            patch.object(soha, "MAX_SPAN_BYTES", 256 * 1024 * 1024),
+            patch.object(soha, "_input_read_deps", return_value=[(dep, layout)]),
+            patch.object(soha, "_output_symbol_to_dim", return_value={n: 0}),
+        ):
+            infos = soha._input_span_infos_controlled_by_output_dims(op, max_cores=1)
+            plan = plan_span_overflow_tile(op, max_cores=1)
+
+        self.assertEqual(infos, [])
+        self.assertIsNone(plan)
+
+    def test_full_scalar_reduction_returns_none(self):
+        op = _reduction_op((), reduction_ranges=(4096, 4096, 128))
+
+        self.assertIsNone(plan_span_overflow_tile(op, max_cores=4))
+
+    def test_multiple_input_reads_aggregate_input_candidates(self):
+        op = _reduction_op((4_194_304,), reduction_ranges=(64,))
+        m, k = sympy.symbols("m k")
+        dep0 = MemoryDep("arg0", m * 64 + k, (m, k), (4_194_304, 64))
+        dep1 = MemoryDep("arg1", m * 64 + k, (m, k), (4_194_304, 64))
+        layout = _fixed_tiled_layout((4_194_304, 64))
+
+        with (
+            patch.object(soha, "MAX_SPAN_BYTES", 256 * 1024 * 1024),
+            patch.object(
+                soha, "_input_read_deps", return_value=[(dep0, layout), (dep1, layout)]
+            ),
+            patch.object(soha, "_output_symbol_to_dim", return_value={m: 0}),
+        ):
+            infos = soha._input_span_infos_controlled_by_output_dims(op, max_cores=1)
+
+        self.assertEqual(len(infos), 2)
+        self.assertEqual({info.dep_name for info in infos}, {"arg0", "arg1"})
+
+    def test_broadcasted_input_without_output_symbol_does_not_misfire(self):
+        op = _reduction_op((4_194_304,), reduction_ranges=(64,))
+        m, k = sympy.symbols("m k")
+        dep = MemoryDep("bias", k, (k,), (64,))
+        layout = _fixed_tiled_layout((64,))
+
+        with (
+            patch.object(soha, "MAX_SPAN_BYTES", 256 * 1024 * 1024),
+            patch.object(soha, "_input_read_deps", return_value=[(dep, layout)]),
+            patch.object(soha, "_output_symbol_to_dim", return_value={m: 0}),
+        ):
+            infos = soha._input_span_infos_controlled_by_output_dims(op, max_cores=1)
+
+        self.assertEqual(infos, [])
+
+    def test_break_to_continue_finds_inner_output_controlled_span(self):
+        op = _reduction_op((4_194_304, 64), reduction_ranges=(8192,))
+        k, m, n = sympy.symbols("k m n")
+        dep = MemoryDep(
+            "arg0",
+            k * 4_194_304 * 64 + m * 64 + n,
+            (k, m, n),
+            (8192, 4_194_304, 64),
+        )
+        layout = _fixed_tiled_layout((8192, 4_194_304, 64))
+
+        with (
+            patch.object(soha, "MAX_SPAN_BYTES", 256 * 1024 * 1024),
+            patch.object(soha, "_input_read_deps", return_value=[(dep, layout)]),
+            patch.object(soha, "_output_symbol_to_dim", return_value={m: 0, n: 1}),
+        ):
+            infos = soha._input_span_infos_controlled_by_output_dims(op, max_cores=1)
+
+        self.assertEqual(len(infos), 1)
+        self.assertEqual(infos[0].chunking_info.selected_host_dim, 0)
+
+    def test_transposed_bmm_input_stick_alignment_rejects_split(self):
+        op = _reduction_op(
+            (8190, 64), reduction_ranges=(64,), reduction_type=BATCH_MATMUL_OP
+        )
+        m, n, k = sympy.symbols("m n k")
+        dep = MemoryDep(
+            "transposed_rhs",
+            k * 64 * 8192 + n * 8192 + m,
+            (k, n, m),
+            (64, 64, 8192),
+        )
+        layout = _fixed_tiled_layout((64, 64, 8192))
+
+        with (
+            patch.object(soha, "_input_read_deps", return_value=[(dep, layout)]),
+            patch.object(soha, "_output_symbol_to_dim", return_value={m: 0, n: 1}),
+        ):
+            error = soha._input_stick_alignment_error(op, host_dim=0, split_count=3)
+
+        self.assertIsNotNone(error)
+        self.assertIn("transposed_rhs", error)
+
+    def test_pointwise_multiple_overflow_dims_emits_multilevel_plan(self):
+        op = _pointwise_op((4096, 4096, 4096, 64))
+
+        with patch.object(soha, "MAX_SPAN_BYTES", 256 * 1024 * 1024):
+            plan = plan_span_overflow_tile(op, max_cores=1)
+
+        self.assertIsNotNone(plan)
+        self.assertGreaterEqual(len(plan.levels), 2)
+
+    def test_pointwise_too_many_overflow_dims_raises(self):
+        op = _pointwise_op((64, 64, 64, 64, 64, 64))
+
+        with patch.object(soha, "MAX_SPAN_BYTES", 1):
+            with self.assertRaisesRegex(Exception, "bounded search limit"):
+                plan_span_overflow_tile(op, max_cores=1)
+
+    def test_coordinate_scan_fallback_still_plans_output_span(self):
+        op = _pointwise_op((1, 8195, 256, 64))
+
+        with patch.object(soha, "_output_write_dep", return_value=None):
+            plan = plan_span_overflow_tile(op, max_cores=4)
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.selected_host_dim, 1)
+
+    def test_reduction_indirect_read_guard(self):
+        op = _reduction_op((1, 8195, 256, 64), reduction_ranges=(128,))
+
+        with patch.object(
+            soha,
+            "indirect_info_from_op",
+            return_value=({"arg0"}, {}, {sympy.Symbol("indirect0"): 8}),
+        ):
+            plan = plan_span_overflow_tile(op, max_cores=4)
+
+        self.assertIsNone(plan)
+
+    def test_bmm_ambiguous_reduction_symbol_map_returns_empty(self):
+        op = _reduction_op(
+            (1, 16, 64), reduction_ranges=(64,), reduction_type=BATCH_MATMUL_OP
+        )
+        b, m, n, k0, k1 = sympy.symbols("b m n k0 k1")
+        dep0 = MemoryDep("lhs", k0 * 16 + m, (k0, m), (64, 16))
+        dep1 = MemoryDep("rhs", k1 * 64 + n, (k1, n), (64, 64))
+
+        with patch.object(
+            soha, "_output_symbol_to_dim", return_value={b: 0, m: 1, n: 2}
+        ):
+            symbol_to_dim = _bmm_output_symbol_to_dim(
+                op,
+                [
+                    (dep0, _fixed_tiled_layout((64, 16))),
+                    (dep1, _fixed_tiled_layout((64, 64))),
+                ],
+            )
+
+        self.assertEqual(symbol_to_dim, {})
 
 
 class TestSpanOverflowLargeShapeContract(InductorTestCase):
@@ -496,7 +1136,7 @@ class TestSpanOverflowLargeShapeContract(InductorTestCase):
             _out_coords_for_bhld,
         ):
             with patch("torch_spyre._inductor.coarse_tile.insert_tiling_propagation"):
-                with config.patch({"sencores": 4, "chunk_large_tensors": False}):
+                with config.patch({"sencores": 4}):
                     # Layer 2: adapter emits the same group shape as user hints.
                     auto_graph = _graph([auto_op])
                     auto_groups = span_overflow_groups(auto_graph)
@@ -562,7 +1202,6 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
     @config.patch(
         {
             "sencores": 4,
-            "chunk_large_tensors": False,
             "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
@@ -592,7 +1231,67 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
     @config.patch(
         {
             "sencores": 4,
-            "chunk_large_tensors": False,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_reduction_input_span_codegen_contains_auto_loop_spec(self):
+        x = torch.randn(2, 20, 16, 64, dtype=torch.float16).to("spyre")
+
+        def fn(x):
+            return x.sum(dim=0)
+
+        cfn = torch.compile(fn, dynamic=False)
+        with (
+            patch(_LAUNCH_JOBPLAN),
+            patch(_PREPARE_KERNEL),
+            patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, x)
+
+        self.assertTrue(source_codes)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src)
+        self.assertIn("count=sympify('10')", src)
+        self.assertIn("op='sum'", src)
+        self.assertIn("tiled_symbols=[[sympify('c0')]]", src)
+
+    @patch("torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES", 8192)
+    @config.patch(
+        {
+            "sencores": 4,
+            "unroll_loops": False,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_bmm_lm_head_codegen_contains_auto_loop_spec(self):
+        x = torch.randn(2, 64, dtype=torch.float16).to("spyre")
+        weight = torch.randn(1024, 64, dtype=torch.float16).to("spyre")
+
+        def fn(x, weight):
+            return torch.nn.functional.linear(x, weight)
+
+        cfn = torch.compile(fn, dynamic=False)
+        with (
+            patch(_LAUNCH_JOBPLAN),
+            patch(_PREPARE_KERNEL),
+            patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, x, weight)
+
+        self.assertTrue(source_codes)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src)
+        self.assertIn("count=sympify('16')", src)
+        self.assertIn("op='batchmatmul'", src)
+        self.assertIn("tiled_symbols=[[sympify('c0')]]", src)
+
+    @patch("torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES", 8192)
+    @config.patch(
+        {
+            "sencores": 4,
             "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,

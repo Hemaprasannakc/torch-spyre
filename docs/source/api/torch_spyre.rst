@@ -513,9 +513,6 @@ Environment Variables
      - Use the co-optimizing LX allocator strategy (default ``0``)
    * - ``SPYRE_INDUCTOR_MEMORY_PLAN``
      - Enable HBM / device-buffer memory planning (default ``1``)
-   * - ``CHUNK_LARGE_TENSORS``
-     - Run the ``chunk_large_tensors`` pass to split tensors that exceed
-       the per-core span (default ``0``)
    * - ``GLOBAL_STICK_OPTIMIZER``
      - Enable the global stick-dimension optimizer (default ``1``)
    * - ``SPYRE_CORE_ID_K_FAST_EMISSION``
