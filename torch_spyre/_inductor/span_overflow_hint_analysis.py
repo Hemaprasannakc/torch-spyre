@@ -386,20 +386,13 @@ def _coordinate_span_elems(
     dep: MemoryDep,
     split_by_symbol: dict[sympy.Symbol, int],
 ) -> int | None:
-    """Return how many values one physical device coordinate can take.
+    """Return a conservative span bound for one physical device coordinate.
 
-    ``split_by_symbol`` gives the hypothetical split count for each free
-    symbol in ``coord``; a symbol absent from the map is treated as unsplit
-    (split_count=1).  Each symbol's contribution is computed independently,
-    holding every other free symbol at its own extreme, then summed.  That is
-    exact for the additive stick/tile-index coordinates this pass reasons
-    about, including a coordinate jointly controlled by more than one output
-    symbol -- for example two interleaved dims sharing one physical stride.
-
-    Example: for LM-head restickify, ``coord = floor(d0 / 64)`` and
-    ``d0`` has range ``49216``.  With no split, the coordinate ranges from
-    ``0`` to ``768``, so the span is ``769``.  If ``d0`` is split by ``769``,
-    each tile has range ``64`` and the coordinate span becomes ``1``.
+    ``split_by_symbol`` gives the hypothetical split count for each free symbol
+    in ``coord``; a symbol absent from the map is treated as unsplit.  Plain
+    affine/floor terms are evaluated at endpoints.  Modulo terms are bounded by
+    their modulus because their maximum can occur just before wraparound rather
+    than at either endpoint.
     """
     per_core_max = 0
     per_core_min = 0
@@ -412,6 +405,12 @@ def _coordinate_span_elems(
             return None
         range_size //= split_count
         term = coord.subs({other: 0 for other in coord.free_symbols - {sym}})
+        if term.has(sympy.Mod):
+            modulus = min(int(mod.args[1]) for mod in term.atoms(sympy.Mod))
+            critical_point = min(range_size, modulus) - 1
+            per_core_max += int(term.subs(sym, critical_point))
+            per_core_min += int(term.subs(sym, 0))
+            continue
         per_core_max += int(term.subs(sym, range_size - 1))
         per_core_min += int(term.subs(sym, 0))
     return per_core_max - per_core_min + 1
@@ -560,6 +559,35 @@ def _output_write_dep(op: ComputedBuffer) -> MemoryDep | None:
     return dep
 
 
+def _output_dep_with_split_ranges(
+    dep: MemoryDep,
+    symbol_to_dim: dict[sympy.Symbol, int],
+    split_by_host_dim: dict[int, int],
+) -> MemoryDep | None:
+    """Return ``dep`` with ranges shrunk to model a hypothetical output tile."""
+    if not split_by_host_dim:
+        return dep
+
+    ranges: dict[sympy.Symbol, int] = {}
+    for sym, size in dep.ranges.items():
+        try:
+            range_size = int(size)
+        except (TypeError, ValueError):
+            return None
+        split_count = split_by_host_dim.get(symbol_to_dim.get(sym, -1), 1)
+        if range_size % split_count != 0:
+            return None
+        ranges[sym] = range_size // split_count
+
+    return MemoryDep(
+        dep.name,
+        dep.index,
+        tuple(ranges.keys()),
+        tuple(ranges.values()),
+        getattr(dep, "mode", None),
+    )
+
+
 def _output_span_candidates_from_op(
     op: ComputedBuffer,
     *,
@@ -584,30 +612,41 @@ def _output_span_candidates_from_op(
     layout = layout or op.layout
     split_by_host_dim = split_by_host_dim or {}
 
-    # Use the output MemoryDep address expression to derive physical device
-    # coordinates. If a supported op lacks usable write address math, fail loud
-    # instead of falling back to stride-map guessing.
     name = op_name or op.get_name()
     out_dep = _output_write_dep(op)
     if out_dep is None:
-        raise Unsupported(
-            f"Cannot auto-tile {name}: output write MemoryDep is unavailable "
-            "for address-math span analysis."
+        logger.debug(
+            "span_overflow_output: op=%s skipped; output write MemoryDep unavailable",
+            name,
         )
+        return []
 
     symbol_to_dim = _output_symbol_to_dim(op)
     if not symbol_to_dim:
-        raise Unsupported(
-            f"Cannot auto-tile {name}: could not map output iteration symbols "
-            "to output host dimensions."
+        logger.debug(
+            "span_overflow_output: op=%s skipped; output symbol map unavailable",
+            name,
         )
+        return []
+
+    out_dep = _output_dep_with_split_ranges(out_dep, symbol_to_dim, split_by_host_dim)
+    if out_dep is None:
+        logger.debug(
+            "span_overflow_output: op=%s skipped; output ranges do not match split %s",
+            name,
+            split_by_host_dim,
+        )
+        return []
 
     try:
         device_coords = _device_coordinates_for_span(layout, out_dep)
     except (TypeError, ValueError, RuntimeError, Unsupported) as exc:
-        raise Unsupported(
-            f"Cannot auto-tile {name}: output device-coordinate analysis failed."
-        ) from exc
+        logger.debug(
+            "span_overflow_output: op=%s skipped; device-coordinate analysis failed: %s",
+            name,
+            exc,
+        )
+        return []
 
     device_size = [int(s) for s in layout.device_layout.device_size]
     itemsize = layout.dtype.itemsize
@@ -855,11 +894,12 @@ def _host_dim_target_symbols(
     dim space, but each input dependency may place the same symbol at a
     different input host dim or physical stick position.
     """
-    symbol_to_dim = (
-        _bmm_output_symbol_to_dim(op, _input_read_deps(op))
-        if _is_batch_matmul_reduction(op)
-        else _output_symbol_to_dim(op)
-    )
+    if _is_batch_matmul_reduction(op):
+        symbol_to_dim = _bmm_output_symbol_to_dim(op, _input_read_deps(op))
+        if not symbol_to_dim:
+            symbol_to_dim = _output_symbol_to_dim(op)
+    else:
+        symbol_to_dim = _output_symbol_to_dim(op)
     return {sym for sym, dim in symbol_to_dim.items() if dim == host_dim}
 
 

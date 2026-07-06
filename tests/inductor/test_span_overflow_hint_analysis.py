@@ -1173,34 +1173,21 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
         spans = {c.chunking_info.per_core_span for c in candidates}
         self.assertEqual(len(spans), 1)
 
-    def test_pointwise_entangled_dim_discovered_only_on_retile_raises(self):
-        """Three equal-sized dims can physically interleave on retile.
+    def test_pointwise_post_tile_validation_uses_tiled_ranges(self):
+        """Post-tile validation must model the per-tile iteration domain.
 
-        For this shape, the untiled layout's device coordinates map cleanly to
-        host dims 1 and 2 only -- those are the only candidates the initial
-        scan finds.  But ``_resize_device_layout`` reassigns physical
-        positions once a hypothetical tile is applied, and for this
-        all-equal-dims shape that reassignment entangles a third logical dim
-        onto one physical coordinate together with dim 1.  That entangled
-        coordinate is now correctly evaluated (it is no longer silently
-        skipped, see the joint-symbol-coordinate tests above) and still
-        overflows for every combo of splitting dims 1 and 2 alone.
-
-        The search only ever considers host dims discovered by the *initial*
-        untiled scan; it does not widen its search when post-tile
-        re-validation surfaces overflow tied to a dim outside that set.  So
-        the planner correctly raises ``Unsupported`` here rather than
-        emitting a plan that still leaves that entangled coordinate over the
-        limit -- this used to silently "succeed" before the joint-coordinate
-        fix, which is exactly the bug that fix closes.  Widening the search to
-        absorb newly-discovered dims is tracked as follow-up work (see
-        Known Limitations in the docs).
+        This shape used to raise because validation rebuilt a shrunk output
+        layout but kept the original full output ``MemoryDep.ranges``.  The
+        mismatched domain made revalidation report an overflow tied to a dim
+        outside the initial candidate set.  With tiled ranges, the selected
+        split validates against the same domain the real tiled kernel executes.
         """
         op = _pointwise_op((4096, 4096, 4096, 64))
 
         with patch.object(soha, "MAX_SPAN_BYTES", 256 * 1024 * 1024):
-            with self.assertRaisesRegex(Unsupported, "no combined split"):
-                plan_span_overflow_tile(op, max_cores=1)
+            plan = plan_span_overflow_tile(op, max_cores=1)
+
+        self.assertIsNotNone(plan)
 
     def test_pointwise_too_many_overflow_dims_raises(self):
         op = _pointwise_op((64, 64, 64, 64, 64, 64))
@@ -1209,12 +1196,20 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
             with self.assertRaisesRegex(Exception, "bounded search limit"):
                 plan_span_overflow_tile(op, max_cores=1)
 
-    def test_missing_output_write_dep_is_unsupported(self):
+    def test_missing_output_write_dep_skips_auto_tiling(self):
         op = _pointwise_op((1, 8195, 256, 64))
 
         with patch.object(soha, "_output_write_dep", return_value=None):
-            with self.assertRaisesRegex(Exception, "output write MemoryDep"):
-                plan_span_overflow_tile(op, max_cores=4)
+            self.assertIsNone(plan_span_overflow_tile(op, max_cores=4))
+
+    def test_coordinate_span_elems_preserves_mod_coefficients(self):
+        h = sympy.Symbol("h")
+        dep = MemoryDep("buf0", h, (h,), (6000,))
+        coord = sympy.floor(2 * sympy.Mod(h, 2048))
+
+        span = soha._coordinate_span_elems(coord, dep, {h: 1})
+
+        self.assertEqual(span, 4095)
 
     def test_reduction_indirect_read_guard(self):
         op = _reduction_op((1, 8195, 256, 64), reduction_ranges=(128,))
@@ -1399,7 +1394,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
             "allow_all_ops_in_lx_planning": True,
         }
     )
-    def test_bmm_lm_head_codegen_contains_auto_loop_spec(self):
+    def test_lm_head_restickify_codegen_contains_auto_loop_spec(self):
         x = torch.randn(2, 64, dtype=torch.float16).to("spyre")
         weight = torch.randn(1024, 64, dtype=torch.float16).to("spyre")
 
@@ -1417,7 +1412,8 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         self.assertTrue(source_codes)
         src = source_codes[0]
         self.assertIn("LoopSpec(", src)
-        self.assertIn("count=sympify('16')", src)
+        self.assertIn("count=sympify('4')", src)
+        self.assertIn("op='ReStickifyOpHBM'", src)
         self.assertIn("op='batchmatmul'", src)
         self.assertIn("tiled_symbols=[[sympify('c0')]]", src)
 
