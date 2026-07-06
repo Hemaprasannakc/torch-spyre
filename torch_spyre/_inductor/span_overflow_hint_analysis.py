@@ -20,7 +20,6 @@ import itertools
 import math
 
 from dataclasses import dataclass
-from typing import Callable
 
 import sympy
 from torch._inductor.dependencies import MemoryDep
@@ -33,13 +32,11 @@ from .ir import FixedTiledLayout, _resize_device_layout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
     _fixed_read_layout,
-    compute_coordinates,
-    concretize_index,
     device_coordinates,
     indirect_info_from_op,
     op_out_coords,
 )
-from .work_division import MAX_SPAN_BYTES, core_split
+from .work_division import MAX_SPAN_BYTES
 
 
 logger = get_inductor_logger("span_overflow_hint_analysis")
@@ -47,12 +44,18 @@ logger = get_inductor_logger("span_overflow_hint_analysis")
 
 @dataclass(frozen=True)
 class ChunkingInfo:
-    """Physical span facts for one op before coarse tiling."""
+    """Physical span facts that explain why one candidate needs tiling.
+
+    ``per_core_span`` is the byte span we would see if work division gives no
+    useful split for the selected physical coordinate.  ``selected_host_dim`` is
+    the logical output dimension that can shrink that span through coarse
+    tiling, and ``reason`` records whether the pressure came from output writes
+    or from a direct input dependency.
+    """
 
     total_bytes: int
     per_core_span: int
     core_split_estimate: int
-    # 0 means no device dim mapped via stride_map; use the fallback host dim.
     selected_device_dim_size: int
     selected_device_span_stride_elems: int
     selected_host_dim: int
@@ -62,7 +65,14 @@ class ChunkingInfo:
 
 @dataclass(frozen=True)
 class InputSpanInfo:
-    """Input span facts that can be reduced by output-range tiling."""
+    """Input span facts that can be reduced by output-range tiling.
+
+    This is used for Reduction/BMM ops where the output tensor can be small but
+    a direct input read still spans too much memory.  ``controlling_symbol`` is
+    the output-loop symbol, such as BMM ``M`` or ``N``; reduction-only symbols
+    such as ``K`` are not represented here because this pass cannot tile
+    reduction ranges yet.
+    """
 
     chunking_info: ChunkingInfo
     dep_name: str
@@ -71,7 +81,16 @@ class InputSpanInfo:
 
 @dataclass(frozen=True)
 class SpanOverflowTileLevel:
-    """One output-range coarse-tiling level requested by span analysis."""
+    """One coarse-tile loop level to apply to the op's iteration space.
+
+    ``selected_host_dim`` is the output/data-range dimension to tile.  For an
+    op with ranges ``[M, N]``, ``selected_host_dim=0`` tiles ``M`` and
+    ``selected_host_dim=1`` tiles ``N``.  ``split_count`` is the number of
+    equal-sized chunks to create for that dimension, so the dimension size must
+    be divisible by it.  ``is_reduction`` is false for the current automatic
+    span-overflow planner because it only tiles output ranges; reduction-range
+    tiling would require partial-result accumulation.
+    """
 
     selected_host_dim: int
     split_count: int
@@ -80,36 +99,36 @@ class SpanOverflowTileLevel:
 
 @dataclass(frozen=True)
 class SpanOverflowTilePlan:
-    """Coarse-tiling request produced by span-overflow analysis."""
+    """Complete coarse-tiling request returned by span-overflow analysis.
+
+    ``levels`` is the actual tiling plan consumed by ``coarse_tile``.  It can
+    contain one level, for example ``[(host_dim=0, split_count=769)]`` for the
+    LM-head vocab dimension, or multiple levels when several output dimensions
+    must be tiled together.  The levels are emitted outer-to-inner by host dim.
+
+    ``chunking_infos`` records the physical span facts that caused the plan:
+    total bytes, per-tile/per-core span estimate, selected physical span dim,
+    corresponding host dim, stick size, and reason.  There may be more
+    ``chunking_infos`` than ``levels`` because one tile level can fix multiple
+    output/input span pressures.
+
+    ``reason`` is a short human-readable summary used for diagnostics and logs,
+    such as ``"output span overflow"`` or ``"input span overflow for arg0_1"``.
+    """
 
     levels: tuple[SpanOverflowTileLevel, ...]
     chunking_infos: tuple[ChunkingInfo, ...]
     reason: str | None = None
 
-    @property
-    def selected_host_dim(self) -> int:
-        """Compatibility accessor for historical single-level callers."""
-        return self.levels[0].selected_host_dim
-
-    @property
-    def split_count(self) -> int:
-        """Compatibility accessor for historical single-level callers."""
-        return self.levels[0].split_count
-
-    @property
-    def is_reduction(self) -> bool:
-        """Compatibility accessor for historical single-level callers."""
-        return self.levels[0].is_reduction
-
-    @property
-    def chunking_info(self) -> ChunkingInfo:
-        """Compatibility accessor for historical single-candidate callers."""
-        return self.chunking_infos[0]
-
 
 @dataclass(frozen=True)
 class SpanOverflowCandidate:
-    """A span overflow that can potentially be fixed by output-range tiling."""
+    """One overflowing output/input span and the output dim that can shrink it.
+
+    Candidate collection is intentionally separate from choosing split counts:
+    first find every host dim that can structurally reduce an overflow, then let
+    the cost search decide the cheapest legal split combination.
+    """
 
     chunking_info: ChunkingInfo
     source: str
@@ -121,19 +140,14 @@ _MAX_TILE_COMBOS = 512
 _MAX_SPLITS_PER_DIM = 16
 
 
-@dataclass(frozen=True)
-class SpanDimInfo:
-    """Mapping from the first span-controlling device dim to a host dim."""
-
-    selected_host_dim: int
-    selected_device_dim_size: int
-    selected_device_span_stride_elems: int
-    core_split_estimate: int
-    skipped_outer_device_dims: tuple[int, ...] = ()
-
-
 def _layout_has_static_span_metadata(layout: FixedTiledLayout) -> bool:
-    """Return True when span planning can use concrete layout metadata."""
+    """Return True when span planning can use concrete layout metadata.
+
+    The planner needs integer host sizes, host strides, physical device sizes,
+    stride maps, and stick size.  If any of these are symbolic, skip auto tiling
+    and leave the op to existing compiler paths; symbolic-shape support belongs
+    to a later phase.
+    """
     try:
         for values in (
             layout.size,
@@ -149,111 +163,18 @@ def _layout_has_static_span_metadata(layout: FixedTiledLayout) -> bool:
     return True
 
 
-def _iter_span_dim_infos(
-    layout: FixedTiledLayout,
-    max_cores: int,
-) -> list[SpanDimInfo]:
-    """Return mappable span-controlling dims in outer-to-inner order."""
-    stl = layout.device_layout
-    device_size = [int(s) for s in stl.device_size]
-    host_size = [int(s) for s in layout.size]
-    host_stride = [int(s) for s in layout.stride]
-    stick_elems = stl.elems_per_stick()
-
-    infos: list[SpanDimInfo] = []
-    skipped_outer_device_dims: list[int] = []
-    for device_dim in range(len(device_size) - 1):
-        if device_size[device_dim] <= 1:
-            skipped_outer_device_dims.append(device_dim)
-            continue
-
-        sm = int(stl.stride_map[device_dim])
-        if sm <= 0:
-            skipped_outer_device_dims.append(device_dim)
-            continue
-
-        exact_matches = [
-            d for d, s in enumerate(host_stride) if host_size[d] > 1 and s == sm
-        ]
-        stick_scaled_matches = [
-            d
-            for d, s in enumerate(host_stride)
-            if host_size[d] > 1 and s * stick_elems == sm and d not in exact_matches
-        ]
-        matching_dims = exact_matches or stick_scaled_matches
-
-        if not matching_dims:
-            skipped_outer_device_dims.append(device_dim)
-            continue
-
-        selected_host_dim = matching_dims[0]
-        selected_device_dim_size = device_size[device_dim]
-        infos.append(
-            SpanDimInfo(
-                selected_host_dim=selected_host_dim,
-                selected_device_dim_size=selected_device_dim_size,
-                selected_device_span_stride_elems=math.prod(
-                    device_size[device_dim + 1 :]
-                ),
-                core_split_estimate=core_split(selected_device_dim_size, max_cores),
-                skipped_outer_device_dims=tuple(skipped_outer_device_dims),
-            )
-        )
-
-    return infos
-
-
-def _find_outermost_span_dim(
-    layout: FixedTiledLayout,
-    max_cores: int,
-) -> SpanDimInfo | None:
-    """Find the outermost mapped device dim that can reduce memory span."""
-    infos = _iter_span_dim_infos(layout, max_cores)
-    return infos[0] if infos else None
-
-
-def _compute_num_chunks(
-    chunking_info: ChunkingInfo,
-    max_cores: int,
-) -> int:
-    """Return the minimum coarse-tile count required by span and total limits."""
-    if chunking_info.selected_device_dim_size == 0:
-        return max(
-            1, math.ceil(chunking_info.total_bytes / (MAX_SPAN_BYTES * max_cores))
-        )
-
-    num_from_span = math.ceil(chunking_info.per_core_span / MAX_SPAN_BYTES)
-    num_from_total = math.ceil(chunking_info.total_bytes / (MAX_SPAN_BYTES * max_cores))
-    return max(num_from_span, num_from_total)
-
-
-def _divisible_split_candidates(full_size: int, required_count: int) -> list[int]:
-    """Return exact split counts for ``full_size`` at least ``required_count``."""
-    if required_count <= 1:
-        return [1]
-    if required_count > full_size:
-        raise Unsupported(
-            f"Cannot choose coarse-tile split count for dimension size {full_size}: "
-            f"required count {required_count} exceeds the dimension size."
-        )
-
-    return sorted(
-        {
-            d
-            for i in range(1, math.isqrt(full_size) + 1)
-            if full_size % i == 0
-            for d in (i, full_size // i)
-            if d >= required_count
-        }
-    )
-
-
 def _post_tile_layout_for_splits(
     original_layout: FixedTiledLayout,
     split_by_host_dim: dict[int, int],
     op_name: str,
 ) -> FixedTiledLayout:
-    """Build the per-tile layout after applying one or more host-dim splits."""
+    """Build the actual per-tile Spyre layout for one or more host splits.
+
+    The search never trusts arithmetic alone.  For a candidate like
+    ``{dim0: 769, dim1: 2}``, this shrinks the logical host sizes first and then
+    calls ``_resize_device_layout`` so validation uses the same physical layout
+    reconstruction as real coarse tiling.
+    """
     new_size = list(original_layout.size)
     for selected_host_dim, split_count in split_by_host_dim.items():
         if split_count <= 0:
@@ -305,22 +226,13 @@ def _post_tile_layout_for_splits(
     )
 
 
-def _post_tile_layout(
-    original_layout: FixedTiledLayout,
-    selected_host_dim: int,
-    split_count: int,
-    op_name: str,
-) -> FixedTiledLayout:
-    """Build the per-tile layout used for single-dim post-tile validation."""
-    return _post_tile_layout_for_splits(
-        original_layout,
-        {selected_host_dim: split_count},
-        op_name,
-    )
-
-
 def _within_stick_host_dim(layout: FixedTiledLayout) -> int:
-    """Return the host dim represented by the physical within-stick dim."""
+    """Return the logical host dim represented by the final stick coordinate.
+
+    Splitting this host dim is only legal when each tile still contains a whole
+    number of Spyre sticks; otherwise a coarse-tile boundary would cut through a
+    physical stick.
+    """
     sm_last = int(list(layout.device_layout.stride_map)[-1])
     host_stride = [int(s) for s in layout.stride]
     return next(
@@ -334,7 +246,11 @@ def _post_tile_stick_alignment_error(
     selected_host_dim: int,
     split_count: int,
 ) -> str | None:
-    """Return a diagnostic if coarse tiling cuts through physical sticks."""
+    """Return a diagnostic if a split cuts through physical sticks.
+
+    Non-stick dims are always fine here.  For the within-stick host dim, the
+    post-tile size must remain divisible by ``elems_per_stick``.
+    """
     if split_count <= 1:
         return None
 
@@ -355,191 +271,13 @@ def _post_tile_stick_alignment_error(
     )
 
 
-def _post_tile_span_ok(
-    split_count: int,
-    original_layout: FixedTiledLayout,
-    selected_host_dim: int,
-    max_cores: int,
-    op_name: str,
-) -> bool:
-    """Return whether the post-tile layout fits span and total limits."""
-    tiled_layout = _post_tile_layout(
-        original_layout,
-        selected_host_dim,
-        split_count,
-        op_name,
-    )
-    post_span_dim_info = _find_outermost_span_dim(tiled_layout, max_cores)
-    return (
-        _needs_chunking(
-            tiled_layout,
-            max_cores,
-            post_span_dim_info,
-            op_name=f"{op_name}:post_tile",
-            trigger="post_tile_validation",
-        )
-        is None
-    )
-
-
-def _post_tile_validated_split_count(
-    op_name: str,
-    full_size: int,
-    required_count: int,
-    chunking_info: ChunkingInfo,
-    original_layout: FixedTiledLayout,
-    max_cores: int,
-    extra_span_ok: Callable[[int], bool] | None = None,
-) -> int:
-    """Return the smallest bounded, stick-safe split count that validates."""
-    candidates = _divisible_split_candidates(full_size, required_count)
-    initial = candidates[0]
-    selected_host_dim = chunking_info.selected_host_dim
-
-    stick_alignment_errors: list[str] = []
-    for candidate in candidates:
-        stick_error = _post_tile_stick_alignment_error(
-            original_layout, selected_host_dim, candidate
-        )
-        if stick_error is not None:
-            stick_alignment_errors.append(stick_error)
-            logger.debug(
-                "plan_span_overflow_tile: %s candidate=%d rejected: %s",
-                op_name,
-                candidate,
-                stick_error,
-            )
-            continue
-
-        if _post_tile_span_ok(
-            candidate, original_layout, selected_host_dim, max_cores, op_name
-        ) and (extra_span_ok is None or extra_span_ok(candidate)):
-            if candidate != initial:
-                logger.debug(
-                    "plan_span_overflow_tile: %s bumped split_count %d -> %d "
-                    "after post-tile layout validation",
-                    op_name,
-                    initial,
-                    candidate,
-                )
-            return candidate
-
-        logger.debug(
-            "plan_span_overflow_tile: %s candidate=%d still overflows after "
-            "post-tile layout validation; trying next divisor",
-            op_name,
-            candidate,
-        )
-
-    if stick_alignment_errors:
-        raise Unsupported(
-            f"Cannot auto-tile {op_name}: selected_host_dim size {full_size} "
-            f"has no legal split >= {required_count} that preserves Spyre "
-            f"stick alignment. First rejected candidate: "
-            f"{stick_alignment_errors[0]}."
-        )
-
-    raise Unsupported(
-        f"Cannot auto-tile {op_name}: no divisor of selected_host_dim "
-        f"size {full_size} >= {required_count} makes the post-tile layout fit "
-        f"within span_limit={MAX_SPAN_BYTES / (1024**2):.0f} MB and "
-        f"total_limit={(MAX_SPAN_BYTES * max_cores) / (1024**3):.2f} GB "
-        f"(selected_device_dim_size={chunking_info.selected_device_dim_size}, "
-        f"stride_elems={chunking_info.selected_device_span_stride_elems}, "
-        f"dtype_itemsize={original_layout.dtype.itemsize})."
-    )
-
-
-def _needs_chunking(
-    layout: FixedTiledLayout,
-    max_cores: int,
-    span_dim_info: SpanDimInfo | None,
-    *,
-    op_name: str | None = None,
-    trigger: str = "output_span",
-) -> ChunkingInfo | None:
-    """Return chunking info when the layout exceeds span or total limits."""
-    device_size = [int(s) for s in layout.device_layout.device_size]
-    itemsize = layout.dtype.itemsize
-    total_bytes = math.prod(device_size) * itemsize
-    stick_elems = layout.device_layout.elems_per_stick()
-
-    if span_dim_info is None:
-        if total_bytes > MAX_SPAN_BYTES * max_cores:
-            host_size = [int(s) for s in layout.size]
-            fallback_selected_host_dim = max(
-                range(len(host_size)), key=lambda d: host_size[d]
-            )
-            return ChunkingInfo(
-                total_bytes=total_bytes,
-                per_core_span=total_bytes,
-                core_split_estimate=1,
-                selected_device_dim_size=0,
-                selected_device_span_stride_elems=0,
-                selected_host_dim=fallback_selected_host_dim,
-                stick_elems=stick_elems,
-                reason=(
-                    "no device dimension could be mapped to a splittable "
-                    "host dimension via stride_map; using largest host dim "
-                    "as fallback"
-                ),
-            )
-        return None
-
-    selected_device_dim_size = span_dim_info.selected_device_dim_size
-    selected_device_span_stride_elems = span_dim_info.selected_device_span_stride_elems
-    core_split_estimate = span_dim_info.core_split_estimate
-    per_core_span = (
-        math.ceil(selected_device_dim_size / core_split_estimate)
-        * selected_device_span_stride_elems
-        * itemsize
-    )
-
-    needs_chunk_for_span = per_core_span > MAX_SPAN_BYTES
-    needs_chunk_for_total = total_bytes > MAX_SPAN_BYTES * max_cores
-    if not (needs_chunk_for_span or needs_chunk_for_total):
-        return None
-
-    logger.info(
-        "[span_overflow_hint_analysis] trigger=%s op=%s "
-        "selected_host_dim=%d selected_device_dim_size=%d "
-        "selected_device_span_stride_elems=%d core_split_estimate=%d "
-        "per_core_span=%.2f MB total=%.2f GB "
-        "(shape=%s, dtype=%s, device_size=%s, "
-        "span_limit=%.2f MB, total_limit=%.2f GB)",
-        trigger,
-        op_name or "<unknown>",
-        span_dim_info.selected_host_dim,
-        selected_device_dim_size,
-        selected_device_span_stride_elems,
-        core_split_estimate,
-        per_core_span / (1024**2),
-        total_bytes / (1024**3),
-        list(layout.size),
-        layout.dtype,
-        device_size,
-        MAX_SPAN_BYTES / (1024**2),
-        (MAX_SPAN_BYTES * max_cores) / (1024**3),
-    )
-    return ChunkingInfo(
-        total_bytes=total_bytes,
-        per_core_span=per_core_span,
-        core_split_estimate=core_split_estimate,
-        selected_device_dim_size=selected_device_dim_size,
-        selected_device_span_stride_elems=selected_device_span_stride_elems,
-        selected_host_dim=span_dim_info.selected_host_dim,
-        stick_elems=stick_elems,
-        reason=(
-            "skipped unmapped outer device dims "
-            f"{span_dim_info.skipped_outer_device_dims}"
-            if span_dim_info.skipped_outer_device_dims
-            else None
-        ),
-    )
-
-
 def _is_batch_matmul_reduction(op: ComputedBuffer) -> bool:
-    """Return True for BMM reductions handled by the output-dim policy."""
+    """Return True for matmul/BMM reductions with output-dim tiling policy.
+
+    ``F.linear`` lowers to a Reduction with ``reduction_type=batchmatmul`` even
+    though the user did not call ``torch.bmm``.  For these ops, output dims
+    such as M/N/vocab can be tiled; K remains a reduction-only dim.
+    """
     return (
         isinstance(op.data, Reduction)
         and getattr(op.data, "reduction_type", None) == BATCH_MATMUL_OP
@@ -547,7 +285,15 @@ def _is_batch_matmul_reduction(op: ComputedBuffer) -> bool:
 
 
 def _output_symbol_to_dim(op: ComputedBuffer) -> dict[sympy.Symbol, int]:
-    """Map output iteration symbols to output dimensions."""
+    """Map each output iteration symbol to its logical output host dim.
+
+    This answers: "which output dimension does this symbol represent?"  For an
+    output write dependency like ``MemoryDep('buf1', 4096*d0 + d1,
+    {d0: 49216, d1: 4096})``, the result is ``{d0: 0, d1: 1}``: symbol ``d0``
+    controls host dim 0 and symbol ``d1`` controls host dim 1.  Span candidates
+    use this map to turn a physical coordinate such as ``floor(d0 / 64)`` back
+    into the coarse-tile dimension ``selected_host_dim=0``.
+    """
     symbol_to_dim: dict[sympy.Symbol, int] = {}
     try:
         out_coords = op_out_coords(op)
@@ -572,7 +318,13 @@ def _bmm_output_symbol_to_dim(
     op: ComputedBuffer,
     input_deps: list[tuple[MemoryDep, FixedTiledLayout]],
 ) -> dict[sympy.Symbol, int]:
-    """Map BMM output symbols while identifying K as reduction-only."""
+    """Map BMM output symbols while excluding the single K symbol.
+
+    The generic output map says which symbols are output-controlled.  This BMM
+    helper additionally checks input deps to make sure there is exactly one
+    non-output symbol, the matmul reduction K.  Ambiguous cases return an empty
+    map so the planner skips rather than guessing.
+    """
     symbol_to_dim = _output_symbol_to_dim(op)
     if not symbol_to_dim:
         return {}
@@ -591,7 +343,13 @@ def _bmm_output_symbol_to_dim(
 
 
 def _input_read_deps(op: ComputedBuffer) -> list[tuple[MemoryDep, FixedTiledLayout]]:
-    """Return fixed-layout input deps that can participate in span planning."""
+    """Return direct fixed-layout input MemoryDeps for span planning.
+
+    Indirect/gather reads are skipped before reaching this path.  For each
+    remaining MemoryDep, this resolves the producer buffer and captures its
+    physical FixedTiledLayout so input span analysis uses the input tensor's own
+    device layout, not the consumer output layout.
+    """
     try:
         reads = op.get_read_writes().reads
     except (AttributeError, TypeError):
@@ -615,7 +373,7 @@ def _input_read_deps(op: ComputedBuffer) -> list[tuple[MemoryDep, FixedTiledLayo
 
 
 def _range_size_for_symbol(dep: MemoryDep, sym: sympy.Symbol) -> int | None:
-    """Return a concrete iteration range size for ``sym`` if available."""
+    """Return the concrete MemoryDep range size for ``sym`` if available."""
     try:
         return int(dep.ranges[sym])
     except (KeyError, TypeError, ValueError):
@@ -628,7 +386,13 @@ def _coordinate_span_elems(
     split_symbol: sympy.Symbol,
     split_count: int,
 ) -> int | None:
-    """Return the span in elements for one device coordinate expression."""
+    """Return how many values one physical device coordinate can take.
+
+    Example: for LM-head restickify, ``coord = floor(d0 / 64)`` and
+    ``d0`` has range ``49216``.  With no split, the coordinate ranges from
+    ``0`` to ``768``, so the span is ``769``.  If ``d0`` is split by ``769``,
+    each tile has range ``64`` and the coordinate span becomes ``1``.
+    """
     per_core_max = 0
     per_core_min = 0
     for sym in coord.free_symbols:
@@ -649,24 +413,14 @@ def _device_coordinates_for_span(
     layout: FixedTiledLayout,
     dep: MemoryDep,
 ) -> list[sympy.Expr]:
-    """Return device coordinates for span planning.
+    """Return physical device coordinates using the shared coordinate API.
 
-    Span planning only inspects non-stick coordinates.  If the shared helper
-    rejects the stick expression, recompute coordinates without the stick guard
-    so output-controlled outer spans can still be analyzed.  TODO: replace this
-    with a shared non-stick coordinate helper in pass_utils.
+    Span planning intentionally uses the same ``MemoryDep`` -> device-coordinate
+    path as work division.  If the shared helper rejects the access pattern, for
+    example because the within-stick expression is unsupported, let that
+    ``Unsupported`` propagate instead of planning from a looser local fallback.
     """
-    try:
-        return device_coordinates(layout.device_layout, dep, None)
-    except Unsupported:
-        index = concretize_index(dep.index, set(dep.ranges.keys()))
-        return compute_coordinates(
-            layout.device_layout.device_size,
-            layout.device_layout.stride_map,
-            dep.ranges,
-            index,
-            None,
-        )
+    return device_coordinates(layout.device_layout, dep, None)
 
 
 def _input_span_infos_controlled_by_output_dims(
@@ -782,35 +536,12 @@ def _input_span_infos_controlled_by_output_dims(
     return infos
 
 
-def _chunking_info_from_span_dim(
-    layout: FixedTiledLayout,
-    span_dim_info: SpanDimInfo,
-    *,
-    core_split_estimate: int,
-    reason: str | None = None,
-) -> ChunkingInfo:
-    """Build ChunkingInfo for one span-controlling physical dimension."""
-    device_size = [int(s) for s in layout.device_layout.device_size]
-    itemsize = layout.dtype.itemsize
-    per_core_span = (
-        math.ceil(span_dim_info.selected_device_dim_size / core_split_estimate)
-        * span_dim_info.selected_device_span_stride_elems
-        * itemsize
-    )
-    return ChunkingInfo(
-        total_bytes=math.prod(device_size) * itemsize,
-        per_core_span=per_core_span,
-        core_split_estimate=core_split_estimate,
-        selected_device_dim_size=span_dim_info.selected_device_dim_size,
-        selected_device_span_stride_elems=span_dim_info.selected_device_span_stride_elems,
-        selected_host_dim=span_dim_info.selected_host_dim,
-        stick_elems=layout.device_layout.elems_per_stick(),
-        reason=reason,
-    )
-
-
 def _output_write_dep(op: ComputedBuffer) -> MemoryDep | None:
-    """Return the concrete output MemoryDep used for address-math span checks."""
+    """Return the output MemoryDep used to convert host indexes to device coords.
+
+    If the op has no concrete output write dependency, automatic span planning
+    cannot safely map physical span pressure back to logical host dims.
+    """
     try:
         dep = next(iter(op.get_read_writes().writes))
     except (AttributeError, StopIteration, TypeError):
@@ -827,21 +558,47 @@ def _output_span_candidates_from_op(
     split_by_host_dim: dict[int, int] | None = None,
     op_name: str | None = None,
 ) -> list[SpanOverflowCandidate]:
-    """Collect output spans using physical device-coordinate address math."""
+    """Return output host dims whose physical write span needs tiling.
+
+    This answers: "If work division gives this op no useful split, does any
+    non-stick output device coordinate span more than ``MAX_SPAN_BYTES``, and
+    which output host dim controls that coordinate?"  The result is a list of
+    candidate host dims that coarse tiling can shrink structurally.
+
+    The scan is physical-coordinate first, not logical-dim first: compute device
+    coordinates from the output write ``MemoryDep``, skip the final within-stick
+    coordinate, then map each remaining coordinate back to a logical output dim
+    only when exactly one output symbol controls it.  For example,
+    ``floor(d0 / 64)`` maps to host dim ``0`` while the stick coordinate
+    ``d0 % 64`` is ignored.
+    """
     layout = layout or op.layout
     split_by_host_dim = split_by_host_dim or {}
+
+    # Use the output MemoryDep address expression to derive physical device
+    # coordinates. If a supported op lacks usable write address math, fail loud
+    # instead of falling back to stride-map guessing.
+    name = op_name or op.get_name()
     out_dep = _output_write_dep(op)
     if out_dep is None:
-        return _output_span_candidates(layout, op_name=op_name or op.get_name())
+        raise Unsupported(
+            f"Cannot auto-tile {name}: output write MemoryDep is unavailable "
+            "for address-math span analysis."
+        )
 
     symbol_to_dim = _output_symbol_to_dim(op)
     if not symbol_to_dim:
-        return _output_span_candidates(layout, op_name=op_name or op.get_name())
+        raise Unsupported(
+            f"Cannot auto-tile {name}: could not map output iteration symbols "
+            "to output host dimensions."
+        )
 
     try:
         device_coords = _device_coordinates_for_span(layout, out_dep)
-    except (TypeError, ValueError, RuntimeError, Unsupported):
-        return _output_span_candidates(layout, op_name=op_name or op.get_name())
+    except (TypeError, ValueError, RuntimeError, Unsupported) as exc:
+        raise Unsupported(
+            f"Cannot auto-tile {name}: output device-coordinate analysis failed."
+        ) from exc
 
     device_size = [int(s) for s in layout.device_layout.device_size]
     itemsize = layout.dtype.itemsize
@@ -850,6 +607,10 @@ def _output_span_candidates_from_op(
         if not coord.free_symbols:
             continue
         output_syms = [sym for sym in coord.free_symbols if sym in symbol_to_dim]
+        # Coarse tiling can only shrink coordinates controlled by exactly one
+        # output symbol.  For example, ``floor(d1 / 64)`` maps cleanly to the
+        # output dim for ``d1``; mixed expressions like ``d0 + d1`` or coords
+        # involving reduction-only symbols are skipped here.
         if len(output_syms) != 1 or len(output_syms) != len(coord.free_symbols):
             logger.debug(
                 "span_overflow_output: op=%s skipped coord=%s output_syms=%s",
@@ -905,7 +666,7 @@ def _log_span_candidates(
     *,
     op_name: str,
 ) -> list[SpanOverflowCandidate]:
-    """Log span-overflow candidates and return them unchanged."""
+    """Log candidate span facts and return the candidate list unchanged."""
     device_size = [int(s) for s in layout.device_layout.device_size]
     for candidate in candidates:
         info = candidate.chunking_info
@@ -930,58 +691,17 @@ def _log_span_candidates(
     return candidates
 
 
-def _output_span_candidates(
-    layout: FixedTiledLayout,
-    *,
-    op_name: str,
-) -> list[SpanOverflowCandidate]:
-    """Collect output-layout spans that overflow without work-division help."""
-    candidates: list[SpanOverflowCandidate] = []
-    for span_dim_info in _iter_span_dim_infos(layout, max_cores=1):
-        chunking_info = _chunking_info_from_span_dim(
-            layout,
-            span_dim_info,
-            core_split_estimate=1,
-            reason="output span overflow",
-        )
-        if chunking_info.per_core_span > MAX_SPAN_BYTES:
-            candidates.append(
-                SpanOverflowCandidate(chunking_info=chunking_info, source="output")
-            )
-
-    device_size = [int(s) for s in layout.device_layout.device_size]
-    total_bytes = math.prod(device_size) * layout.dtype.itemsize
-    if not candidates and total_bytes > MAX_SPAN_BYTES:
-        host_size = [int(s) for s in layout.size]
-        selected_host_dim = max(range(len(host_size)), key=lambda d: host_size[d])
-        candidates.append(
-            SpanOverflowCandidate(
-                chunking_info=ChunkingInfo(
-                    total_bytes=total_bytes,
-                    per_core_span=total_bytes,
-                    core_split_estimate=1,
-                    selected_device_dim_size=0,
-                    selected_device_span_stride_elems=0,
-                    selected_host_dim=selected_host_dim,
-                    stick_elems=layout.device_layout.elems_per_stick(),
-                    reason=(
-                        "output total span overflow; using largest host dim as fallback"
-                    ),
-                ),
-                source="output_total",
-            )
-        )
-
-    return _log_span_candidates(candidates, layout, op_name=op_name)
-
-
 def _input_span_candidates(
     op: ComputedBuffer,
     max_cores: int,
     *,
     split_by_host_dim: dict[int, int] | None = None,
 ) -> list[SpanOverflowCandidate]:
-    """Collect reduction/BMM input spans controlled by output dimensions."""
+    """Collect Reduction/BMM input spans controlled by output dimensions.
+
+    This wraps the lower-level input scan and filters out host dims that have no
+    legal nontrivial coarse split after output/input stick-alignment checks.
+    """
     candidates: list[SpanOverflowCandidate] = []
     for info in _input_span_infos_controlled_by_output_dims(
         op,
@@ -1007,7 +727,14 @@ def _input_span_candidates(
 def _candidate_host_dims(
     candidates: list[SpanOverflowCandidate],
 ) -> list[int]:
-    """Return host dims in cost-search order by decreasing span pressure."""
+    """Return unique candidate host dims ordered by strongest span pressure.
+
+    Multiple output/input span candidates can point at the same logical output
+    dim.  The search only needs to split that dim once, so this collapses
+    candidates by ``selected_host_dim`` and orders dims by their largest
+    observed byte span.  This ordering does not decide correctness; it only
+    gives the combo search a stable pressure-first dim order.
+    """
     max_span_by_dim: dict[int, int] = {}
     first_seen: dict[int, int] = {}
     for idx, candidate in enumerate(candidates):
@@ -1023,7 +750,7 @@ def _candidate_host_dims(
 
 
 def _host_dim_has_legal_nontrivial_split(op: ComputedBuffer, host_dim: int) -> bool:
-    """Return True when coarse tiling can legally split this output dim."""
+    """Return True when ``host_dim`` has at least one legal split greater than 1."""
     try:
         candidates = _split_candidates_for_host_dim(op, host_dim)
     except Unsupported:
@@ -1032,17 +759,29 @@ def _host_dim_has_legal_nontrivial_split(op: ComputedBuffer, host_dim: int) -> b
 
 
 def _candidate_required_split_count(candidate: SpanOverflowCandidate) -> int:
-    """Return the split count needed if this candidate's dim tiled alone."""
-    info = candidate.chunking_info
-    if info.selected_device_dim_size == 0:
-        return max(1, math.ceil(info.total_bytes / MAX_SPAN_BYTES))
-    return max(1, math.ceil(info.per_core_span / MAX_SPAN_BYTES))
+    """Return the minimum split needed if this candidate's dim tiled alone.
+
+    This is ``ceil(per_core_span / MAX_SPAN_BYTES)``: if a dim creates a
+    384 MB span and the limit is 256 MB, it needs at least split ``2`` when
+    considered by itself.
+
+    The combined search can still choose a different legal divisor or combine
+    multiple smaller splits across dims; this value is only the starting lower
+    bound for that dim's split candidates.
+    """
+    return max(1, math.ceil(candidate.chunking_info.per_core_span / MAX_SPAN_BYTES))
 
 
 def _required_split_counts_by_host_dim(
     candidates: list[SpanOverflowCandidate],
 ) -> dict[int, int]:
-    """Return the strongest single-dim split requirement per host dim."""
+    """Return the strongest required split count for each logical host dim.
+
+    If output and input analysis both say host dim ``0`` can overflow, keep the
+    larger split requirement.  Example: output needs split ``2`` but an input
+    span controlled by the same dim needs split ``4``; the combo search should
+    generate dim-0 divisors around ``4`` rather than around ``2``.
+    """
     required_by_dim: dict[int, int] = {}
     for candidate in candidates:
         dim = candidate.chunking_info.selected_host_dim
@@ -1057,7 +796,12 @@ def _cap_split_candidates(
     legal_candidates: list[int],
     required_count: int,
 ) -> list[int]:
-    """Bound split candidates while preserving small and required splits."""
+    """Bound legal divisors while keeping cheap and required-area choices.
+
+    A large highly-composite dim can have many legal divisors.  Keep a compact
+    set that still contains cheap small splits, divisors near ``required_count``,
+    and a few large fallbacks, so the Cartesian combo search stays bounded.
+    """
     if len(legal_candidates) <= _MAX_SPLITS_PER_DIM:
         return legal_candidates
 
@@ -1096,7 +840,12 @@ def _host_dim_target_symbols(
     op: ComputedBuffer,
     host_dim: int,
 ) -> set[sympy.Symbol]:
-    """Return the output iteration symbols mapped to ``host_dim``."""
+    """Return output-loop symbols that represent one logical host dim.
+
+    Input stick checks need this bridge: a split is chosen in consumer output
+    dim space, but each input dependency may place the same symbol at a
+    different input host dim or physical stick position.
+    """
     symbol_to_dim = (
         _bmm_output_symbol_to_dim(op, _input_read_deps(op))
         if _is_batch_matmul_reduction(op)
@@ -1146,7 +895,14 @@ def _split_candidates_for_host_dim(
     host_dim: int,
     required_count: int = 1,
 ) -> list[int]:
-    """Return bounded legal split candidates for one output host dim."""
+    """Return bounded legal split counts for one logical output host dim.
+
+    The split count must divide the op's output range for ``host_dim`` exactly,
+    because coarse tiling emits equal-sized loop tiles.  Then the candidates are
+    filtered for output and input stick alignment: a split is legal only if the
+    resulting tile boundary does not cut through physical sticks in the output
+    layout or any direct input layout controlled by the same output symbol.
+    """
     ranges = list(op.data.ranges)
     if host_dim >= len(ranges):
         raise Unsupported(
@@ -1183,6 +939,14 @@ def _split_candidates_for_host_dim(
         )
     ]
     capped_candidates = _cap_split_candidates(legal_candidates, required_count)
+    logger.debug(
+        "[span-overflow divisors] op=%s host_dim=%d required=%d legal=%s capped=%s",
+        op.get_name(),
+        host_dim,
+        required_count,
+        legal_candidates,
+        capped_candidates,
+    )
     if len(legal_candidates) > len(capped_candidates):
         logger.debug(
             "span_overflow_tile_search: op=%s host_dim=%d limiting %d split "
@@ -1197,7 +961,11 @@ def _split_candidates_for_host_dim(
 
 
 def _combo_cost(combo: tuple[int, ...]) -> tuple[int, int, int, tuple[int, ...]]:
-    """Prefer fewer total tiles, fewer tiled dims, and smaller maximum split."""
+    """Rank split combinations by compile/runtime cost.
+
+    Prefer fewer total loop tiles first, then fewer tiled dimensions, then a
+    smaller largest split.  The final tuple gives deterministic tie-breaking.
+    """
     return (
         math.prod(combo),
         sum(split > 1 for split in combo),
@@ -1209,7 +977,13 @@ def _combo_cost(combo: tuple[int, ...]) -> tuple[int, int, int, tuple[int, ...]]
 def _iter_split_combos(
     split_candidates: list[list[int]],
 ) -> list[tuple[int, ...]]:
-    """Return bounded split combinations in increasing cost order."""
+    """Return bounded split combinations in increasing cost order.
+
+    Each input list contains legal split counts for one candidate host dim.  The
+    Cartesian product represents all ways to tile those dims together, including
+    leaving a dim unsplit with count ``1``.  The search checks the cheapest
+    combinations first and caps the total attempts for compile-time safety.
+    """
     combos = sorted(itertools.product(*split_candidates), key=_combo_cost)
     if len(combos) > _MAX_TILE_COMBOS:
         logger.debug(
@@ -1225,7 +999,12 @@ def _combined_tile_stick_alignment_error(
     original_layout: FixedTiledLayout,
     split_by_host_dim: dict[int, int],
 ) -> str | None:
-    """Return the first stick-alignment error for a combined split."""
+    """Return the first stick-alignment error for a multi-dim tile plan.
+
+    Single-dim candidates are already pre-filtered, but this check keeps the
+    final combined plan honest and reports whether the output layout or one of
+    the input layouts would get a stick-cutting tile boundary.
+    """
     for host_dim, split_count in split_by_host_dim.items():
         error = _post_tile_stick_alignment_error(original_layout, host_dim, split_count)
         if error is not None:
@@ -1241,7 +1020,14 @@ def _remaining_span_candidates_after_tile(
     max_cores: int,
     split_by_host_dim: dict[int, int],
 ) -> list[SpanOverflowCandidate]:
-    """Return spans that still overflow after applying a combined tile split."""
+    """Return spans that still overflow after a hypothetical combined tile.
+
+    This is the validation step.  It rebuilds the post-tile output layout using
+    the actual Spyre layout resize logic, then reruns output and reduction input
+    span analysis with those split counts.  A combo is accepted only when this
+    returns no remaining candidates, meaning the tiled op is structurally within
+    span even if work division gives no extra help.
+    """
     tiled_layout = _post_tile_layout_for_splits(
         op.layout,
         split_by_host_dim,
@@ -1267,9 +1053,35 @@ def _search_min_cost_tile_plan(
     max_cores: int,
     candidates: list[SpanOverflowCandidate],
 ) -> SpanOverflowTilePlan | None:
-    """Find the cheapest combined coarse-tile plan that clears all spans."""
+    """Find the cheapest combined coarse-tile plan that clears all candidates.
+
+    The incoming candidates say which logical output dims can reduce an
+    overflowing physical span.  This function converts those dims into legal
+    split divisors, tries split combinations in cost order, validates each
+    combination against reconstructed post-tile layouts, and returns the first
+    plan that leaves no output/input span overflow.
+    """
     host_dims = _candidate_host_dims(candidates)
+    logger.debug(
+        "[span-overflow search] op=%s candidates=%s host_dims=%s",
+        op.get_name(),
+        [
+            {
+                "source": candidate.source,
+                "host_dim": candidate.chunking_info.selected_host_dim,
+                "device_dim_size": candidate.chunking_info.selected_device_dim_size,
+                "stride_elems": candidate.chunking_info.selected_device_span_stride_elems,
+                "span_mb": candidate.chunking_info.per_core_span / (1024**2),
+                "reason": candidate.chunking_info.reason,
+            }
+            for candidate in candidates
+        ],
+        host_dims,
+    )
     if not host_dims:
+        logger.debug(
+            "[span-overflow search] op=%s no candidate host dims", op.get_name()
+        )
         return None
     if len(host_dims) > _MAX_TILE_DIMS:
         raise Unsupported(
@@ -1283,6 +1095,12 @@ def _search_min_cost_tile_plan(
         _split_candidates_for_host_dim(op, dim, required_by_dim.get(dim, 1))
         for dim in host_dims
     ]
+    logger.debug(
+        "[span-overflow search] op=%s required_by_dim=%s split_candidates=%s",
+        op.get_name(),
+        required_by_dim,
+        dict(zip(host_dims, split_candidates)),
+    )
     first_stick_error: str | None = None
     for combo in _iter_split_combos(split_candidates):
         split_by_host_dim = {
@@ -1296,6 +1114,12 @@ def _search_min_cost_tile_plan(
         )
         if stick_error is not None:
             first_stick_error = first_stick_error or stick_error
+            logger.debug(
+                "[span-overflow search] op=%s combo=%s rejected_stick=%s",
+                op.get_name(),
+                split_by_host_dim,
+                stick_error,
+            )
             continue
 
         try:
@@ -1330,6 +1154,12 @@ def _search_min_cost_tile_plan(
             )
             for dim in sorted(split_by_host_dim)
         )
+        logger.info(
+            "[span-overflow search] op=%s selected_split=%s levels=%s",
+            op.get_name(),
+            split_by_host_dim,
+            [(level.selected_host_dim, level.split_count) for level in levels],
+        )
         return SpanOverflowTilePlan(
             levels=levels,
             chunking_infos=tuple(candidate.chunking_info for candidate in candidates),
@@ -1357,7 +1187,12 @@ def _search_min_cost_tile_plan(
 
 
 def _has_indirect_reads(op: ComputedBuffer) -> bool:
-    """Return True if the op uses indirect/gather-style input reads."""
+    """Return True if the op uses indirect/gather-style input reads.
+
+    Automatic span-overflow tiling currently handles direct MemoryDep address
+    math only.  Indirect-access ops use their own SDSC/IDA lowering path and are
+    skipped here.
+    """
     try:
         _, _, indirect_sizes = indirect_info_from_op(op)
     except (AttributeError, RuntimeError, TypeError, Unsupported):
@@ -1369,130 +1204,89 @@ def plan_span_overflow_tile(
     op: ComputedBuffer,
     max_cores: int,
 ) -> SpanOverflowTilePlan | None:
-    """Return an automatic output-range coarse-tile plan if needed."""
+    """Return an automatic output-range coarse-tile plan for supported ops.
+
+    Supported inputs are static ``FixedTiledLayout`` ``ComputedBuffer`` ops whose
+    data is ``Pointwise`` or ``Reduction``.  The planner skips non-computed ops,
+    flexible/dynamic layouts, scalar reductions with no output ranges, and
+    indirect-access ops because those are handled outside this automatic
+    span-overflow coarse-tiling path.
+
+    The returned plan contains one or more output-range tile levels plus the
+    physical span facts that caused them.  ``None`` means this op either is not
+    eligible for this pass or has no output/input span that needs coarse tiling.
+    """
+    logger.debug(
+        "[span-overflow planner] enter op=%s data=%s max_cores=%s",
+        getattr(op, "get_name", lambda: "<unknown>")(),
+        type(getattr(op, "data", None)).__name__,
+        max_cores,
+    )
     if not (
         isinstance(op, ComputedBuffer)
         and isinstance(op.layout, FixedTiledLayout)
         and isinstance(op.data, (Pointwise, Reduction))
     ):
+        logger.debug("[span-overflow planner] skip unsupported op/type")
         return None
 
+    # Span planning requires concrete layout/device metadata so it can rebuild
+    # post-tile Spyre layouts and validate physical spans exactly.
     if not _layout_has_static_span_metadata(op.layout):
+        logger.debug(
+            "[span-overflow planner] skip op=%s reason=non_static_layout",
+            op.get_name(),
+        )
+        return None
+
+    logger.debug(
+        "[span-overflow planner] op=%s ranges=%s reduction_ranges=%s layout_size=%s device_size=%s",
+        op.get_name(),
+        list(getattr(op.data, "ranges", [])),
+        list(getattr(op.data, "reduction_ranges", [])),
+        list(op.layout.size),
+        list(op.layout.device_layout.device_size),
+    )
+
+    # Indirect-access ops are supported by separate lowering paths; automatic
+    # span-overflow tiling only handles direct MemoryDep address math.
+    if _has_indirect_reads(op):
+        logger.debug(
+            "[span-overflow planner] skip op=%s reason=indirect_reads",
+            op.get_name(),
+        )
         return None
 
     if isinstance(op.data, Pointwise):
-        # Gather/indirect-access ops can lower as Pointwise ComputedBuffers, but
-        # they require the dedicated indirect-access SDSC path rather than automatic
-        # output coarse tiling.
-        if _has_indirect_reads(op):
-            return None
+        # Pointwise ops only need output-span analysis here.
         candidates = _output_span_candidates_from_op(op, op_name=op.get_name())
+        logger.debug(
+            "[span-overflow planner] op=%s pointwise_output_candidates=%d",
+            op.get_name(),
+            len(candidates),
+        )
         return _search_min_cost_tile_plan(op, max_cores, candidates)
 
     if isinstance(op.data, Reduction):
-        # Gather/scatter-indexed reductions (e.g. scatter-reduce) require the
-        # dedicated indirect-access SDSC path rather than automatic coarse
-        # tiling, same as the Pointwise case above.
-        if _has_indirect_reads(op):
-            return None
+        # Scalar/full reductions have no output range to coarse-tile.
+        # Non-scalar reductions combine output-span candidates with input spans
+        # controlled by output symbols; reduction-only input spans are
+        # intentionally skipped until reduction-range tiling exists.
         if not list(op.data.ranges):
+            logger.debug(
+                "[span-overflow planner] skip op=%s reason=scalar_reduction",
+                op.get_name(),
+            )
             return None
-        candidates = _output_span_candidates_from_op(op, op_name=op.get_name())
-        candidates += _input_span_candidates(op, max_cores)
+        output_candidates = _output_span_candidates_from_op(op, op_name=op.get_name())
+        input_candidates = _input_span_candidates(op, max_cores)
+        candidates = output_candidates + input_candidates
+        logger.debug(
+            "[span-overflow planner] op=%s reduction_output_candidates=%d input_candidates=%d",
+            op.get_name(),
+            len(output_candidates),
+            len(input_candidates),
+        )
         return _search_min_cost_tile_plan(op, max_cores, candidates)
 
     return None
-
-
-def _plan_reduction_output_span_overflow_tile(
-    op: ComputedBuffer,
-    max_cores: int,
-) -> SpanOverflowTilePlan | None:
-    """Compatibility wrapper for reduction span planning."""
-    if not list(op.data.ranges):
-        return None
-    candidates = _output_span_candidates_from_op(op, op_name=op.get_name())
-    candidates += _input_span_candidates(op, max_cores)
-    return _search_min_cost_tile_plan(op, max_cores, candidates)
-
-
-def _output_chunking_info(
-    op: ComputedBuffer,
-    max_cores: int,
-) -> ChunkingInfo | None:
-    """Return the first output chunking info when the output layout overflows."""
-    candidates = _output_span_candidates_from_op(op, op_name=op.get_name())
-    return candidates[0].chunking_info if candidates else None
-
-
-def _plan_output_span_overflow_tile(
-    op: ComputedBuffer,
-    max_cores: int,
-) -> SpanOverflowTilePlan | None:
-    """Compatibility wrapper for output-only span planning."""
-    candidates = _output_span_candidates_from_op(op, op_name=op.get_name())
-    return _search_min_cost_tile_plan(op, max_cores, candidates)
-
-
-def _plan_tile_from_chunking_info(
-    op: ComputedBuffer,
-    max_cores: int,
-    chunking_info: ChunkingInfo,
-    *,
-    required_count: int | None = None,
-    reason: str | None = None,
-    extra_span_ok: Callable[[int], bool] | None = None,
-) -> SpanOverflowTilePlan | None:
-    """Build a single-dim tile plan from selected chunking info.
-
-    Kept for private tests and callers that exercise the historical one-dim
-    path.  The production planner uses the multi-dim cost search above.
-    """
-    selected_host_dim = chunking_info.selected_host_dim
-    ranges = list(op.data.ranges)
-    if selected_host_dim >= len(ranges):
-        raise Unsupported(
-            f"Cannot auto-tile {op.get_name()}: selected host dim "
-            f"{selected_host_dim} is out of bounds for given data ranges {ranges}."
-        )
-
-    try:
-        full_size = int(ranges[selected_host_dim])
-    except (TypeError, ValueError) as exc:
-        raise Unsupported(
-            f"Cannot auto-tile {op.get_name()}: selected host dim "
-            f"{selected_host_dim} has non-integral range "
-            f"{ranges[selected_host_dim]!r}."
-        ) from exc
-
-    if full_size <= 1:
-        raise Unsupported(
-            f"Cannot auto-tile {op.get_name()}: selected host dim "
-            f"{selected_host_dim} has unsplittable range {full_size}."
-        )
-
-    if required_count is None:
-        required_count = _compute_num_chunks(chunking_info, max_cores)
-    if required_count <= 1:
-        return None
-
-    split_count = _post_tile_validated_split_count(
-        op.get_name(),
-        full_size,
-        required_count,
-        chunking_info,
-        op.layout,
-        max_cores,
-        extra_span_ok=extra_span_ok,
-    )
-
-    return SpanOverflowTilePlan(
-        levels=(
-            SpanOverflowTileLevel(
-                selected_host_dim=selected_host_dim,
-                split_count=split_count,
-            ),
-        ),
-        chunking_infos=(chunking_info,),
-        reason=reason or chunking_info.reason or "output span overflow",
-    )

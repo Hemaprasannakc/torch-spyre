@@ -393,10 +393,11 @@ physical address-coordinate analysis:
 5. create one `SpanOverflowCandidate` for each output-controlled coordinate
    whose span exceeds `MAX_SPAN_BYTES`.
 
-If output write-dep or symbol-coordinate analysis is unavailable, it falls back
-to `_output_span_candidates`, which uses `device_size`, `stride_map`, host
-strides, and stick size to recover span-driving host dimensions.  The fallback
-is less precise, but still feeds the same candidate/combo search.
+If output write-dep or symbol-coordinate analysis is unavailable, the planner
+raises `Unsupported` instead of falling back to stride-map guessing.  This keeps
+span planning on the same `MemoryDep` address-math model used by work division
+and avoids silently choosing a host dimension that may not actually control the
+physical coordinate.
 
 ## Reduction Flow
 
@@ -605,9 +606,12 @@ synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
 3. calls `plan_span_overflow_tile`;
 4. maps each `selected_host_dim` to a concrete output loop symbol via
    `op_out_coords(op)`;
-5. creates synthetic `DimHint`s with ids starting at
+5. rejects automatic producer-consumer pairs where a planned op reads a
+   producer that was already auto-tiled, because those per-op groups would not
+   share one loop nest;
+6. creates synthetic `DimHint`s with ids starting at
    `_SPAN_OVERFLOW_HINT_ID = 10000`;
-6. returns coarse-tile groups in the same format as user hints.
+7. returns coarse-tile groups in the same format as user hints.
 
 From `coarse_tile` onward, automatic and manual hints share the same path:
 
@@ -648,10 +652,12 @@ automatic output-range tile plan.  Common reasons:
 - no legal exact divisor exists;
 - stick alignment rejects all candidates;
 - `_resize_device_layout` cannot reconstruct the post-tile layout;
-- every tried combination still leaves output/input spans above the limit.
+- every tried combination still leaves output/input spans above the limit;
+- an automatically tiled op reads a producer that was already automatically
+  tiled, which would require producer-consumer loop fusion to be correct.
 
 These failures are deliberate.  They avoid silently emitting a plan that still
-violates the hardware span limit.
+violates the hardware span limit or silently creates unsynchronized tile loops.
 
 ## Known Limitations
 
@@ -666,8 +672,14 @@ violates the hardware span limit.
   `_MAX_TILE_COMBOS`; very high-rank overflow cases can raise `Unsupported`.
 - Symbolic layout metadata is skipped because exact divisibility and post-tile
   Spyre layout validation require concrete sizes.
-- Automatic groups are per-op.  Loop fusion/coalescing of similar automatic
-  groups is future work.
+- Automatic groups are per-op.  If an automatically planned op reads a producer
+  that was already auto-tiled, the adapter now raises `Unsupported` instead of
+  emitting two independent loop groups.  This is required for correctness: two
+  separate 769-tile loops for `restickify(weight)` and the BMM/LM-head consumer
+  are not guaranteed to execute tile-by-tile in lockstep.  Manual `spyre_hint`
+  groups are unaffected because users can explicitly group producer and consumer
+  in one shared coarse-tile group.  Automatic producer-consumer loop fusion is
+  future work.
 
 ## Validation
 
@@ -697,19 +709,9 @@ Current coverage includes:
 - input-layout stick alignment;
 - multi-level plan generation;
 - adapter and `coarse_tile` stamping;
+- fail-safe rejection for the LM-head pattern where an auto-tiled restickify
+  producer feeds an auto-tiled BMM consumer;
 - codegen `LoopSpec` tests for Pointwise, Reduction, and BMM/LM-head shapes.
-
-Runtime before/after repro scripts live under `span_overflow_hints/`, including:
-
-```text
-repro_lm_head_bmm_span_issue.py
-repro_6d_reduction_span_issue.py
-repro_workdivision_needs_span_overflow_pass.py
-```
-
-Use `SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS=1` to simulate before-pass
-behavior and `SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS=0` to enable automatic
-span-overflow hints.
 
 ## Key Files
 

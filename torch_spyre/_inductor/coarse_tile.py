@@ -52,6 +52,7 @@ import sympy
 from sympy import Expr
 
 import torch
+from torch._inductor.dependencies import MemoryDep
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
     ComputedBuffer,
@@ -423,10 +424,21 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
     from . import config
 
     if config.ignore_wsr_hints or config.ignore_span_overflow_hints:
+        logger.debug(
+            "[span-overflow groups] disabled ignore_wsr_hints=%s ignore_span_overflow_hints=%s",
+            config.ignore_wsr_hints,
+            config.ignore_span_overflow_hints,
+        )
         return []
 
+    logger.debug(
+        "[span-overflow groups] begin ops=%d sencores=%s",
+        len(graph.operations),
+        config.sencores,
+    )
     groups: list[tuple] = []
     next_hint_id = _SPAN_OVERFLOW_HINT_ID
+    auto_tiled_producers: set[str] = set()
 
     for op in graph.operations:
         if not isinstance(op, ComputedBuffer):
@@ -442,7 +454,55 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
 
         plan = plan_span_overflow_tile(op, config.sencores)
         if plan is None:
+            logger.debug(
+                "[span-overflow groups] op=%s no auto plan",
+                op.get_name(),
+            )
             continue
+
+        logger.debug(
+            "[span-overflow groups] op=%s plan_levels=%s reasons=%s",
+            op.get_name(),
+            [
+                (level.selected_host_dim, level.split_count, level.is_reduction)
+                for level in plan.levels
+            ],
+            [info.reason for info in plan.chunking_infos],
+        )
+
+        # Auto span-overflow groups are currently emitted per op.  If this op
+        # reads a producer that was already auto-tiled, independent loop groups
+        # can execute out of lockstep and produce wrong results.  Manual hints
+        # are unaffected because they use the user-hint grouping path.
+        try:
+            read_deps = {
+                dep.name
+                for dep in op.get_read_writes().reads
+                if isinstance(dep, MemoryDep)
+            }
+        except (AttributeError, TypeError):
+            read_deps = set()
+        logger.debug(
+            "[span-overflow groups] op=%s read_deps=%s auto_tiled_producers=%s",
+            op.get_name(),
+            sorted(read_deps),
+            sorted(auto_tiled_producers),
+        )
+        conflicting_producers = sorted(read_deps & auto_tiled_producers)
+        if conflicting_producers:
+            logger.warning(
+                "[span-overflow groups] op=%s rejected_conflicting_auto_producers=%s",
+                op.get_name(),
+                conflicting_producers,
+            )
+            raise Unsupported(
+                f"Cannot auto-tile {op.get_name()}: it reads already auto-tiled "
+                f"producer(s) {conflicting_producers}. Automatic span-overflow "
+                "groups are currently per-op, so tiling this producer and "
+                "consumer independently can produce unsynchronized loop nests. "
+                "Producer-consumer span-overflow loop fusion is required for "
+                "this case."
+            )
 
         out_coords = op_out_coords(op)
         hints: list[DimHint] = []
@@ -474,6 +534,17 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
             hint_id = next_hint_id
             next_hint_id += 1
             loop_var = next(iter(free_symbols))
+            logger.debug(
+                "[span-overflow groups] op=%s host_dim=%d coord=%s "
+                "loop_var=%s split_count=%s hint_id=%d is_reduction=%s",
+                op.get_name(),
+                host_dim,
+                coord,
+                loop_var,
+                split_count,
+                hint_id,
+                is_reduction,
+            )
             hints.append(
                 DimHint(
                     dim_names=["_span_overflow"],
@@ -497,11 +568,18 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
 
         op.dim_hints = hints  # type: ignore[attr-defined]
         groups.append(([op], levels))
+        auto_tiled_producers.add(op.get_name())
+        logger.debug(
+            "[span-overflow groups] created group_index=%d op=%s levels=%s",
+            len(groups) - 1,
+            op.get_name(),
+            levels,
+        )
 
         max_total = max(info.total_bytes for info in plan.chunking_infos)
         max_span = max(info.per_core_span for info in plan.chunking_infos)
         logger.info(
-            "span_overflow_groups: op %s levels=%s total=%.2fGB per_tile_span=%.2fMB",
+            "[span-overflow groups] op=%s levels=%s total=%.2fGB per_tile_span=%.2fMB",
             op.get_name(),
             level_summary,
             max_total / (1024**3),
