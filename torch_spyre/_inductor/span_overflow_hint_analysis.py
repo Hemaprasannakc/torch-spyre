@@ -32,10 +32,11 @@ from .ir import FixedTiledLayout, _resize_device_layout
 from .logging_utils import get_inductor_logger
 from .pass_utils import (
     _fixed_read_layout,
-    device_coordinates,
+    concretize_index,
     indirect_info_from_op,
     op_out_coords,
 )
+from .views import compute_coordinates
 from .work_division import MAX_SPAN_BYTES
 
 
@@ -383,10 +384,17 @@ def _range_size_for_symbol(dep: MemoryDep, sym: sympy.Symbol) -> int | None:
 def _coordinate_span_elems(
     coord: sympy.Expr,
     dep: MemoryDep,
-    split_symbol: sympy.Symbol,
-    split_count: int,
+    split_by_symbol: dict[sympy.Symbol, int],
 ) -> int | None:
     """Return how many values one physical device coordinate can take.
+
+    ``split_by_symbol`` gives the hypothetical split count for each free
+    symbol in ``coord``; a symbol absent from the map is treated as unsplit
+    (split_count=1).  Each symbol's contribution is computed independently,
+    holding every other free symbol at its own extreme, then summed.  That is
+    exact for the additive stick/tile-index coordinates this pass reasons
+    about, including a coordinate jointly controlled by more than one output
+    symbol -- for example two interleaved dims sharing one physical stride.
 
     Example: for LM-head restickify, ``coord = floor(d0 / 64)`` and
     ``d0`` has range ``49216``.  With no split, the coordinate ranges from
@@ -399,10 +407,10 @@ def _coordinate_span_elems(
         range_size = _range_size_for_symbol(dep, sym)
         if range_size is None:
             return None
-        if sym == split_symbol:
-            if range_size % split_count != 0:
-                return None
-            range_size //= split_count
+        split_count = split_by_symbol.get(sym, 1)
+        if range_size % split_count != 0:
+            return None
+        range_size //= split_count
         term = coord.subs({other: 0 for other in coord.free_symbols - {sym}})
         per_core_max += int(term.subs(sym, range_size - 1))
         per_core_min += int(term.subs(sym, 0))
@@ -413,14 +421,22 @@ def _device_coordinates_for_span(
     layout: FixedTiledLayout,
     dep: MemoryDep,
 ) -> list[sympy.Expr]:
-    """Return physical device coordinates using the shared coordinate API.
+    """Return physical coordinates for span planning.
 
-    Span planning intentionally uses the same ``MemoryDep`` -> device-coordinate
-    path as work division.  If the shared helper rejects the access pattern, for
-    example because the within-stick expression is unsupported, let that
-    ``Unsupported`` propagate instead of planning from a looser local fallback.
+    This pass analyzes only non-stick coordinates and all callers ignore
+    ``coords[-1]``.  Use the same index concretization and coordinate
+    decomposition as ``device_coordinates()``, but skip its final stick-expression
+    validation so an unsupported stick form does not reject an otherwise valid
+    non-stick span candidate.
     """
-    return device_coordinates(layout.device_layout, dep, None)
+    index = concretize_index(dep.index, set(dep.ranges.keys()))
+    return compute_coordinates(
+        layout.device_layout.device_size,
+        layout.device_layout.stride_map,
+        dep.ranges,
+        index,
+        None,
+    )
 
 
 def _input_span_infos_controlled_by_output_dims(
@@ -483,56 +499,49 @@ def _input_span_infos_controlled_by_output_dims(
                     reduction_syms,
                 )
                 continue
-            if len(output_syms) != 1:
-                logger.debug(
-                    "span_overflow_input: op=%s dep=%s skipped coord=%s "
-                    "output_syms=%s reduction_syms=%s",
-                    op.get_name(),
-                    dep.name,
-                    coord,
-                    output_syms,
-                    reduction_syms,
-                )
-                continue
 
-            controlling_symbol = output_syms[0]
-            output_dim = symbol_to_dim[controlling_symbol]
-            split_for_symbol = split_by_host_dim.get(output_dim, 1)
-
-            coord_span_elems = _coordinate_span_elems(
-                coord, dep, controlling_symbol, split_for_symbol
-            )
+            # A coordinate can be jointly controlled by more than one output
+            # symbol, for example two interleaved dims sharing one physical
+            # stride.  Compute its span using every contributing dim's
+            # hypothetical split, then register a candidate against each
+            # contributing dim so the combo search can consider splitting
+            # them together.
+            split_by_symbol = {
+                sym: split_by_host_dim.get(symbol_to_dim[sym], 1) for sym in output_syms
+            }
+            coord_span_elems = _coordinate_span_elems(coord, dep, split_by_symbol)
             if coord_span_elems is None:
                 continue
 
             # Span-overflow planning is intentionally conservative: coarse tiles
             # must make the span safe even if downstream work division provides
             # no additional split for this coordinate.
-            split_estimate = 1
             per_core_span = (
                 coord_span_elems * math.prod(device_size[device_dim + 1 :]) * itemsize
             )
             if per_core_span <= MAX_SPAN_BYTES:
                 continue
 
-            infos.append(
-                InputSpanInfo(
-                    chunking_info=ChunkingInfo(
-                        total_bytes=math.prod(device_size) * itemsize,
-                        per_core_span=per_core_span,
-                        core_split_estimate=split_estimate,
-                        selected_device_dim_size=coord_span_elems,
-                        selected_device_span_stride_elems=math.prod(
-                            device_size[device_dim + 1 :]
+            for controlling_symbol in output_syms:
+                output_dim = symbol_to_dim[controlling_symbol]
+                infos.append(
+                    InputSpanInfo(
+                        chunking_info=ChunkingInfo(
+                            total_bytes=math.prod(device_size) * itemsize,
+                            per_core_span=per_core_span,
+                            core_split_estimate=1,
+                            selected_device_dim_size=coord_span_elems,
+                            selected_device_span_stride_elems=math.prod(
+                                device_size[device_dim + 1 :]
+                            ),
+                            selected_host_dim=output_dim,
+                            stick_elems=stick_elems,
+                            reason=f"input span overflow for {dep.name}",
                         ),
-                        selected_host_dim=output_dim,
-                        stick_elems=stick_elems,
-                        reason=f"input span overflow for {dep.name}",
-                    ),
-                    dep_name=dep.name,
-                    controlling_symbol=controlling_symbol,
+                        dep_name=dep.name,
+                        controlling_symbol=controlling_symbol,
+                    )
                 )
-            )
     return infos
 
 
@@ -607,11 +616,13 @@ def _output_span_candidates_from_op(
         if not coord.free_symbols:
             continue
         output_syms = [sym for sym in coord.free_symbols if sym in symbol_to_dim]
-        # Coarse tiling can only shrink coordinates controlled by exactly one
-        # output symbol.  For example, ``floor(d1 / 64)`` maps cleanly to the
-        # output dim for ``d1``; mixed expressions like ``d0 + d1`` or coords
-        # involving reduction-only symbols are skipped here.
-        if len(output_syms) != 1 or len(output_syms) != len(coord.free_symbols):
+        # A coordinate can be jointly controlled by more than one output
+        # symbol, for example two interleaved dims sharing one physical
+        # stride -- ``floor(d1 / 64)`` maps cleanly to the output dim for
+        # ``d1``; ``floor(d0/2) + floor(d1/64)`` is still tileable via both
+        # ``d0`` and ``d1``.  Only a coordinate that also involves a
+        # reduction-only symbol is unsafe to tile and is skipped here.
+        if len(output_syms) != len(coord.free_symbols):
             logger.debug(
                 "span_overflow_output: op=%s skipped coord=%s output_syms=%s",
                 op.get_name(),
@@ -620,14 +631,10 @@ def _output_span_candidates_from_op(
             )
             continue
 
-        controlling_symbol = output_syms[0]
-        output_dim = symbol_to_dim[controlling_symbol]
-        coord_span_elems = _coordinate_span_elems(
-            coord,
-            out_dep,
-            controlling_symbol,
-            split_by_host_dim.get(output_dim, 1),
-        )
+        split_by_symbol = {
+            sym: split_by_host_dim.get(symbol_to_dim[sym], 1) for sym in output_syms
+        }
+        coord_span_elems = _coordinate_span_elems(coord, out_dep, split_by_symbol)
         if coord_span_elems is None:
             continue
         per_core_span = (
@@ -635,23 +642,25 @@ def _output_span_candidates_from_op(
         )
         if per_core_span <= MAX_SPAN_BYTES:
             continue
-        candidates.append(
-            SpanOverflowCandidate(
-                chunking_info=ChunkingInfo(
-                    total_bytes=math.prod(device_size) * itemsize,
-                    per_core_span=per_core_span,
-                    core_split_estimate=1,
-                    selected_device_dim_size=coord_span_elems,
-                    selected_device_span_stride_elems=math.prod(
-                        device_size[device_dim + 1 :]
+        for controlling_symbol in output_syms:
+            output_dim = symbol_to_dim[controlling_symbol]
+            candidates.append(
+                SpanOverflowCandidate(
+                    chunking_info=ChunkingInfo(
+                        total_bytes=math.prod(device_size) * itemsize,
+                        per_core_span=per_core_span,
+                        core_split_estimate=1,
+                        selected_device_dim_size=coord_span_elems,
+                        selected_device_span_stride_elems=math.prod(
+                            device_size[device_dim + 1 :]
+                        ),
+                        selected_host_dim=output_dim,
+                        stick_elems=layout.device_layout.elems_per_stick(),
+                        reason="output span overflow",
                     ),
-                    selected_host_dim=output_dim,
-                    stick_elems=layout.device_layout.elems_per_stick(),
-                    reason="output span overflow",
-                ),
-                source="output",
+                    source="output",
+                )
             )
-        )
 
     return _log_span_candidates(
         candidates,

@@ -96,16 +96,42 @@ def _fixed_tiled_layout(shape, dtype=torch.float16):
     return FixedTiledLayout("spyre:0", dtype, size, stride, device_layout)
 
 
+def _output_symbols_for_shape(shape):
+    if len(shape) == 0:
+        return ()
+    if len(shape) == 4:
+        return sympy.symbols("b h l d")
+    return sympy.symbols(" ".join(f"d{i}" for i in range(len(shape))))
+
+
+def _output_write_dep(name, shape, layout):
+    symbols = _output_symbols_for_shape(shape)
+    if not isinstance(symbols, tuple):
+        symbols = (symbols,)
+    index = sympy.Integer(0)
+    for sym, stride in zip(symbols, layout.stride):
+        index += sym * int(stride)
+    return MemoryDep(name, index, symbols, tuple(shape))
+
+
+def _default_read_writes_for_output(name, shape, layout):
+    return SimpleNamespace(reads=set(), writes={_output_write_dep(name, shape, layout)})
+
+
 def _pointwise_op(shape, name="buf0"):
     """Return a real ComputedBuffer with a lightweight Pointwise mock."""
     data = MagicMock(spec=Pointwise)
     data.ranges = list(shape)
+    layout = _fixed_tiled_layout(shape)
     op = ComputedBuffer(
         name=name,
-        layout=_fixed_tiled_layout(shape),
+        layout=layout,
         data=data,
     )
     op.operation_name = name
+    op.get_read_writes = MagicMock(
+        return_value=_default_read_writes_for_output(name, shape, layout)
+    )
     return op
 
 
@@ -115,12 +141,16 @@ def _reduction_op(shape, reduction_ranges=(64,), name="buf0", reduction_type="su
     data.ranges = list(shape)
     data.reduction_ranges = list(reduction_ranges)
     data.reduction_type = reduction_type
+    layout = _fixed_tiled_layout(shape)
     op = ComputedBuffer(
         name=name,
-        layout=_fixed_tiled_layout(shape),
+        layout=layout,
         data=data,
     )
     op.operation_name = name
+    op.get_read_writes = MagicMock(
+        return_value=_default_read_writes_for_output(name, shape, layout)
+    )
     return op
 
 
@@ -289,7 +319,12 @@ class TestSpanOverflowGroups(InductorTestCase):
         lm_head_bmm.get_read_writes = MagicMock(
             return_value=SimpleNamespace(
                 reads={
-                    MemoryDep("buf1", sympy.Symbol("d1"), {sympy.Symbol("d1"): 49216})
+                    MemoryDep(
+                        "buf1",
+                        sympy.Symbol("d1"),
+                        (sympy.Symbol("d1"),),
+                        (49216,),
+                    )
                 }
             )
         )
@@ -1029,6 +1064,49 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
 
         self.assertEqual(infos, [])
 
+    def test_input_coordinate_jointly_controlled_by_two_symbols_becomes_two_candidates(
+        self,
+    ):
+        """A coordinate mixing two output symbols must not be silently dropped.
+
+        Some physical layouts interleave two logical dims into one physical
+        stride (see the (4096, 4096, 4096, 64) repro).  Such a coordinate is
+        still safely tileable by splitting either contributing dim, so it must
+        produce a candidate for each dim instead of being skipped outright.
+        """
+        op = _reduction_op((2_000_000,), reduction_ranges=(64,))
+        p, q = sympy.symbols("p q")
+        dep = MemoryDep("arg0", p + q, (p, q), (2_000_000, 2_000_000))
+        layout = SimpleNamespace(
+            size=[2_000_000, 64],
+            stride=[64, 1],
+            dtype=torch.float16,
+            device_layout=SimpleNamespace(
+                device_size=[2_000_000, 64],
+                stride_map=[64, 1],
+                elems_per_stick=lambda: 64,
+            ),
+        )
+
+        with (
+            patch.object(soha, "MAX_SPAN_BYTES", 256 * 1024 * 1024),
+            patch.object(soha, "_input_read_deps", return_value=[(dep, layout)]),
+            patch.object(soha, "_output_symbol_to_dim", return_value={p: 0, q: 1}),
+            patch.object(
+                soha,
+                "_device_coordinates_for_span",
+                return_value=[p + q, sympy.Integer(0)],
+            ),
+        ):
+            infos = soha._input_span_infos_controlled_by_output_dims(op, max_cores=1)
+
+        self.assertEqual(len(infos), 2)
+        self.assertEqual(
+            {info.chunking_info.selected_host_dim for info in infos}, {0, 1}
+        )
+        spans = {info.chunking_info.per_core_span for info in infos}
+        self.assertEqual(len(spans), 1)
+
     def test_transposed_bmm_input_stick_alignment_rejects_split(self):
         op = _reduction_op(
             (8190, 64), reduction_ranges=(64,), reduction_type=BATCH_MATMUL_OP
@@ -1051,14 +1129,78 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
         self.assertIsNotNone(error)
         self.assertIn("transposed_rhs", error)
 
-    def test_pointwise_multiple_overflow_dims_emits_multilevel_plan(self):
+    def test_output_coordinate_jointly_controlled_by_two_symbols_becomes_two_candidates(
+        self,
+    ):
+        """Output-side counterpart of the input-side joint-coordinate test.
+
+        ``_output_span_candidates_from_op`` must register a candidate for
+        every output symbol that jointly controls an overflowing physical
+        coordinate, not just bail out because more than one symbol is
+        involved.
+        """
+        p, q = sympy.symbols("p q")
+        out_dep = MemoryDep("buf0", p + q, (p, q), (2_000_000, 2_000_000))
+        layout = SimpleNamespace(
+            size=[2_000_000, 2_000_000],
+            dtype=torch.float16,
+            device_layout=SimpleNamespace(
+                device_size=[2_000_000, 64],
+                elems_per_stick=lambda: 64,
+            ),
+        )
+        op = MagicMock(spec=ComputedBuffer)
+        op.get_name.return_value = "buf0"
+
+        with (
+            patch.object(soha, "MAX_SPAN_BYTES", 256 * 1024 * 1024),
+            patch.object(soha, "_output_write_dep", return_value=out_dep),
+            patch.object(soha, "_output_symbol_to_dim", return_value={p: 0, q: 1}),
+            patch.object(
+                soha,
+                "_device_coordinates_for_span",
+                return_value=[p + q, sympy.Integer(0)],
+            ),
+        ):
+            candidates = soha._output_span_candidates_from_op(
+                op, layout=layout, op_name="buf0"
+            )
+
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(
+            {c.chunking_info.selected_host_dim for c in candidates}, {0, 1}
+        )
+        spans = {c.chunking_info.per_core_span for c in candidates}
+        self.assertEqual(len(spans), 1)
+
+    def test_pointwise_entangled_dim_discovered_only_on_retile_raises(self):
+        """Three equal-sized dims can physically interleave on retile.
+
+        For this shape, the untiled layout's device coordinates map cleanly to
+        host dims 1 and 2 only -- those are the only candidates the initial
+        scan finds.  But ``_resize_device_layout`` reassigns physical
+        positions once a hypothetical tile is applied, and for this
+        all-equal-dims shape that reassignment entangles a third logical dim
+        onto one physical coordinate together with dim 1.  That entangled
+        coordinate is now correctly evaluated (it is no longer silently
+        skipped, see the joint-symbol-coordinate tests above) and still
+        overflows for every combo of splitting dims 1 and 2 alone.
+
+        The search only ever considers host dims discovered by the *initial*
+        untiled scan; it does not widen its search when post-tile
+        re-validation surfaces overflow tied to a dim outside that set.  So
+        the planner correctly raises ``Unsupported`` here rather than
+        emitting a plan that still leaves that entangled coordinate over the
+        limit -- this used to silently "succeed" before the joint-coordinate
+        fix, which is exactly the bug that fix closes.  Widening the search to
+        absorb newly-discovered dims is tracked as follow-up work (see
+        Known Limitations in the docs).
+        """
         op = _pointwise_op((4096, 4096, 4096, 64))
 
         with patch.object(soha, "MAX_SPAN_BYTES", 256 * 1024 * 1024):
-            plan = plan_span_overflow_tile(op, max_cores=1)
-
-        self.assertIsNotNone(plan)
-        self.assertGreaterEqual(len(plan.levels), 2)
+            with self.assertRaisesRegex(Unsupported, "no combined split"):
+                plan_span_overflow_tile(op, max_cores=1)
 
     def test_pointwise_too_many_overflow_dims_raises(self):
         op = _pointwise_op((64, 64, 64, 64, 64, 64))

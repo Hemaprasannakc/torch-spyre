@@ -299,6 +299,40 @@ _input_span_infos_controlled_by_output_dims
 This is not solved by the current pass.  It needs reduction-range tiling and
 partial accumulation.
 
+### 9. Coordinate Jointly Controlled by Two Output Symbols
+
+Example pattern:
+
+```text
+device coordinate = floor(h / 2048) + floor(2 * Mod(l, 2048))
+```
+
+Some physical layouts interleave two logical dims into one physical stride --
+for example a device dimension whose coordinate is a sum of independent terms
+in `h` and `l`.  Earlier this was skipped outright because coordinate
+discovery only accepted a coordinate driven by exactly one output symbol; that
+silently dropped the coordinate from span analysis entirely, so its span was
+never checked against `MAX_SPAN_BYTES` even after tiling other dims.
+
+`_coordinate_span_elems` already computes a coordinate's span by summing each
+free symbol's independent contribution, so a coordinate mixing two or more
+*output* symbols is just as exact to evaluate as one with a single symbol.
+Discovery now accepts a coordinate as long as every free symbol is
+output-controlled (still rejecting any coordinate that also involves a
+reduction-only symbol) and registers one candidate per contributing host dim,
+so the combo search can consider splitting them together.
+
+Code flow:
+
+```text
+_output_span_candidates_from_op / _input_span_infos_controlled_by_output_dims
+  -> output_syms = symbols in coord that are output-controlled
+  -> skip only if some free symbol is reduction-only
+  -> split_by_symbol = {sym: split_by_host_dim[dim(sym)] for sym in output_syms}
+  -> coord_span_elems = _coordinate_span_elems(coord, dep, split_by_symbol)
+  -> one SpanOverflowCandidate/InputSpanInfo per symbol in output_syms
+```
+
 ## Entry Point
 
 The planner entry point is:
@@ -362,6 +396,7 @@ The planner skips:
 | Pointwise indirect/gather read | No | Return `None`; indirect path owns it |
 | Reduction output span overflow | Yes | Emit output-range tile levels if post-tile layout validates |
 | Reduction input span controlled by output dim | Yes | Emit tile for the matching output dim |
+| Coordinate jointly controlled by 2+ output symbols | Yes | Emit a candidate for each contributing dim |
 | Reduction input span controlled by reduction dim | No | Skip candidate; reduction-range tiling is future work |
 | BMM input span controlled by `b`, `m`, or `n` | Yes | Emit tile for matching output dim |
 | BMM input span controlled by `k` | No | Skip candidate; `k` is reduction-only |
@@ -390,8 +425,11 @@ physical address-coordinate analysis:
 2. map output iteration symbols to output dimensions;
 3. compute physical device coordinates for the output layout;
 4. walk non-stick device coordinates;
-5. create one `SpanOverflowCandidate` for each output-controlled coordinate
-   whose span exceeds `MAX_SPAN_BYTES`.
+5. create one `SpanOverflowCandidate` per output symbol that controls a
+   coordinate whose span exceeds `MAX_SPAN_BYTES` -- a coordinate jointly
+   controlled by several output symbols contributes one candidate per
+   contributing dim (see [Coordinate Jointly Controlled by Two Output
+   Symbols](#9-coordinate-jointly-controlled-by-two-output-symbols)).
 
 If output write-dep or symbol-coordinate analysis is unavailable, the planner
 raises `Unsupported` instead of falling back to stride-map guessing.  This keeps
@@ -424,12 +462,15 @@ symbols into:
 - output symbols: symbols present in `_output_symbol_to_dim(op)`;
 - reduction symbols: symbols not present in that output map.
 
-If a coordinate is controlled by exactly one output symbol, output-range coarse
-tiling can reduce that input span, so the planner creates an input-derived
-candidate.  If a coordinate is controlled by a reduction symbol, the planner
-skips that coordinate and continues scanning later device coordinates.  That
-`continue` behavior is important: a reduction-controlled outer coordinate must
-not prevent discovery of a more-inner output-controlled overflowing coordinate.
+If every free symbol in a coordinate is output-controlled, output-range coarse
+tiling can reduce that input span, so the planner creates one input-derived
+candidate per contributing output symbol -- one for a coordinate driven by a
+single output dim, or several for a coordinate that jointly mixes multiple
+output dims onto one physical stride.  If a coordinate involves a reduction
+symbol, the planner skips that coordinate entirely and continues scanning
+later device coordinates.  That `continue` behavior is important: a
+reduction-controlled outer coordinate must not prevent discovery of a
+more-inner output-controlled overflowing coordinate.
 
 Reduction-only input span overflow remains a known limitation.  It requires
 reduction-range tiling and partial accumulation, which this pass does not
@@ -505,6 +546,15 @@ Candidates can come from:
 - output layout span analysis;
 - reduction input span analysis;
 - BMM input span analysis.
+
+A single physical coordinate jointly controlled by several output symbols
+produces one candidate per contributing host dim, all sharing the same
+`per_core_span` (the real joint span of that one coordinate).  Requiring a
+dim's own split count from `_candidate_required_split_count` on such a
+candidate is a conservative starting estimate -- it assumes that dim alone
+must clear the whole joint span -- but it only seeds the bounded divisor
+search; the post-tile combo is always validated exactly, so an imprecise
+estimate costs extra combo attempts, not correctness.
 
 `_candidate_host_dims` merges candidates by host dim and orders dims by
 decreasing span pressure.  This ordering affects the bounded combo search when
@@ -680,6 +730,18 @@ violates the hardware span limit or silently creates unsynchronized tile loops.
   groups are unaffected because users can explicitly group producer and consumer
   in one shared coarse-tile group.  Automatic producer-consumer loop fusion is
   future work.
+- The combo search only ever considers host dims found by the *initial*,
+  untiled candidate scan.  `_resize_device_layout` can reassign which physical
+  device position represents which logical dim once a hypothetical tile is
+  applied, and for layouts with several equal-sized non-stick dims that
+  reassignment can entangle two logical dims onto one physical coordinate that
+  did not exist in the untiled layout.  Post-tile re-validation now correctly
+  evaluates that entangled coordinate (see [Coordinate Jointly Controlled by
+  Two Output Symbols](#9-coordinate-jointly-controlled-by-two-output-symbols)),
+  but if it still overflows, the search cannot widen its host-dim set to
+  include the newly-entangled dim mid-search -- it raises `Unsupported` rather
+  than accept an incomplete plan.  Widening the search to absorb dims
+  discovered during re-validation is future work.
 
 ## Validation
 
@@ -708,6 +770,8 @@ Current coverage includes:
 - BMM reduction-symbol validation;
 - input-layout stick alignment;
 - multi-level plan generation;
+- coordinates jointly controlled by two output symbols producing one candidate
+  per contributing dim, on both the output and reduction/BMM input paths;
 - adapter and `coarse_tile` stamping;
 - fail-safe rejection for the LM-head pattern where an auto-tiled restickify
   producer feeds an auto-tiled BMM consumer;
