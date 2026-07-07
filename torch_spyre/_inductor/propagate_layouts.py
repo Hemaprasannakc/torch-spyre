@@ -79,28 +79,6 @@ from .views import matching_dim
 logger = get_inductor_logger("propagate_layouts")
 
 
-def _producer_needs_span_overflow_tiling(producer: ComputedBuffer) -> bool:
-    """Return True when copy-back elision would hide an auto-tiled producer."""
-    if not (
-        isinstance(producer.data, Pointwise)
-        and isinstance(producer.layout, FixedTiledLayout)
-    ):
-        return False
-    try:
-        from . import config
-        from .span_overflow_hint_analysis import plan_span_overflow_tile
-
-        return plan_span_overflow_tile(producer, config.sencores) is not None
-    except (AttributeError, TypeError, RuntimeError, Unsupported):
-        logger.debug(
-            "copy-back elision: conservatively preserving producer %s; "
-            "span-overflow planning failed",
-            producer.get_name(),
-            exc_info=True,
-        )
-        return True
-
-
 prims = torch.ops.prims
 aten = torch.ops.aten
 spyreop = torch.ops.spyre
@@ -1010,8 +988,6 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
         if producer is None or producer is copy_op:
             continue
         if not isinstance(producer, ComputedBuffer):
-            continue
-        if _producer_needs_span_overflow_tiling(producer):
             continue
         if isinstance(producer.layout, MutationLayoutSHOULDREMOVE):
             continue

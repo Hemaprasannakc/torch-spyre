@@ -1276,6 +1276,9 @@ def plan_span_overflow_tile(
         and isinstance(op.layout, FixedTiledLayout)
         and isinstance(op.data, (Pointwise, Reduction))
     ):
+        # TODO: decide whether MutationLayoutSHOULDREMOVE producers need
+        # span-overflow planning, or whether they are safe to keep outside this
+        # pass as copy-back/mutation intermediates.
         logger.debug("[span-overflow planner] skip unsupported op/type")
         return None
 
