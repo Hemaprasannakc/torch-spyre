@@ -590,11 +590,19 @@ The search is bounded:
 _MAX_TILE_DIMS = 3
 _MAX_SPLITS_PER_DIM = 16
 _MAX_TILE_COMBOS = 512
+_MAX_AUTO_TILE_SPLIT_COUNT = 64
 ```
 
 If more than `_MAX_TILE_DIMS` host dimensions overflow, the planner raises
 `Unsupported`.  Split candidates per dim are capped before Cartesian product
-construction, and combinations are tried in increasing cost order:
+construction, and automatic split counts above `_MAX_AUTO_TILE_SPLIT_COUNT` are
+rejected because current automatic `LoopSpec` lowering can materialize one SDSC
+spec per coarse tile.  A plan such as `split_count=769` can therefore generate
+`sdsc_0.json` through `sdsc_768.json` instead of one compact symbolic tile loop.
+Manual `spyre_hint` remains explicit/user-controlled and can rely on the more
+mature user-hint grouping path; the automatic pass is intentionally capped until
+auto groups can reuse the same compact grouped lowering.
+Combinations are tried in increasing cost order:
 
 ```python
 cost = (
@@ -744,16 +752,34 @@ violates the hardware span limit or silently creates unsynchronized tile loops.
   they require the indirect-access SDSC path.
 - The combo search is bounded by `_MAX_TILE_DIMS`, `_MAX_SPLITS_PER_DIM`, and
   `_MAX_TILE_COMBOS`; very high-rank overflow cases can raise `Unsupported`.
+- Automatic split counts are additionally capped by
+  `_MAX_AUTO_TILE_SPLIT_COUNT`.  This is a lowering/codegen safety limit, not a
+  mathematical span limit: current automatic coarse tiling can unroll a large
+  tile count into many generated SDSC specs, which is expensive and can appear
+  to hang compilation.  For example, an automatic split of `769` may emit 769
+  per-tile specs.  Manual `spyre_hint` is still user-controlled and may be able
+  to use existing grouped hint lowering more effectively; automatic
+  span-overflow should grow producer-consumer/grouped loop lowering before this
+  cap is relaxed.
 - Symbolic layout metadata is skipped because exact divisibility and post-tile
   Spyre layout validation require concrete sizes.
 - Automatic groups are per-op.  If an automatically planned op reads a producer
-  that was already auto-tiled, the adapter now raises `Unsupported` instead of
-  emitting two independent loop groups.  This is required for correctness: two
-  separate 769-tile loops for `restickify(weight)` and the BMM/LM-head consumer
-  are not guaranteed to execute tile-by-tile in lockstep.  Manual `spyre_hint`
-  groups are unaffected because users can explicitly group producer and consumer
-  in one shared coarse-tile group.  Automatic producer-consumer loop fusion is
-  future work.
+  that was already auto-tiled, the adapter raises `Unsupported` instead of
+  emitting two independent loop groups.  This is required for correctness: a
+  restickify/layout-conversion producer and its BMM/LM-head consumer must share
+  one synchronized tile loop.  Manual `spyre_hint` groups are unaffected because
+  users can explicitly group producer and consumer in one shared coarse-tile
+  group.  Automatic producer-consumer loop fusion is future work.  A typical
+  failure looks like `Cannot auto-tile buf0: it reads already auto-tiled
+  producer(s) ['buf1']` for very large `F.linear`/LM-head shapes.
+- The planner does not yet model expected Work Division splits when choosing
+  coarse-tile counts.  Candidate detection uses `core_split_estimate=1`, so
+  coarse tiling must make spans safe by itself.  This is conservative and avoids
+  depending on a later pass, but it can overestimate the coarse split needed
+  when Work Division would already split the same high-pressure coordinate.
+  Future cost-model work should validate the combined effect of planned coarse
+  tiles plus committed/estimated Work Division splits, so auto coarse tiling only
+  covers residual span pressure and avoids excessive `LoopSpec` counts.
 - The combo search only considers host dims found by the initial untiled
   candidate scan.  Post-tile validation uses the per-tile output ranges and
   rebuilt physical layout, so it validates the same domain the tiled kernel will

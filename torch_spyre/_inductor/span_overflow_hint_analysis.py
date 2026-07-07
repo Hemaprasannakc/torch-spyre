@@ -139,6 +139,10 @@ class SpanOverflowCandidate:
 _MAX_TILE_DIMS = 3
 _MAX_TILE_COMBOS = 512
 _MAX_SPLITS_PER_DIM = 16
+# Current LoopSpec lowering fully unrolls each coarse-tile loop into separate
+# SDSC specs, so keep automatic plans conservative.  Manual spyre_hint remains
+# user-controlled and can request larger counts explicitly.
+_MAX_AUTO_TILE_SPLIT_COUNT = 64
 
 
 def _layout_has_static_span_metadata(layout: FixedTiledLayout) -> bool:
@@ -416,6 +420,51 @@ def _coordinate_span_elems(
     return per_core_max - per_core_min + 1
 
 
+def _split_by_symbol_for_coord(
+    coord: sympy.Expr,
+    symbol_to_dim: dict[sympy.Symbol, int],
+    split_by_host_dim: dict[int, int],
+) -> dict[sympy.Symbol, int]:
+    """Return split counts for output symbols present in coord."""
+    return {
+        sym: split_by_host_dim.get(symbol_to_dim[sym], 1)
+        for sym in coord.free_symbols
+        if sym in symbol_to_dim
+    }
+
+
+def _tile_aware_inner_stride_elems(
+    device_coords: list[sympy.Expr],
+    device_size: list[int],
+    dep: MemoryDep,
+    inner_start_dim: int,
+    symbol_to_dim: dict[sympy.Symbol, int],
+    split_by_host_dim: dict[int, int],
+) -> int | None:
+    """Return inner physical span size after applying output tile splits.
+
+    For input reads, splitting one output dim can reduce the physical span
+    nested under another output dim.  Example: a d1 coordinate may have an
+    inner d2 coordinate; when the candidate combo splits both d1 and
+    d2, the byte span for d1 must use the tiled d2 range instead of
+    the full input tensor's physical d2 size.
+    """
+    stride_elems = 1
+    for device_dim, coord in enumerate(
+        device_coords[inner_start_dim:], inner_start_dim
+    ):
+        split_by_symbol = _split_by_symbol_for_coord(
+            coord,
+            symbol_to_dim,
+            split_by_host_dim,
+        )
+        coord_span_elems = _coordinate_span_elems(coord, dep, split_by_symbol)
+        if coord_span_elems is None:
+            return None
+        stride_elems *= min(coord_span_elems, device_size[device_dim])
+    return stride_elems
+
+
 def _device_coordinates_for_span(
     layout: FixedTiledLayout,
     dep: MemoryDep,
@@ -505,19 +554,30 @@ def _input_span_infos_controlled_by_output_dims(
             # hypothetical split, then register a candidate against each
             # contributing dim so the combo search can consider splitting
             # them together.
-            split_by_symbol = {
-                sym: split_by_host_dim.get(symbol_to_dim[sym], 1) for sym in output_syms
-            }
+            split_by_symbol = _split_by_symbol_for_coord(
+                coord,
+                symbol_to_dim,
+                split_by_host_dim,
+            )
             coord_span_elems = _coordinate_span_elems(coord, dep, split_by_symbol)
             if coord_span_elems is None:
+                continue
+
+            inner_stride_elems = _tile_aware_inner_stride_elems(
+                device_coords,
+                device_size,
+                dep,
+                device_dim + 1,
+                symbol_to_dim,
+                split_by_host_dim,
+            )
+            if inner_stride_elems is None:
                 continue
 
             # Span-overflow planning is intentionally conservative: coarse tiles
             # must make the span safe even if downstream work division provides
             # no additional split for this coordinate.
-            per_core_span = (
-                coord_span_elems * math.prod(device_size[device_dim + 1 :]) * itemsize
-            )
+            per_core_span = coord_span_elems * inner_stride_elems * itemsize
             if per_core_span <= MAX_SPAN_BYTES:
                 continue
 
@@ -530,9 +590,7 @@ def _input_span_infos_controlled_by_output_dims(
                             per_core_span=per_core_span,
                             core_split_estimate=1,
                             selected_device_dim_size=coord_span_elems,
-                            selected_device_span_stride_elems=math.prod(
-                                device_size[device_dim + 1 :]
-                            ),
+                            selected_device_span_stride_elems=inner_stride_elems,
                             selected_host_dim=output_dim,
                             stick_elems=stick_elems,
                             reason=f"input span overflow for {dep.name}",
@@ -983,16 +1041,26 @@ def _split_candidates_for_host_dim(
         for split in candidates
         if split == 1
         or (
-            _post_tile_stick_alignment_error(op.layout, host_dim, split) is None
+            # A split that shrinks this dim's per-tile extent to exactly 1
+            # element is rejected: the codegen/DDC lowering path drops
+            # unit-size dims from the op's iteration space (see
+            # spyre_kernel.py's host_to_it mapping), which can under-count
+            # the dimensions a fixed-arity hardware kernel template expects
+            # and crash native codegen (DtException: "Not enough
+            # dimensions") rather than fail cleanly at the Python level.
+            split <= _MAX_AUTO_TILE_SPLIT_COUNT
+            and full_size // split > 1
+            and _post_tile_stick_alignment_error(op.layout, host_dim, split) is None
             and _input_stick_alignment_error(op, host_dim, split) is None
         )
     ]
     capped_candidates = _cap_split_candidates(legal_candidates, required_count)
     logger.debug(
-        "[span-overflow divisors] op=%s host_dim=%d required=%d legal=%s capped=%s",
+        "[span-overflow divisors] op=%s host_dim=%d required=%d max_auto_split=%d legal=%s capped=%s",
         op.get_name(),
         host_dim,
         required_count,
+        _MAX_AUTO_TILE_SPLIT_COUNT,
         legal_candidates,
         capped_candidates,
     )

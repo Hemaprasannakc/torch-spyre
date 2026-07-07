@@ -473,6 +473,16 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertFalse(plan.levels[0].is_reduction)
         self.assertEqual(plan.chunking_infos[0].selected_device_dim_size, _E2E_SHAPE[1])
 
+    def test_auto_planner_rejects_split_counts_above_codegen_cap(self):
+        op = _pointwise_op((4096, 4096))
+
+        with (
+            patch.object(soha, "MAX_SPAN_BYTES", 32 * 1024 * 1024),
+            patch.object(soha, "_MAX_AUTO_TILE_SPLIT_COUNT", 2),
+        ):
+            with self.assertRaisesRegex(Unsupported, "no combined split"):
+                plan_span_overflow_tile(op, max_cores=1)
+
     def test_planner_skips_pointwise_with_indirect_reads(self):
         op = _pointwise_op(_E2E_SHAPE)
 
@@ -1106,6 +1116,71 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
         )
         spans = {info.chunking_info.per_core_span for info in infos}
         self.assertEqual(len(spans), 1)
+
+    def test_input_span_validation_uses_other_tiled_inner_output_dims(self):
+        """Combined input span validation must shrink inner tiled coords too.
+
+        The sum repro shape (2, 2, 257, 64, 64, 128) over the last dim has an
+        input physical d1 coordinate whose inner span includes d2.  Splitting d1
+        alone still leaves a 514 MB span, but splitting d1 and d2 together makes
+        the d1 span small enough.
+        """
+        op = _reduction_op((2, 2, 257, 64, 64), reduction_ranges=(128,))
+        d0, d1, d2, d3, d4, d5 = sympy.symbols("d0 d1 d2 d3 d4 d5")
+        dep = MemoryDep(
+            "arg0",
+            269484032 * d0 + 134742016 * d1 + 524288 * d2 + 8192 * d3 + 128 * d4 + d5,
+            (d0, d1, d2, d3, d4, d5),
+            (2, 2, 257, 64, 64, 128),
+        )
+        layout = SimpleNamespace(
+            size=[2, 2, 257, 64, 64, 128],
+            stride=[269484032, 134742016, 524288, 8192, 128, 1],
+            dtype=torch.float16,
+            device_layout=SimpleNamespace(
+                device_size=[2, 257, 64, 64, 2, 2, 64],
+                stride_map=[134742016, 524288, 8192, 128, 64, 269484032, 1],
+                elems_per_stick=lambda: 64,
+            ),
+        )
+        device_coords = [
+            d1,
+            d2,
+            d3,
+            d4,
+            sympy.floor(d5 / 64),
+            d0,
+            sympy.Mod(d5, 64),
+        ]
+
+        with (
+            patch.object(soha, "MAX_SPAN_BYTES", 256 * 1024 * 1024),
+            patch.object(soha, "_input_read_deps", return_value=[(dep, layout)]),
+            patch.object(
+                soha,
+                "_output_symbol_to_dim",
+                return_value={d0: 0, d1: 1, d2: 2, d3: 3, d4: 4},
+            ),
+            patch.object(
+                soha, "_device_coordinates_for_span", return_value=device_coords
+            ),
+        ):
+            d1_only_infos = soha._input_span_infos_controlled_by_output_dims(
+                op,
+                max_cores=1,
+                split_by_host_dim={1: 2},
+            )
+            d1_d2_infos = soha._input_span_infos_controlled_by_output_dims(
+                op,
+                max_cores=1,
+                split_by_host_dim={1: 2, 2: 257},
+            )
+
+        self.assertIn(
+            1,
+            {info.chunking_info.selected_host_dim for info in d1_only_infos},
+        )
+        self.assertEqual(d1_d2_infos, [])
 
     def test_transposed_bmm_input_stick_alignment_rejects_split(self):
         op = _reduction_op(
