@@ -186,21 +186,26 @@ weight.shape == (1024, 64)
 out.shape    == (2, 1024)
 ```
 
-Lowering can represent this as a batch-matmul-style reduction.  The BMM symbol
-model is:
+Lowering can represent this as a restickify producer followed by a
+batch-matmul-style reduction.  The BMM symbol model is:
 
 ```text
 C[b, m, n] = reduce_k A[b, m, k] * B[b, k, n]
 ```
 
 Spans controlled by `b`, `m`, or `n` are output-range tileable.  Spans
-controlled by `k` are not.  A codegen test checks for:
+controlled by `k` are not.  In the LM-head lowering, the restickify producer can
+be auto-tiled independently.  The BMM consumer is not automatically fused with
+that producer yet, so current codegen coverage checks for a restickify
+`LoopSpec` plus a plain BMM consumer:
 
 ```text
 LoopSpec(
-count=sympify('16')
-op='batchmatmul'
+count=sympify('4')
+op='ReStickifyOpHBM'
 tiled_symbols=[[sympify('c0')]]
+
+op='batchmatmul'
 ```
 
 Code flow:
@@ -210,7 +215,7 @@ plan_span_overflow_tile
   -> Reduction branch
   -> _is_batch_matmul_reduction(op) == True
   -> _bmm_output_symbol_to_dim
-       -> verify exactly one reduction-only symbol, k
+       -> verify exactly one reduction-only symbol, k for input-span candidates
   -> _input_span_candidates
   -> _search_min_cost_tile_plan
 ```
@@ -314,13 +319,16 @@ discovery only accepted a coordinate driven by exactly one output symbol; that
 silently dropped the coordinate from span analysis entirely, so its span was
 never checked against `MAX_SPAN_BYTES` even after tiling other dims.
 
-`_coordinate_span_elems` already computes a coordinate's span by summing each
+`_coordinate_span_elems` computes a conservative span bound by summing each
 free symbol's independent contribution, so a coordinate mixing two or more
-*output* symbols is just as exact to evaluate as one with a single symbol.
-Discovery now accepts a coordinate as long as every free symbol is
-output-controlled (still rejecting any coordinate that also involves a
-reduction-only symbol) and registers one candidate per contributing host dim,
-so the combo search can consider splitting them together.
+*output* symbols can be evaluated like one with a single symbol.  Plain
+monotonic terms are checked at endpoints.  Mod-wrapped terms are evaluated at
+the wraparound critical point in the full term expression, preserving scale
+factors such as `2 * Mod(l, 2048)`.  Discovery accepts a coordinate as long as
+every free symbol is output-controlled (still rejecting any coordinate that
+also involves a reduction-only symbol) and registers one candidate per
+contributing host dim, so the combo search can consider splitting them
+together.
 
 Code flow:
 
@@ -382,7 +390,7 @@ The production planner handles:
 The planner skips:
 
 - non-`ComputedBuffer` ops;
-- non-`FixedTiledLayout` ops;
+- non-`FixedTiledLayout` ops, including mutation/copy-back intermediate layouts;
 - symbolic/dynamic layout metadata;
 - scalar/full reductions where `op.data.ranges` is empty;
 - Pointwise or Reduction ops with indirect/gather/scatter-style reads;
@@ -432,10 +440,10 @@ physical address-coordinate analysis:
    Symbols](#9-coordinate-jointly-controlled-by-two-output-symbols)).
 
 If output write-dep or symbol-coordinate analysis is unavailable, the planner
-raises `Unsupported` instead of falling back to stride-map guessing.  This keeps
-span planning on the same `MemoryDep` address-math model used by work division
-and avoids silently choosing a host dimension that may not actually control the
-physical coordinate.
+returns no output candidates instead of falling back to stride-map guessing.
+This keeps span planning on the same `MemoryDep` address-math model used by
+work division while avoiding compile failures for ops that may not need
+automatic tiling.
 
 ## Reduction Flow
 
@@ -619,7 +627,8 @@ contiguous host strides, and calls `_resize_device_layout` to rebuild the real
 
 Then `_remaining_span_candidates_after_tile` checks:
 
-- output spans using the rebuilt output layout;
+- output spans using the rebuilt output layout and output `MemoryDep.ranges`
+  shrunk to the hypothetical per-tile domain;
 - reduction/BMM input spans using the candidate split map.
 
 Only if no output or relevant input spans remain above `MAX_SPAN_BYTES` does the
@@ -672,13 +681,20 @@ From `coarse_tile` onward, automatic and manual hints share the same path:
 
 ## Configuration
 
-Automatic span-overflow hints are suppressed when:
+Automatic span-overflow hints are opt-in.  By default:
 
 ```python
 config.ignore_span_overflow_hints == True
 ```
 
-or when the broader working-set-reduction hint path is disabled:
+because `SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS` defaults to `1`.  Enable the
+pass with:
+
+```bash
+SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS=0
+```
+
+The broader working-set-reduction hint switch still suppresses this path:
 
 ```python
 config.ignore_wsr_hints == True
@@ -687,11 +703,19 @@ config.ignore_wsr_hints == True
 User-authored `spyre_hint` groups take precedence per op.  Automatic hints are
 not added to ops that already carry user dim hints.
 
+When span-overflow hints are explicitly enabled, copy-back elision preserves
+Pointwise `FixedTiledLayout` producers instead of rewriting them to mutation
+layouts.  This mirrors the old large-tensor chunking behavior: enabling the
+automatic span-overflow feature opts into keeping pointwise producer layouts
+visible to the span planner.  With the default disabled setting, normal
+copy-back elision behavior is unchanged.
+
 ## Failure Policy
 
 The planner returns `None` for unsupported-but-safe-to-ignore cases such as
-ineligible op types, symbolic layouts, indirect reads, scalar reductions, or no
-span overflow.
+ineligible op types, missing output address metadata, failed symbol/coordinate
+analysis before any overflow candidate is proven, symbolic layouts, indirect
+reads, scalar reductions, or no span overflow.
 
 It raises `Unsupported` when it detects overflow but cannot represent a safe
 automatic output-range tile plan.  Common reasons:
@@ -730,18 +754,16 @@ violates the hardware span limit or silently creates unsynchronized tile loops.
   groups are unaffected because users can explicitly group producer and consumer
   in one shared coarse-tile group.  Automatic producer-consumer loop fusion is
   future work.
-- The combo search only ever considers host dims found by the *initial*,
-  untiled candidate scan.  `_resize_device_layout` can reassign which physical
-  device position represents which logical dim once a hypothetical tile is
-  applied, and for layouts with several equal-sized non-stick dims that
-  reassignment can entangle two logical dims onto one physical coordinate that
-  did not exist in the untiled layout.  Post-tile re-validation now correctly
-  evaluates that entangled coordinate (see [Coordinate Jointly Controlled by
-  Two Output Symbols](#9-coordinate-jointly-controlled-by-two-output-symbols)),
-  but if it still overflows, the search cannot widen its host-dim set to
-  include the newly-entangled dim mid-search -- it raises `Unsupported` rather
-  than accept an incomplete plan.  Widening the search to absorb dims
-  discovered during re-validation is future work.
+- The combo search only considers host dims found by the initial untiled
+  candidate scan.  Post-tile validation uses the per-tile output ranges and
+  rebuilt physical layout, so it validates the same domain the tiled kernel will
+  execute.  Widening the search to absorb new dims discovered only during
+  re-validation remains future work if such a case appears.
+- Mutation/copy-back intermediate layouts are currently outside planner scope.
+  When span-overflow hints are enabled, pointwise copy-back elision preserves
+  `FixedTiledLayout` producers so the planner can still see normal pointwise
+  producers.  Direct planning through `MutationLayoutSHOULDREMOVE` remains a
+  future eligibility question.
 
 ## Validation
 
@@ -772,10 +794,14 @@ Current coverage includes:
 - multi-level plan generation;
 - coordinates jointly controlled by two output symbols producing one candidate
   per contributing dim, on both the output and reduction/BMM input paths;
+- Mod-wrapped coordinate span bounds that preserve coefficients around the
+  wraparound point;
+- post-tile validation using per-tile output ranges;
 - adapter and `coarse_tile` stamping;
 - fail-safe rejection for the LM-head pattern where an auto-tiled restickify
   producer feeds an auto-tiled BMM consumer;
-- codegen `LoopSpec` tests for Pointwise, Reduction, and BMM/LM-head shapes.
+- codegen `LoopSpec` tests for Pointwise, Reduction, and LM-head restickify
+  shapes.
 
 ## Key Files
 
@@ -784,6 +810,7 @@ Current coverage includes:
 | `torch_spyre/_inductor/span_overflow_hint_analysis.py` | Candidate collection, combo search, post-tile validation, tile-plan dataclasses |
 | `torch_spyre/_inductor/coarse_tile.py` | Adapter from tile plans to synthetic `DimHint`s; coarse-tile IR stamping |
 | `torch_spyre/_inductor/passes.py` | Combines user hint groups and automatic span-overflow groups |
+| `torch_spyre/_inductor/propagate_layouts.py` | Preserves pointwise producer layouts from copy-back elision when automatic span-overflow is explicitly enabled |
 | `torch_spyre/_inductor/ir.py` | Spyre layout resize/reconstruction helpers |
 | `torch_spyre/_inductor/work_division.py` | Span limit constants and downstream per-core span diagnostics |
 | `tests/inductor/test_span_overflow_hint_analysis.py` | Main unit/codegen coverage |

@@ -41,6 +41,7 @@ from torch._inductor.graph import GraphLowering
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.virtualized import V
 
+from . import config
 from torch_spyre._C import (
     ElementArrangement,
     SpyreTensorLayout,
@@ -988,6 +989,12 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
         if producer is None or producer is copy_op:
             continue
         if not isinstance(producer, ComputedBuffer):
+            continue
+        if (
+            not config.ignore_span_overflow_hints
+            and isinstance(producer.data, Pointwise)
+            and isinstance(producer.layout, FixedTiledLayout)
+        ):
             continue
         if isinstance(producer.layout, MutationLayoutSHOULDREMOVE):
             continue
