@@ -761,6 +761,11 @@ violates the hardware span limit or silently creates unsynchronized tile loops.
   to use existing grouped hint lowering more effectively; automatic
   span-overflow should grow producer-consumer/grouped loop lowering before this
   cap is relaxed.
+- Reduction auto-tiling rejects splits that shrink the selected output dim's
+  per-tile extent to `1`, because the reduction lowering/DDC template path can
+  drop unit-size iteration dims before fixed-arity template matching.  This
+  restriction is intentionally scoped to Reduction ops; Pointwise full-size
+  exact divisors remain legal.
 - Symbolic layout metadata is skipped because exact divisibility and post-tile
   Spyre layout validation require concrete sizes.
 - Automatic groups are per-op.  If an automatically planned op reads a producer

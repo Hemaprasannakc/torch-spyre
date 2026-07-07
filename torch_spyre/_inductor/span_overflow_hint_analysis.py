@@ -453,6 +453,13 @@ def _tile_aware_inner_stride_elems(
     for device_dim, coord in enumerate(
         device_coords[inner_start_dim:], inner_start_dim
     ):
+        if not coord.free_symbols:
+            # A constant coordinate (e.g. a broadcast dim) never shrinks under
+            # any hypothetical split -- its physical extent still occupies the
+            # full declared device_size, so use that directly instead of
+            # re-evaluating a span of 1 for a term with nothing to vary.
+            stride_elems *= device_size[device_dim]
+            continue
         split_by_symbol = _split_by_symbol_for_coord(
             coord,
             symbol_to_dim,
@@ -1042,14 +1049,15 @@ def _split_candidates_for_host_dim(
         if split == 1
         or (
             # A split that shrinks this dim's per-tile extent to exactly 1
-            # element is rejected: the codegen/DDC lowering path drops
-            # unit-size dims from the op's iteration space (see
-            # spyre_kernel.py's host_to_it mapping), which can under-count
-            # the dimensions a fixed-arity hardware kernel template expects
-            # and crash native codegen (DtException: "Not enough
+            # element is rejected for Reduction ops: the codegen/DDC lowering
+            # path can drop unit-size dims from the op's iteration space, which
+            # can under-count the dimensions fixed-arity reduction templates
+            # expect and crash native codegen (DtException: "Not enough
             # dimensions") rather than fail cleanly at the Python level.
-            split <= _MAX_AUTO_TILE_SPLIT_COUNT
-            and full_size // split > 1
+            # Pointwise unit tiles remain legal; there is existing coverage for
+            # full-size exact divisors on Pointwise ops.
+            (not isinstance(op.data, Reduction) or full_size // split > 1)
+            and split <= _MAX_AUTO_TILE_SPLIT_COUNT
             and _post_tile_stick_alignment_error(op.layout, host_dim, split) is None
             and _input_stick_alignment_error(op, host_dim, split) is None
         )

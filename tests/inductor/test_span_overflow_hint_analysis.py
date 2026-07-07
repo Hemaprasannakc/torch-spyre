@@ -474,11 +474,16 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertEqual(plan.chunking_infos[0].selected_device_dim_size, _E2E_SHAPE[1])
 
     def test_auto_planner_rejects_split_counts_above_codegen_cap(self):
+        # (4096, 4096) fp16 is 32MB total; capping MAX_SPAN_BYTES well below
+        # that proves a nontrivial split is required.  With the auto split cap
+        # patched to 1, every nontrivial divisor is rejected before combo
+        # validation, so the planner must fail instead of silently accepting an
+        # uncapped split.
         op = _pointwise_op((4096, 4096))
 
         with (
-            patch.object(soha, "MAX_SPAN_BYTES", 32 * 1024 * 1024),
-            patch.object(soha, "_MAX_AUTO_TILE_SPLIT_COUNT", 2),
+            patch.object(soha, "MAX_SPAN_BYTES", 4 * 1024 * 1024),
+            patch.object(soha, "_MAX_AUTO_TILE_SPLIT_COUNT", 1),
         ):
             with self.assertRaisesRegex(Unsupported, "no combined split"):
                 plan_span_overflow_tile(op, max_cores=1)
@@ -751,7 +756,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         with self.assertRaisesRegex(Unsupported, "no combined split"):
             plan_span_overflow_tile(op, max_cores=4)
 
-    def test_planner_allows_full_size_exact_divisor(self):
+    def test_planner_allows_full_size_exact_divisor_for_pointwise(self):
         op = _pointwise_op((1, 17, 16, 64))
 
         with patch(
@@ -761,6 +766,18 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         self.assertIsNotNone(plan)
         self.assertEqual(plan.levels[0].split_count, 17)
+
+    def test_planner_rejects_full_size_exact_divisor_for_reduction(self):
+        # Reduction codegen/DDC can drop unit-size iteration dims before fixed
+        # template matching.  Keep this rejection scoped to Reduction ops;
+        # Pointwise full-size exact divisors are still legal.
+        op = _reduction_op((1, 17, 16, 64))
+
+        with patch(
+            "torch_spyre._inductor.span_overflow_hint_analysis.MAX_SPAN_BYTES", 32768
+        ):
+            with self.assertRaisesRegex(Unsupported, "no combined split"):
+                plan_span_overflow_tile(op, max_cores=4)
 
     def test_planner_raises_when_no_combined_split_satisfies_post_tile_span(self):
         op = _pointwise_op(_E2E_SHAPE)
