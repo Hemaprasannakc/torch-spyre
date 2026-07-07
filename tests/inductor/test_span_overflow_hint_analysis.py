@@ -231,7 +231,7 @@ class TestSpanOverflowGroups(InductorTestCase):
     def test_no_overflow_returns_empty(self):
         op = _pointwise_op((1, 2, 16, 64), name="small_op")
 
-        with config.patch({"sencores": 4}):
+        with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
             groups = _run_span_overflow_groups(op)
 
         self.assertEqual(groups, [])
@@ -239,7 +239,7 @@ class TestSpanOverflowGroups(InductorTestCase):
     def test_overflow_pointwise_returns_one_group(self):
         op = _pointwise_op(_E2E_SHAPE)
 
-        with config.patch({"sencores": 4}):
+        with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
             groups = _run_span_overflow_groups(op)
 
         self.assertEqual(len(groups), 1)
@@ -248,7 +248,7 @@ class TestSpanOverflowGroups(InductorTestCase):
     def test_overflow_reduction_output_returns_one_group(self):
         op = _reduction_op(_E2E_SHAPE)
 
-        with config.patch({"sencores": 4}):
+        with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
             groups = _run_span_overflow_groups(op)
 
         self.assertEqual(len(groups), 1)
@@ -259,7 +259,7 @@ class TestSpanOverflowGroups(InductorTestCase):
     def test_scalar_reduction_skipped(self):
         op = _reduction_op((), reduction_ranges=(8195, 256, 64))
 
-        with config.patch({"sencores": 4}):
+        with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
             groups = span_overflow_groups(_graph([op]))
 
         self.assertEqual(groups, [])
@@ -267,7 +267,7 @@ class TestSpanOverflowGroups(InductorTestCase):
     def test_group_structure(self):
         op = _pointwise_op(_E2E_SHAPE)
 
-        with config.patch({"sencores": 4}):
+        with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
             groups = _run_span_overflow_groups(op)
 
         self.assertEqual(len(groups), 1)
@@ -288,7 +288,7 @@ class TestSpanOverflowGroups(InductorTestCase):
         with patch(
             "torch_spyre._inductor.coarse_tile.op_out_coords", _out_coords_for_bhld
         ):
-            with config.patch({"sencores": 4}):
+            with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
                 groups = span_overflow_groups(_graph([op0, op1]))
 
         self.assertEqual(len(groups), 2)
@@ -364,7 +364,7 @@ class TestSpanOverflowGroups(InductorTestCase):
                     else [sympy.Symbol("d0"), sympy.Symbol("d1")]
                 ),
             ),
-            config.patch({"sencores": 4}),
+            config.patch({"sencores": 4, "ignore_span_overflow_hints": False}),
         ):
             with self.assertRaisesRegex(
                 Unsupported,
@@ -377,7 +377,7 @@ class TestSpanOverflowGroups(InductorTestCase):
 
         op = _pointwise_op(_E2E_SHAPE)
 
-        with config.patch({"sencores": 4}):
+        with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
             _run_span_overflow_groups(op)
 
         self.assertTrue(hasattr(op, "dim_hints"))
@@ -392,7 +392,7 @@ class TestSpanOverflowGroups(InductorTestCase):
     def test_trip_count_matches_level_and_hint(self):
         op = _pointwise_op(_E2E_SHAPE)
 
-        with config.patch({"sencores": 4}):
+        with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
             groups = _run_span_overflow_groups(op)
 
         _, levels = groups[0]
@@ -412,7 +412,7 @@ class TestSpanOverflowGroups(InductorTestCase):
         op.get_name.return_value = "non_fixed_tiled"
         op.get_operation_name.return_value = "non_fixed_tiled"
 
-        with config.patch({"sencores": 4}):
+        with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
             groups = span_overflow_groups(_graph([op]))
 
         self.assertEqual(groups, [])
@@ -421,7 +421,7 @@ class TestSpanOverflowGroups(InductorTestCase):
         op = _pointwise_op(_E2E_SHAPE)
         op.layout.size[1] = sympy.Symbol("s0")
 
-        with config.patch({"sencores": 4}):
+        with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
             groups = span_overflow_groups(_graph([op]))
 
         self.assertEqual(groups, [])
@@ -439,7 +439,7 @@ class TestSpanOverflowGroups(InductorTestCase):
         ]
         unhinted_op = _pointwise_op(_E2E_SHAPE, name="unhinted")
 
-        with config.patch({"sencores": 4}):
+        with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
             with patch(
                 "torch_spyre._inductor.coarse_tile.op_out_coords",
                 _out_coords_for_bhld,
@@ -911,7 +911,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
     def test_adapter_creates_dim_hint_and_group(self):
         op = _pointwise_op(_E2E_SHAPE)
 
-        with config.patch({"sencores": 4}):
+        with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
             groups = span_overflow_groups(_graph([op]))
 
         self.assertEqual(len(groups), 1)
@@ -930,7 +930,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
     def test_adapter_handles_nontrivial_batch_coord(self):
         op = _pointwise_op((4, 8195, 256, 64))
 
-        with config.patch({"sencores": 4}):
+        with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
             groups = span_overflow_groups(_graph([op]))
 
         self.assertEqual(len(groups), 1)
@@ -948,7 +948,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
     ):
         op = _pointwise_op(_E2E_SHAPE)
 
-        with config.patch({"sencores": 4}):
+        with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
             graph = _graph([op])
             groups = span_overflow_groups(graph)
             coarse_tile(graph, groups)
@@ -1264,7 +1264,7 @@ class TestSpanOverflowLargeShapeContract(InductorTestCase):
             _out_coords_for_bhld,
         ):
             with patch("torch_spyre._inductor.coarse_tile.insert_tiling_propagation"):
-                with config.patch({"sencores": 4}):
+                with config.patch({"sencores": 4, "ignore_span_overflow_hints": False}):
                     # Layer 2: adapter emits the same group shape as user hints.
                     auto_graph = _graph([auto_op])
                     auto_groups = span_overflow_groups(auto_graph)
@@ -1333,6 +1333,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
             "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
         }
     )
     def test_codegen_contains_auto_span_overflow_loop_spec(self):
@@ -1362,6 +1363,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
             "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
         }
     )
     def test_reduction_input_span_codegen_contains_auto_loop_spec(self):
@@ -1392,6 +1394,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
             "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
         }
     )
     def test_lm_head_restickify_codegen_contains_auto_loop_spec(self):
@@ -1424,6 +1427,7 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
             "unroll_loops": False,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
         }
     )
     def test_auto_span_overflow_matches_equivalent_spyre_hint_loop_spec(self):
