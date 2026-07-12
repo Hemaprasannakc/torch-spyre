@@ -1025,9 +1025,7 @@ def _input_stick_alignment_error(
         input_coords = host_coordinates(layout, dep, None)
         for sym in target_symbols:
             matches = [
-                i
-                for i, coord in enumerate(input_coords)
-                if coord.free_symbols == {sym}
+                i for i, coord in enumerate(input_coords) if coord.free_symbols == {sym}
             ]
             if len(matches) != 1:
                 # sym doesn't control exactly one of this input's own
