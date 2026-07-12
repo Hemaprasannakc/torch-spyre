@@ -980,6 +980,32 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         with self.assertRaisesRegex(Unsupported, "no combined split"):
             plan_span_overflow_tile(op, max_cores=4)
 
+    def test_within_stick_host_dim_returns_none_when_no_host_stride_matches(self):
+        # No host stride equals the device layout's final stride-map entry.
+        # An earlier revision guessed len(host_stride) - 1 here; that risked
+        # silently validating stick alignment against the wrong host dim if
+        # the guess was wrong. It must instead report "unknown" so the
+        # caller can fail safe.
+        fake_layout = SimpleNamespace(
+            stride=[8, 4, 1],
+            device_layout=SimpleNamespace(stride_map=[8, 4, 999]),
+        )
+
+        self.assertIsNone(soha._within_stick_host_dim(fake_layout))
+
+    def test_post_tile_stick_alignment_error_rejects_when_stick_dim_unknown(self):
+        fake_layout = SimpleNamespace(
+            stride=[8, 4, 1],
+            device_layout=SimpleNamespace(stride_map=[8, 4, 999]),
+            size=[10, 20, 30],
+        )
+
+        error = soha._post_tile_stick_alignment_error(
+            fake_layout, selected_host_dim=2, split_count=3
+        )
+
+        self.assertIsNotNone(error)
+
     def test_planner_allows_full_size_exact_divisor_for_pointwise(self):
         op = _pointwise_op((1, 17, 16, 64))
 
