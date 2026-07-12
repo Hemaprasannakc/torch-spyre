@@ -243,6 +243,15 @@ def _within_stick_host_dim(layout: FixedTiledLayout) -> int:
     Splitting this host dim is only legal when each tile still contains a whole
     number of Spyre sticks; otherwise a coarse-tile boundary would cut through a
     physical stick.
+
+    TODO: the fallback below (``len(host_stride) - 1``) is reached whenever no
+    host stride exactly matches ``sm_last``, e.g. for a layout whose physical
+    stick-carrying host dim doesn't correspond to a literal stride match. If
+    that guess is ever wrong, the caller validates stick alignment against the
+    wrong host dim instead of the real one. No concrete failing layout has
+    been constructed for this yet, so this is left as a documented risk rather
+    than a speculative ``Unsupported`` raise; flag if a real counter-example
+    turns up.
     """
     sm_last = int(list(layout.device_layout.stride_map)[-1])
     host_stride = [int(s) for s in layout.stride]
@@ -1026,7 +1035,17 @@ def _input_stick_alignment_error(
     cannot just index by that position.  Instead, ``host_coordinates`` -- the
     same helper ``op_out_coords`` uses for the output -- derives this input's
     own per-dimension coordinate expressions directly from its layout and
-    index, and we find which one ``sym`` actually controls.
+    index, and we find which one(s) ``sym`` actually controls.
+
+    A single input dimension's coordinate can be jointly controlled by
+    ``sym`` together with another symbol (e.g. an interleaved/collapsed
+    physical stride after a view or transpose).  Checking only dimensions
+    where ``sym`` is the *sole* free symbol would silently skip stick
+    alignment for that dimension entirely -- mirroring the sibling span
+    candidate search (``_input_span_infos_controlled_by_output_dims``), we
+    instead check every input dimension ``sym`` contributes to, whether or
+    not other symbols also contribute to it, since splitting ``sym`` can cut
+    a physical stick on that dimension either way.
     """
     if split_count <= 1:
         return None
@@ -1040,20 +1059,18 @@ def _input_stick_alignment_error(
             continue
         input_coords = host_coordinates(layout, dep, None)
         for sym in target_symbols:
-            matches = [
-                i for i, coord in enumerate(input_coords) if coord.free_symbols == {sym}
+            matching_dims = [
+                i for i, coord in enumerate(input_coords) if sym in coord.free_symbols
             ]
-            if len(matches) != 1:
-                # sym doesn't control exactly one of this input's own
-                # dimensions (absent, or an ambiguous/shared coordinate) --
-                # nothing to check against this dependency.
-                continue
-            input_host_dim = matches[0]
-            error = _post_tile_stick_alignment_error(
-                layout, input_host_dim, split_count
-            )
-            if error is not None:
-                return f"input dependency {dep.name} host dim {input_host_dim}: {error}"
+            for input_host_dim in matching_dims:
+                error = _post_tile_stick_alignment_error(
+                    layout, input_host_dim, split_count
+                )
+                if error is not None:
+                    return (
+                        f"input dependency {dep.name} host dim {input_host_dim}: "
+                        f"{error}"
+                    )
     return None
 
 

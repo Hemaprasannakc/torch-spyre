@@ -1239,8 +1239,10 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
             # hasn't run yet), so we can't yet tell whether this specific
             # producer will actually get auto-tiled. Conservatively preserve
             # the copy-back for any Pointwise producer while the feature is
-            # on, the same way the old chunk_large_tensors guard did with
-            # `config.chunk_large_tensors and isinstance(producer.data, Pointwise)`.
+            # on, the same way the old (now-removed) chunk_large_tensors
+            # guard did: `config.chunk_large_tensors and
+            # isinstance(producer.data, Pointwise)`, with no layout-type
+            # check either.
             continue
         if isinstance(producer.layout, MutationLayoutSHOULDREMOVE):
             continue

@@ -1143,6 +1143,45 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertIn("transposed_rhs", error)
         self.assertIn("host dim 2", error)
 
+    def test_input_stick_alignment_checks_jointly_controlled_input_dim(self):
+        # The target symbol (m) is not the sole free symbol of any input
+        # coordinate -- it shares the within-stick dim's coordinate with
+        # another symbol (n), e.g. an interleaved/collapsed physical stride
+        # after a view or transpose. Requiring an exact coord.free_symbols
+        # == {m} match would find no dimension at all and silently skip the
+        # stick-alignment check entirely; checking every dimension m
+        # contributes to (regardless of co-occurring symbols) still catches
+        # the misaligned split.
+        op = _reduction_op((8190, 64), reduction_ranges=(64,))
+        m, n, k = sympy.symbols("m n k")
+        input_dep = MemoryDep(
+            "interleaved_rhs",
+            k * 8192 + m + n,
+            (k, m, n),
+            (64, 8192, 8192),
+        )
+        input_layout = _fixed_tiled_layout((64, 8192))
+
+        with (
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._input_read_deps",
+                return_value=[(input_dep, input_layout)],
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis._output_symbol_to_dim",
+                return_value={m: 0, n: 1},
+            ),
+            patch(
+                "torch_spyre._inductor.span_overflow_hint_analysis.host_coordinates",
+                return_value=[k, m + n],
+            ),
+        ):
+            error = _input_stick_alignment_error(op, host_dim=0, split_count=3)
+
+        self.assertIsNotNone(error)
+        self.assertIn("interleaved_rhs", error)
+        self.assertIn("host dim 1", error)
+
     def test_candidate_host_dims_orders_by_decreasing_span_pressure(self):
         candidates = [
             SimpleNamespace(

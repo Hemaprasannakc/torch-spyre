@@ -543,7 +543,9 @@ Environment Variables
        span-overflow coarse-tiling hints (default ``0``)
    * - ``SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS``
      - Ignore only span-overflow coarse-tiling hints; a narrower
-       alternative to ``SPYRE_INDUCTOR_IGNORE_HINTS`` (default ``0``)
+       alternative to ``SPYRE_INDUCTOR_IGNORE_HINTS``.  Defaults to
+       ``1`` (disabled/opt-in): set to ``0`` to enable automatic
+       span-overflow coarse tiling.
 
 **Device enumeration** (``torch_spyre/csrc/spyre_device_enum.cpp``):
 
