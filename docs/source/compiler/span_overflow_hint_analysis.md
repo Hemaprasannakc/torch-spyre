@@ -267,15 +267,34 @@ The planner rejects the split if it would cut through physical sticks in any
 input dependency.  This prevents a plan that is legal for the output tensor but
 unsafe for an input tensor.
 
+`_input_stick_alignment_error` checks every input dimension the split symbol
+contributes to, not only a dimension it controls alone.  A single input
+dimension's coordinate can be jointly controlled by the symbol together with
+another symbol (e.g. an interleaved/collapsed physical stride after a view or
+transpose) -- checking only dimensions where the symbol is the sole free
+symbol would silently skip stick alignment for that dimension entirely.
+
+Both `_post_tile_stick_alignment_error` and `_input_stick_alignment_error`
+depend on `_within_stick_host_dim` to identify which host dim is the
+within-stick dim for a given layout.  If no host stride exactly matches the
+device layout's stride-map entry, `_within_stick_host_dim` returns `None`
+rather than guess a fallback dim, and the caller treats that as "cannot
+verify, reject the split" -- matching the "skip/reject rather than guess"
+discipline used elsewhere in this pass (ambiguous BMM symbol maps return
+empty; `_resize_device_layout` raises rather than guess an ambiguous stick
+dim by elimination).
+
 Code flow:
 
 ```text
 _split_candidates_for_host_dim
   -> _post_tile_stick_alignment_error(op.layout, host_dim, split)
+       -> _within_stick_host_dim(op.layout)
   -> _input_stick_alignment_error(op, host_dim, split)
        -> map output host dim to output symbol
-       -> find same symbol in each input dep
-       -> check that input layout's stick dim is not cut
+       -> find every input dim that symbol contributes to
+       -> check that input layout's stick dim is not cut, via
+          _post_tile_stick_alignment_error -> _within_stick_host_dim
 ```
 
 ### 8. Reduction-Controlled Span: Known Unsupported Case
@@ -323,12 +342,31 @@ never checked against `MAX_SPAN_BYTES` even after tiling other dims.
 free symbol's independent contribution, so a coordinate mixing two or more
 *output* symbols can be evaluated like one with a single symbol.  Plain
 monotonic terms are checked at endpoints.  Mod-wrapped terms are evaluated at
-the wraparound critical point in the full term expression, preserving scale
-factors such as `2 * Mod(l, 2048)`.  Discovery accepts a coordinate as long as
-every free symbol is output-controlled (still rejecting any coordinate that
-also involves a reduction-only symbol) and registers one candidate per
-contributing host dim, so the combo search can consider splitting them
-together.
+a wraparound critical point in the full term expression, preserving scale
+factors such as `2 * Mod(l, 2048)`.
+
+A per-symbol term can contain more than one `Mod` atom on that same symbol
+with different moduli (e.g. two overlapping/interleaved stick strides both
+keyed on the same loop variable).  The term is evaluated at every such atom's
+own critical point plus both domain endpoints, and the true max/min is taken
+across all candidates -- evaluating only at a single critical point derived
+from the smallest modulus would risk assuming that modulus's wraparound also
+maximizes every other `Mod` term summed alongside it, which is not generally
+true.
+
+The critical-point trick itself is only exact when a `Mod`'s argument is the
+*bare* symbol.  A coefficient on the argument (e.g. `Mod(3 * h, 64)`) wraps at
+different symbol values than `modulus - 1`, and evaluating only at the naive
+critical point can silently underestimate the span (confirmed: `Mod(3 * h,
+64)` over `h` in `[0, 100)` has a true max of 63 at `h=21`, not the 61 found
+by evaluating only at `h=63`).  `_coordinate_span_elems` detects this case and
+returns `None` (the same "cannot determine, skip this candidate" signal every
+caller already handles) rather than trust an unproven bound.
+
+Discovery accepts a coordinate as long as every free symbol is
+output-controlled (still rejecting any coordinate that also involves a
+reduction-only symbol) and registers one candidate per contributing host dim,
+so the combo search can consider splitting them together.
 
 Code flow:
 
@@ -825,6 +863,14 @@ violates the hardware span limit or silently creates unsynchronized tile loops.
   `FixedTiledLayout` producers so the planner can still see normal pointwise
   producers.  Direct planning through `MutationLayoutSHOULDREMOVE` remains a
   future eligibility question.
+- A coordinate containing a `Mod` atom whose argument is not the bare split
+  symbol (e.g. `Mod(3 * h, 64)`, as opposed to `Mod(h, 64)`) is skipped rather
+  than bounded: `_coordinate_span_elems` returns `None` for it, since the
+  critical-point trick used for bare-symbol `Mod` atoms is not exact once a
+  coefficient is applied inside the `Mod`.  No concrete op/lowering path has
+  been traced that produces this shape for a `FixedTiledLayout` device
+  coordinate today; this is a documented fail-safe boundary rather than a
+  known-reachable gap.
 
 ## Validation
 
@@ -851,12 +897,16 @@ Current coverage includes:
 - indirect-read guards for Pointwise and Reduction;
 - reduction-controlled span known limitation;
 - BMM reduction-symbol validation;
-- input-layout stick alignment;
+- input-layout stick alignment, including a symbol that jointly controls an
+  input dimension together with another symbol rather than controlling it
+  alone;
 - multi-level plan generation;
 - coordinates jointly controlled by two output symbols producing one candidate
   per contributing dim, on both the output and reduction/BMM input paths;
 - Mod-wrapped coordinate span bounds that preserve coefficients around the
-  wraparound point;
+  wraparound point, correctly bound a term with multiple `Mod` atoms on the
+  same symbol at different moduli, and fail safe (return `None`) for a `Mod`
+  whose argument is not the bare symbol;
 - post-tile validation using per-tile output ranges;
 - adapter and `coarse_tile` stamping;
 - fail-safe rejection for the LM-head pattern where an auto-tiled restickify
