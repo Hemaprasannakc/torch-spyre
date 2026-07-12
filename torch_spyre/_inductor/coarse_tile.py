@@ -76,7 +76,11 @@ from .logging_utils import get_inductor_logger
 from .loop_info import CoarseTileInfo
 from .propagate_hints import DimHint
 from .pass_utils import op_out_coords
-from .span_overflow_hint_analysis import plan_span_overflow_tile
+from .span_overflow_hint_analysis import (
+    SpanOverflowTilePlan,
+    can_conform_pointwise_tile,
+    plan_span_overflow_tile,
+)
 from .ir import FixedTiledLayout, _resize_device_layout
 
 logger = get_inductor_logger("coarse_tile")
@@ -84,6 +88,83 @@ hints_logger = get_inductor_logger("assign_dim_hints")
 
 
 _SPAN_OVERFLOW_HINT_ID = 10000
+
+
+def _auto_span_plan_signature(
+    plan: SpanOverflowTilePlan,
+) -> tuple[tuple[int, int, bool], ...]:
+    """Return the grouping key for a span-overflow plan."""
+    return tuple(
+        (level.selected_host_dim, level.split_count, level.is_reduction)
+        for level in plan.levels
+    )
+
+
+def _auto_span_read_deps(op: ComputedBuffer) -> set[str]:
+    """Return direct MemoryDep read names for auto span-overflow grouping."""
+    try:
+        return {
+            dep.name for dep in op.get_read_writes().reads if isinstance(dep, MemoryDep)
+        }
+    except (AttributeError, TypeError):
+        return set()
+
+
+def _dims_to_hints(
+    op: ComputedBuffer,
+    dims: tuple[tuple[int, int, bool], ...],
+    hint_ids: list[int],
+) -> list[DimHint]:
+    """Create per-op DimHints from (host_dim, split_count, is_reduction) triples.
+
+    ``dims`` is either ``op``'s own independently-searched plan signature, or
+    — when ``op`` conforms to an already-open Pointwise chain — the chain's
+    shared signature.  Either way, ``op`` resolves its own ``loop_var`` from
+    its own output coordinates here, so a conforming op still gets a loop_var
+    that is correct for its own indexing, not copied from the op it conforms
+    to.
+    """
+    out_coords = op_out_coords(op)
+    hints: list[DimHint] = []
+    for (host_dim, split_count, is_reduction), hint_id in zip(dims, hint_ids):
+        if host_dim >= len(out_coords):
+            raise Unsupported(
+                f"Cannot adapt span-overflow plan for {op.get_name()}: "
+                f"host_dim={host_dim} is out of bounds for "
+                f"{len(out_coords)} output coordinates."
+            )
+
+        coord = out_coords[host_dim]
+        free_symbols = coord.free_symbols
+        if len(free_symbols) != 1:
+            raise Unsupported(
+                f"Cannot adapt span-overflow plan for {op.get_name()}: "
+                f"host_dim={host_dim} output coordinate {coord} has "
+                f"{len(free_symbols)} free symbols; expected exactly one loop var."
+            )
+
+        loop_var = next(iter(free_symbols))
+        logger.debug(
+            "[span-overflow groups] op=%s host_dim=%d coord=%s "
+            "loop_var=%s split_count=%s hint_id=%d is_reduction=%s",
+            op.get_name(),
+            host_dim,
+            coord,
+            loop_var,
+            split_count,
+            hint_id,
+            is_reduction,
+        )
+        hints.append(
+            DimHint(
+                dim_names=["_span_overflow"],
+                split_count=split_count,
+                loop_var=loop_var,
+                is_reduction=is_reduction,
+                hint_id=hint_id,
+            )
+        )
+    return hints
 
 
 # ---------------------------------------------------------------------------
@@ -417,9 +498,31 @@ def hints_to_coarse_tile_groups(graph: GraphLowering) -> list[tuple]:
 def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
     """Build coarse_tile() groups from automatic span-overflow plans.
 
-    This adapter converts a SpanOverflowTilePlan into the same group shape as
-    user spyre_hint annotations: ``[([op], [(hint_id, count, is_reduction)])]``.
-    Ops that already carry user hints are left for the user-hint grouping path.
+    This adapter converts SpanOverflowTilePlans into the same group shape as
+    user spyre_hint annotations: ``[(ops, [(hint_id, count, is_reduction)])]``.
+    Ops that already carry user dim hints are left for the user-hint grouping
+    path.
+
+    A contiguous run of Pointwise ops shares one group/loop when either:
+      - each op's own independently-searched plan
+        (``plan_span_overflow_tile``) produces the exact same
+        ``(host_dim, split_count, is_reduction)`` signature as the run so
+        far; or
+      - an op's own plan disagrees, but the run reads into it (a real
+        producer-consumer edge) and the run's existing split is *also* a
+        legal, sufficient plan for that op on its own
+        (``can_conform_pointwise_tile``) — the op then adopts the run's split
+        instead of its own.
+
+    Reduction/BMM ops are never grouped (this pass is Pointwise-only for now)
+    and always get an independent singleton group. An op that reads a buffer
+    from an already-closed group, or from the open run without being
+    fusable into it, still raises ``Unsupported``: two independent loop nests
+    over the same span-overflow-sized data can desynchronize, and for ops
+    tiled specifically because their *full* buffer violates the hardware
+    span limit, falling back to materializing that full buffer for an
+    "outside consumer" would silently reintroduce the exact span violation
+    tiling was meant to prevent.
     """
     from . import config
 
@@ -439,134 +542,205 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
     groups: list[tuple] = []
     next_hint_id = _SPAN_OVERFLOW_HINT_ID
     auto_tiled_producers: set[str] = set()
+    # Producers already tiled by a user spyre_hint (assign_dim_hints runs
+    # before this pass and leaves dim_hints set; hints_to_coarse_tile_groups
+    # only reads it, it never clears it). An op reading one of these has the
+    # same unsynchronized-loop-nest risk as reading an auto_tiled_producers
+    # entry, so both sets guard the same conflict checks below.
+    manually_hinted_producers: set[str] = {
+        op.get_name()
+        for op in graph.operations
+        if isinstance(op, ComputedBuffer) and getattr(op, "dim_hints", [])
+    }
+    _PwDims = tuple[tuple[int, int, bool], ...]
+    current_pw_group: list[tuple[ComputedBuffer, _PwDims]] = []
+    current_pw_signature: _PwDims | None = None
+
+    def flush_current_pw_group() -> None:
+        nonlocal next_hint_id, current_pw_group, current_pw_signature
+        if not current_pw_group:
+            return
+
+        signature = current_pw_signature
+        assert signature is not None
+        hint_ids = list(range(next_hint_id, next_hint_id + len(signature)))
+        next_hint_id += len(signature)
+        levels = [
+            (hint_id, sympy.Integer(split_count), is_reduction)
+            for hint_id, (_host_dim, split_count, is_reduction) in zip(
+                hint_ids, signature
+            )
+        ]
+
+        group_ops: list[Operation] = []
+        for grouped_op, dims in current_pw_group:
+            grouped_op.dim_hints = _dims_to_hints(  # type: ignore[attr-defined]
+                grouped_op, dims, hint_ids
+            )
+            group_ops.append(grouped_op)
+            auto_tiled_producers.add(grouped_op.get_name())
+
+        groups.append((group_ops, levels))
+        logger.debug(
+            "[span-overflow groups] created group_index=%d ops=%s levels=%s",
+            len(groups) - 1,
+            [op.get_name() for op in group_ops],
+            levels,
+        )
+        current_pw_group = []
+        current_pw_signature = None
 
     for op in graph.operations:
         if not isinstance(op, ComputedBuffer):
+            flush_current_pw_group()
             continue
         if not isinstance(op.data, (Pointwise, Reduction)):
+            flush_current_pw_group()
             continue
         if isinstance(op.data, Reduction) and not list(op.data.ranges):
+            flush_current_pw_group()
             continue
         if not isinstance(op.layout, FixedTiledLayout):
+            flush_current_pw_group()
             continue
         if getattr(op, "dim_hints", []):
+            flush_current_pw_group()
             continue
+
+        read_deps = _auto_span_read_deps(op)
+        current_group_names = {
+            grouped_op.get_name() for grouped_op, _ in current_pw_group
+        }
 
         plan = plan_span_overflow_tile(op, config.sencores)
         if plan is None:
-            logger.debug(
-                "[span-overflow groups] op=%s no auto plan",
-                op.get_name(),
-            )
+            # op needs no coarse tiling of its own.  It's always safe to leave
+            # it outside any loop: insert_tiling_propagation's outside-consumer
+            # path (coarse_tile.py) already patches consumers of a tiled
+            # producer to read a full, reassembled buffer, and
+            # plan_span_overflow_tile returning None here means that op's own
+            # full-size reads/writes are already known not to overflow.
+            logger.debug("[span-overflow groups] op=%s no auto plan", op.get_name())
+            flush_current_pw_group()
             continue
 
+        signature = _auto_span_plan_signature(plan)
         logger.debug(
             "[span-overflow groups] op=%s plan_levels=%s reasons=%s",
             op.get_name(),
-            [
-                (level.selected_host_dim, level.split_count, level.is_reduction)
-                for level in plan.levels
-            ],
+            list(signature),
             [info.reason for info in plan.chunking_infos],
         )
-
-        # Auto span-overflow groups are currently emitted per op.  If this op
-        # reads a producer that was already auto-tiled, independent loop groups
-        # can execute out of lockstep and produce wrong results.  Manual hints
-        # are unaffected because they use the user-hint grouping path.
-        try:
-            read_deps = {
-                dep.name
-                for dep in op.get_read_writes().reads
-                if isinstance(dep, MemoryDep)
-            }
-        except (AttributeError, TypeError):
-            read_deps = set()
         logger.debug(
-            "[span-overflow groups] op=%s read_deps=%s auto_tiled_producers=%s",
+            "[span-overflow groups] op=%s read_deps=%s auto_tiled_producers=%s "
+            "current_pw_group=%s",
             op.get_name(),
             sorted(read_deps),
             sorted(auto_tiled_producers),
+            sorted(current_group_names),
         )
-        conflicting_producers = sorted(read_deps & auto_tiled_producers)
-        if conflicting_producers:
+
+        completed_conflicts = sorted(
+            read_deps & (auto_tiled_producers | manually_hinted_producers)
+        )
+        if completed_conflicts:
             logger.warning(
                 "[span-overflow groups] op=%s rejected_conflicting_auto_producers=%s",
                 op.get_name(),
-                conflicting_producers,
+                completed_conflicts,
             )
             raise Unsupported(
                 f"Cannot auto-tile {op.get_name()}: it reads already auto-tiled "
-                f"producer(s) {conflicting_producers}. Automatic span-overflow "
-                "groups are currently per-op, so tiling this producer and "
-                "consumer independently can produce unsynchronized loop nests. "
-                "Producer-consumer span-overflow loop fusion is required for "
-                "this case."
+                f"producer(s) {completed_conflicts}. Automatic span-overflow "
+                "grouping currently only synchronizes compatible contiguous "
+                "pointwise ops, so tiling this producer and consumer independently "
+                "can produce unsynchronized loop nests."
             )
 
-        out_coords = op_out_coords(op)
-        hints: list[DimHint] = []
-        levels: list[tuple] = []
-        level_summary: list[tuple[int, int]] = []
+        is_reduction_op = isinstance(op.data, Reduction)
 
-        planned_levels = [
-            (level.selected_host_dim, level.split_count, level.is_reduction)
-            for level in plan.levels
-        ]
-
-        for host_dim, split_count, is_reduction in planned_levels:
-            if host_dim >= len(out_coords):
-                raise Unsupported(
-                    f"Cannot adapt span-overflow plan for {op.get_name()}: "
-                    f"host_dim={host_dim} is out of bounds for "
-                    f"{len(out_coords)} output coordinates."
-                )
-
-            coord = out_coords[host_dim]
-            free_symbols = coord.free_symbols
-            if len(free_symbols) != 1:
-                raise Unsupported(
-                    f"Cannot adapt span-overflow plan for {op.get_name()}: "
-                    f"host_dim={host_dim} output coordinate {coord} has "
-                    f"{len(free_symbols)} free symbols; expected exactly one loop var."
-                )
-
-            hint_id = next_hint_id
-            next_hint_id += 1
-            loop_var = next(iter(free_symbols))
-            logger.debug(
-                "[span-overflow groups] op=%s host_dim=%d coord=%s "
-                "loop_var=%s split_count=%s hint_id=%d is_reduction=%s",
+        can_join_pw_group = (
+            not is_reduction_op
+            and current_pw_signature is not None
+            and signature == current_pw_signature
+        )
+        if can_join_pw_group:
+            current_pw_group.append((op, signature))
+            logger.info(
+                "[span-overflow groups] op=%s joined_matching_signature=%s",
                 op.get_name(),
-                host_dim,
-                coord,
-                loop_var,
-                split_count,
-                hint_id,
-                is_reduction,
+                list(signature),
             )
-            hints.append(
-                DimHint(
-                    dim_names=["_span_overflow"],
-                    split_count=split_count,
-                    loop_var=loop_var,
-                    is_reduction=is_reduction,
-                    hint_id=hint_id,
-                )
-            )
-            levels.append(
-                (
-                    hint_id,
-                    sympy.Integer(split_count),
-                    is_reduction,
-                )
-            )
-            level_summary.append((host_dim, split_count))
-
-        if not levels:
             continue
 
-        op.dim_hints = hints  # type: ignore[attr-defined]
+        # op's own independent plan disagrees with the open run.  If op
+        # actually reads from the run (a real producer-consumer edge, not
+        # just an adjacent unrelated op), check whether the run's split is
+        # *also* legal and sufficient for op on its own — if so, op adopts
+        # the run's split rather than opening a second, unsynchronized loop.
+        conform_dims: tuple[tuple[int, int, bool], ...] | None = None
+        if (
+            not is_reduction_op
+            and current_pw_signature is not None
+            and (read_deps & current_group_names)
+        ):
+            split_by_host_dim = {
+                host_dim: split_count
+                for host_dim, split_count, _ in current_pw_signature
+            }
+            if can_conform_pointwise_tile(op, split_by_host_dim, config.sencores):
+                conform_dims = current_pw_signature
+
+        if conform_dims is not None:
+            current_pw_group.append((op, conform_dims))
+            logger.info(
+                "[span-overflow groups] op=%s conformed_to_group_split=%s "
+                "(own_independent_plan_was=%s)",
+                op.get_name(),
+                list(conform_dims),
+                list(signature),
+            )
+            continue
+
+        pending_conflicts = sorted(read_deps & current_group_names)
+        flush_current_pw_group()
+        if pending_conflicts:
+            logger.warning(
+                "[span-overflow groups] op=%s rejected_conflicting_auto_producers=%s",
+                op.get_name(),
+                pending_conflicts,
+            )
+            raise Unsupported(
+                f"Cannot auto-tile {op.get_name()}: it reads already auto-tiled "
+                f"producer(s) {pending_conflicts}. Automatic span-overflow "
+                "grouping currently only synchronizes compatible contiguous "
+                "pointwise ops, so tiling this producer and consumer independently "
+                "can produce unsynchronized loop nests."
+            )
+
+        if not is_reduction_op:
+            current_pw_group.append((op, signature))
+            current_pw_signature = signature
+            logger.info(
+                "[span-overflow groups] op=%s started_new_pw_group split=%s",
+                op.get_name(),
+                list(signature),
+            )
+            continue
+
+        # Reduction/BMM ops are never grouped in this pass: always an
+        # independent singleton group.
+        hint_ids = list(range(next_hint_id, next_hint_id + len(signature)))
+        next_hint_id += len(signature)
+        op.dim_hints = _dims_to_hints(  # type: ignore[attr-defined]
+            op, signature, hint_ids
+        )
+        levels = [
+            (hint_id, sympy.Integer(split_count), is_reduction)
+            for hint_id, (_host_dim, split_count, is_reduction) in zip(
+                hint_ids, signature
+            )
+        ]
         groups.append(([op], levels))
         auto_tiled_producers.add(op.get_name())
         logger.debug(
@@ -576,6 +750,9 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
             levels,
         )
 
+        level_summary = [
+            (host_dim, split_count) for host_dim, split_count, _ in signature
+        ]
         max_total = max(info.total_bytes for info in plan.chunking_infos)
         max_span = max(info.per_core_span for info in plan.chunking_infos)
         logger.info(
@@ -586,6 +763,7 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
             max_span / (1024**2),
         )
 
+    flush_current_pw_group()
     return groups
 
 

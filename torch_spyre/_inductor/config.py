@@ -65,11 +65,10 @@ ignore_wsr_hints: bool = os.environ.get("SPYRE_INDUCTOR_IGNORE_HINTS", "0") == "
 # SPYRE_INDUCTOR_IGNORE_HINTS flag also disables these so one switch can still
 # suppress all WSR/coarse-tiling hint paths.
 #
-# Defaults to disabled (opt-in): span-overflow auto-tiling does not yet
-# fuse a chained producer/consumer pair into one synchronized coarse-tile
-# group, so tiling them independently can produce wrong results. Kept
-# user-enabled until multi-op grouping and reduction-dim tiling are fully
-# supported. Set SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS=0 to opt in;
+# Defaults to disabled (opt-in): span-overflow auto-tiling can synchronize
+# compatible contiguous pointwise groups, but incompatible producer/consumer
+# groups and reduction-dim tiling still need broader support. Set
+# SPYRE_INDUCTOR_IGNORE_SPAN_OVERFLOW_HINTS=0 to opt in;
 # tests exercising this path directly should override via
 # config.patch({"ignore_span_overflow_hints": False}).
 ignore_span_overflow_hints: bool = (

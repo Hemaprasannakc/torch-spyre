@@ -990,11 +990,15 @@ def _resolve_copy_back_candidates(operations: list[Operation]) -> None:
             continue
         if not isinstance(producer, ComputedBuffer):
             continue
-        if (
-            not config.ignore_span_overflow_hints
-            and isinstance(producer.data, Pointwise)
-            and isinstance(producer.layout, FixedTiledLayout)
+        if not config.ignore_span_overflow_hints and isinstance(
+            producer.data, Pointwise
         ):
+            # Layouts are still plain FixedLayout here (finalize_layouts
+            # hasn't run yet), so we can't yet tell whether this specific
+            # producer will actually get auto-tiled. Conservatively preserve
+            # the copy-back for any Pointwise producer while the feature is
+            # on, the same way the old chunk_large_tensors guard did with
+            # `config.chunk_large_tensors and isinstance(producer.data, Pointwise)`.
             continue
         if isinstance(producer.layout, MutationLayoutSHOULDREMOVE):
             continue

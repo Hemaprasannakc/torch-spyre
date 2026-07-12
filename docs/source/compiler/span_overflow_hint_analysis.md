@@ -673,12 +673,27 @@ synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
 3. calls `plan_span_overflow_tile`;
 4. maps each `selected_host_dim` to a concrete output loop symbol via
    `op_out_coords(op)`;
-5. rejects automatic producer-consumer pairs where a planned op reads a
-   producer that was already auto-tiled, because those per-op groups would not
-   share one loop nest;
-6. creates synthetic `DimHint`s with ids starting at
-   `_SPAN_OVERFLOW_HINT_ID = 10000`;
-7. returns coarse-tile groups in the same format as user hints.
+5. fuses a contiguous run of Pointwise ops into one shared group/loop when
+   either (a) each op's own independent plan produces the exact same
+   `(host_dim, split_count, is_reduction)` signature as the run so far, or
+   (b) an op's own plan disagrees but the op directly reads a buffer written
+   by the open run and the run's split is *also* legal and sufficient for
+   that op on its own (`can_conform_pointwise_tile`) — the op then adopts the
+   run's split instead of its own. Reduction/BMM ops are never grouped or
+   used as a conform target in this pass and always get an independent
+   singleton group;
+6. rejects any op that reads a buffer from an already-closed auto-tiled
+   group, from a producer already tiled by a user `spyre_hint` (checked via
+   the same `dim_hints` attribute `assign_dim_hints` leaves behind, since
+   this pass never clears it), or from the open run without being fusable
+   into it (mismatched signature and conform fails, or the reading op is a
+   Reduction/BMM), since two independent loop nests over the same
+   span-overflow-sized data can desynchronize, and materializing a tiled
+   Pointwise producer's full buffer for such an "outside consumer" can
+   reintroduce the exact span violation tiling was meant to prevent;
+7. creates synthetic `DimHint`s with ids starting at
+   `_SPAN_OVERFLOW_HINT_ID = 10000`, shared across every op in a fused group;
+8. returns coarse-tile groups in the same format as user hints.
 
 From `coarse_tile` onward, automatic and manual hints share the same path:
 
@@ -768,15 +783,30 @@ violates the hardware span limit or silently creates unsynchronized tile loops.
   exact divisors remain legal.
 - Symbolic layout metadata is skipped because exact divisibility and post-tile
   Spyre layout validation require concrete sizes.
-- Automatic groups are per-op.  If an automatically planned op reads a producer
-  that was already auto-tiled, the adapter raises `Unsupported` instead of
-  emitting two independent loop groups.  This is required for correctness: a
-  restickify/layout-conversion producer and its BMM/LM-head consumer must share
-  one synchronized tile loop.  Manual `spyre_hint` groups are unaffected because
-  users can explicitly group producer and consumer in one shared coarse-tile
-  group.  Automatic producer-consumer loop fusion is future work.  A typical
-  failure looks like `Cannot auto-tile buf0: it reads already auto-tiled
-  producer(s) ['buf1']` for very large `F.linear`/LM-head shapes.
+- A contiguous run of Pointwise ops fuses into one shared loop, either because
+  each op's own independent plan already agrees, or because a disagreeing op
+  directly reads the run and can legally conform to the run's split
+  (`can_conform_pointwise_tile` in `span_overflow_hint_analysis.py`). This is
+  still scoped to Pointwise-to-Pointwise: Reduction/BMM ops are never grouped
+  and never conform, and fusion never crosses an already-closed group (closed
+  groups are, by construction, no longer contiguous with what follows). If a
+  Reduction/BMM op reads a producer that was already auto-tiled, or already
+  manually tiled by a user `spyre_hint` — or a Pointwise op reads one that it
+  cannot conform to — the adapter still raises `Unsupported` instead of
+  emitting two independent loop groups. This is required for correctness: a
+  restickify/layout-conversion producer and its BMM/LM-head consumer must
+  share one synchronized tile loop, and materializing the producer's full
+  buffer for such an unfused consumer can reintroduce the exact span
+  violation tiling was meant to prevent. A producer and consumer that are
+  both inside the same manual `spyre_hint` group are unaffected, since users
+  can explicitly group them into one shared coarse-tile group; the conflict
+  check only fires when an *automatically*-tiled op reads a manually-hinted
+  producer that it was not itself grouped with. Automatic Reduction/BMM
+  producer-consumer loop fusion, and fusion across an already-closed group,
+  remain future work. A
+  typical failure still looks like `Cannot auto-tile buf0: it reads already
+  auto-tiled producer(s) ['buf1']` — now for a narrower set of cases (e.g. very
+  large `F.linear`/LM-head shapes, where the consumer is a BMM reduction).
 - The planner does not yet model expected Work Division splits when choosing
   coarse-tile counts.  Candidate detection uses `core_split_estimate=1`, so
   coarse tiling must make spans safe by itself.  This is conservative and avoids

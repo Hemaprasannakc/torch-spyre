@@ -88,6 +88,28 @@ def test_pointwise_out_copy_back_into_input_is_elided(shape):
     _assert_copy_back_elided(source)
 
 
+def test_pointwise_out_copy_back_is_preserved_when_span_overflow_hints_enabled():
+    torch.manual_seed(11)
+    shape = (SIZE, SIZE)
+    x = torch.randn(*shape, dtype=torch.float16)
+    y = torch.randn(*shape, dtype=torch.float16)
+    z = torch.randn(*shape, dtype=torch.float16)
+    tail = torch.randn(*shape, dtype=torch.float16)
+
+    def fn(x, y, z, tail):
+        torch.add(x, y, out=z)
+        return z * tail
+
+    expected_z = z.clone()
+    expected = fn(x, y, expected_z, tail)
+    with inductor_config.patch({"ignore_span_overflow_hints": False}):
+        actual, source, device_args = _compile_and_source(fn, x, y, z, tail)
+
+    torch.testing.assert_close(actual.cpu(), expected, atol=0.1, rtol=0.1)
+    torch.testing.assert_close(device_args[2].cpu(), expected_z, atol=0.1, rtol=0.1)
+    _assert_copy_back_preserved(source)
+
+
 def test_required_copy_backs_are_preserved():
     torch.manual_seed(2)
     x = torch.randn(SIZE, SIZE, dtype=torch.float16)

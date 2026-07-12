@@ -33,6 +33,7 @@ from .logging_utils import get_inductor_logger
 from .pass_utils import (
     _fixed_read_layout,
     concretize_index,
+    host_coordinates,
     indirect_info_from_op,
     op_out_coords,
 )
@@ -103,9 +104,12 @@ class SpanOverflowTilePlan:
     """Complete coarse-tiling request returned by span-overflow analysis.
 
     ``levels`` is the actual tiling plan consumed by ``coarse_tile``.  It can
-    contain one level, for example ``[(host_dim=0, split_count=769)]`` for the
+    contain one level, for example ``[(host_dim=0, split_count=32)]`` for the
     LM-head vocab dimension, or multiple levels when several output dimensions
     must be tiled together.  The levels are emitted outer-to-inner by host dim.
+    Automatic split counts are bounded by ``_MAX_AUTO_TILE_SPLIT_COUNT``; a
+    larger value like 769 is only reachable via a manual ``spyre_hint``, not
+    through this automatic plan.
 
     ``chunking_infos`` records the physical span facts that caused the plan:
     total bytes, per-tile/per-core span estimate, selected physical span dim,
@@ -176,9 +180,11 @@ def _post_tile_layout_for_splits(
     """Build the actual per-tile Spyre layout for one or more host splits.
 
     The search never trusts arithmetic alone.  For a candidate like
-    ``{dim0: 769, dim1: 2}``, this shrinks the logical host sizes first and then
+    ``{dim0: 32, dim1: 2}``, this shrinks the logical host sizes first and then
     calls ``_resize_device_layout`` so validation uses the same physical layout
-    reconstruction as real coarse tiling.
+    reconstruction as real coarse tiling.  Only called from the automatic
+    planner's own search/validation, so candidates here are already bounded by
+    ``_MAX_AUTO_TILE_SPLIT_COUNT``.
     """
     new_size = list(original_layout.size)
     for selected_host_dim, split_count in split_by_host_dim.items():
@@ -397,6 +403,18 @@ def _coordinate_span_elems(
     affine/floor terms are evaluated at endpoints.  Modulo terms are bounded by
     their modulus because their maximum can occur just before wraparound rather
     than at either endpoint.
+
+    This evaluates each tile as if its symbol always starts at 0, not at that
+    tile's offset into the full tensor.  That is safe here: current automatic
+    coarse tiling fully unrolls each tile into its own separately generated
+    SDSC spec (see span_overflow_hint_analysis.md), and _divide_ranges only
+    shrinks the declared range for that spec -- it never rewrites the index
+    expression to add a tile offset.  So a symbol's value within any one
+    tile's generated spec is genuinely bounded by [0, per_tile_size) every
+    time; the tile's real position in the full tensor is resolved afterward,
+    by a separate physical address offset that this Mod computation never
+    sees.  A Mod term therefore cannot see a later tile's actual wraparound
+    window, because no later tile ever substitutes a shifted value here.
     """
     per_core_max = 0
     per_core_min = 0
@@ -583,7 +601,9 @@ def _input_span_infos_controlled_by_output_dims(
 
             # Span-overflow planning is intentionally conservative: coarse tiles
             # must make the span safe even if downstream work division provides
-            # no additional split for this coordinate.
+            # no additional split for this coordinate.  core_split_estimate=1
+            # below is that assumption made explicit -- see the max_cores note
+            # in plan_span_overflow_tile's docstring.
             per_core_span = coord_span_elems * inner_stride_elems * itemsize
             if per_core_span <= MAX_SPAN_BYTES:
                 continue
@@ -753,6 +773,9 @@ def _output_span_candidates_from_op(
                     chunking_info=ChunkingInfo(
                         total_bytes=math.prod(device_size) * itemsize,
                         per_core_span=per_core_span,
+                        # core_split_estimate=1: see the max_cores note in
+                        # plan_span_overflow_tile's docstring -- work division
+                        # is not yet modeled, so this is always 1 today.
                         core_split_estimate=1,
                         selected_device_dim_size=coord_span_elems,
                         selected_device_span_stride_elems=math.prod(
@@ -980,6 +1003,14 @@ def _input_stick_alignment_error(
     tensor's own physical layout (stride order, stick mapping) can differ
     from the output's, so stick alignment must be checked against each
     input's own layout independently of the output layout check.
+
+    A symbol's position in ``dep.ranges`` reflects the op's shared, output-
+    derived iteration order -- it is not guaranteed to match this specific
+    input's own physical dimension order (e.g. for a transposed read), so we
+    cannot just index by that position.  Instead, ``host_coordinates`` -- the
+    same helper ``op_out_coords`` uses for the output -- derives this input's
+    own per-dimension coordinate expressions directly from its layout and
+    index, and we find which one ``sym`` actually controls.
     """
     if split_count <= 1:
         return None
@@ -991,11 +1022,19 @@ def _input_stick_alignment_error(
     for dep, layout in _input_read_deps(op):
         if not _layout_has_static_span_metadata(layout):
             continue
-        dep_symbols = list(dep.ranges.keys())
+        input_coords = host_coordinates(layout, dep, None)
         for sym in target_symbols:
-            if sym not in dep_symbols:
+            matches = [
+                i
+                for i, coord in enumerate(input_coords)
+                if coord.free_symbols == {sym}
+            ]
+            if len(matches) != 1:
+                # sym doesn't control exactly one of this input's own
+                # dimensions (absent, or an ambiguous/shared coordinate) --
+                # nothing to check against this dependency.
                 continue
-            input_host_dim = dep_symbols.index(sym)
+            input_host_dim = matches[0]
             error = _post_tile_stick_alignment_error(
                 layout, input_host_dim, split_count
             )
@@ -1325,6 +1364,64 @@ def _has_indirect_reads(op: ComputedBuffer) -> bool:
     return indirect_sizes is not None
 
 
+def can_conform_pointwise_tile(
+    op: ComputedBuffer,
+    split_by_host_dim: dict[int, int],
+    max_cores: int,
+) -> bool:
+    """Return True if op can safely reuse an already-planned group's tile split.
+
+    Used to fuse a directly-connected Pointwise consumer into an upstream
+    Pointwise chain's shared coarse-tile loop even when the consumer's own
+    independent cost search (``plan_span_overflow_tile``) would have picked a
+    different split: rather than re-run that search, check whether the
+    upstream split is *also* a legal and sufficient plan for ``op``, so every
+    op in the chain iterates in lockstep inside one loop.
+
+    Legal means: every ``host_dim`` exists and its range divides evenly by
+    the given split, and no output or input stick boundary is cut. Sufficient
+    means: after applying the split, ``op`` itself has no remaining
+    output/input span overflow — the upstream split must fully cover this
+    op's own span pressure, not just partially help it.
+    """
+    if not (
+        isinstance(op, ComputedBuffer)
+        and isinstance(op.data, Pointwise)
+        and isinstance(op.layout, FixedTiledLayout)
+        and not getattr(op, "dim_hints", [])
+    ):
+        return False
+    if not _layout_has_static_span_metadata(op.layout):
+        return False
+    if _has_indirect_reads(op):
+        return False
+
+    ranges = list(op.data.ranges)
+    for host_dim, split_count in split_by_host_dim.items():
+        if host_dim >= len(ranges):
+            return False
+        try:
+            full_size = int(ranges[host_dim])
+        except (TypeError, ValueError):
+            return False
+        if full_size <= 1 or full_size % split_count != 0:
+            return False
+
+    if (
+        _combined_tile_stick_alignment_error(op, op.layout, split_by_host_dim)
+        is not None
+    ):
+        return False
+
+    try:
+        remaining = _remaining_span_candidates_after_tile(
+            op, max_cores, split_by_host_dim
+        )
+    except Unsupported:
+        return False
+    return not remaining
+
+
 def plan_span_overflow_tile(
     op: ComputedBuffer,
     max_cores: int,
@@ -1340,6 +1437,19 @@ def plan_span_overflow_tile(
     The returned plan contains one or more output-range tile levels plus the
     physical span facts that caused them.  ``None`` means this op either is not
     eligible for this pass or has no output/input span that needs coarse tiling.
+
+    ``max_cores`` is threaded through this function and everything it calls,
+    but it has no effect on the emitted split today: every candidate's
+    ``core_split_estimate`` is hardcoded to 1, so span math always assumes
+    work division gives no help and ``max_cores``/``SENCORES`` is never
+    consulted. Intentional for now -- the cost search doesn't yet model work
+    division (see the "Work Division is not yet modeled" limitation).
+    ``max_cores`` stays in the signature so that work can wire in without
+    changing every caller.
+
+    TODO: make a common planner for Work Division and Working Set Reduction
+    together, so this pass can get a proper core_split_estimate instead of
+    the hardcoded 1.
     """
     logger.debug(
         "[span-overflow planner] enter op=%s data=%s max_cores=%s",
