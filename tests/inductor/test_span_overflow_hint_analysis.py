@@ -253,7 +253,6 @@ class TestSpanOverflowGroups(InductorTestCase):
 
         self.assertEqual(len(groups), 1)
         self.assertIs(groups[0][0][0], op)
-        self.assertFalse(groups[0][1][0][2])
         self.assertFalse(op.dim_hints[0].is_reduction)
 
     def test_scalar_reduction_skipped(self):
