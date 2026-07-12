@@ -1582,6 +1582,25 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
 
         self.assertEqual(span, 191)
 
+    def test_coordinate_span_elems_returns_none_for_coefficient_inside_mod_argument(
+        self,
+    ):
+        # The critical-point trick (evaluate at sym = modulus - 1) is only
+        # exact when a Mod's argument is the bare symbol. A coefficient on
+        # the argument shifts where the true wraparound maximum occurs:
+        # Mod(3*h, 64) over h in [0, 100) has its true max (63) at h=21, not
+        # at the naive critical point h=63 (which gives only 61). Silently
+        # evaluating only at h=63 would underestimate the span (62 instead
+        # of the true 64). This function must fail safe (return None) for
+        # this shape instead, rather than accept an unproven bound.
+        h = sympy.Symbol("h")
+        dep = MemoryDep("buf0", h, (h,), (100,))
+        coord = sympy.Mod(3 * h, 64)
+
+        span = soha._coordinate_span_elems(coord, dep, {h: 1})
+
+        self.assertIsNone(span)
+
     def test_reduction_indirect_read_guard(self):
         op = _reduction_op((1, 8195, 256, 64), reduction_ranges=(128,))
 

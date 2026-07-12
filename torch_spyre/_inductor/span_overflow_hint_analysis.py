@@ -237,28 +237,27 @@ def _post_tile_layout_for_splits(
     )
 
 
-def _within_stick_host_dim(layout: FixedTiledLayout) -> int:
+def _within_stick_host_dim(layout: FixedTiledLayout) -> int | None:
     """Return the logical host dim represented by the final stick coordinate.
 
     Splitting this host dim is only legal when each tile still contains a whole
     number of Spyre sticks; otherwise a coarse-tile boundary would cut through a
     physical stick.
 
-    TODO: the fallback below (``len(host_stride) - 1``) is reached whenever no
-    host stride exactly matches ``sm_last``, e.g. for a layout whose physical
-    stick-carrying host dim doesn't correspond to a literal stride match. If
-    that guess is ever wrong, the caller validates stick alignment against the
-    wrong host dim instead of the real one. No concrete failing layout has
-    been constructed for this yet, so this is left as a documented risk rather
-    than a speculative ``Unsupported`` raise; flag if a real counter-example
-    turns up.
+    Returns ``None`` when no host stride exactly matches the device layout's
+    final stride-map entry, e.g. for a layout whose physical stick-carrying
+    host dim doesn't correspond to a literal stride match.  Guessing a
+    fallback dim here (as an earlier revision did, via ``len(host_stride) -
+    1``) risks silently validating stick alignment against the wrong host
+    dim if the guess is wrong.  Returning ``None`` instead lets the caller
+    fail safe -- matching the same "skip/reject rather than guess" discipline
+    used elsewhere in this pass (ambiguous BMM symbol maps return empty;
+    ``_resize_device_layout`` raises rather than guess an ambiguous stick
+    dim by elimination).
     """
     sm_last = int(list(layout.device_layout.stride_map)[-1])
     host_stride = [int(s) for s in layout.stride]
-    return next(
-        (i for i, s in enumerate(host_stride) if s == sm_last),
-        len(host_stride) - 1,
-    )
+    return next((i for i, s in enumerate(host_stride) if s == sm_last), None)
 
 
 def _post_tile_stick_alignment_error(
@@ -275,6 +274,15 @@ def _post_tile_stick_alignment_error(
         return None
 
     within_stick_dim = _within_stick_host_dim(original_layout)
+    if within_stick_dim is None:
+        # Cannot confidently identify the stick dim for this layout -- treat
+        # the split as unsafe rather than risk silently validating against
+        # the wrong dim (or not validating at all).
+        return (
+            f"cannot determine the stick-carrying host dim for {original_layout!r} "
+            f"to validate split_count {split_count} against host dim "
+            f"{selected_host_dim}"
+        )
     if selected_host_dim != within_stick_dim:
         return None
 
@@ -450,7 +458,22 @@ def _coordinate_span_elems(
         range_size //= split_count
         term = coord.subs({other: 0 for other in coord.free_symbols - {sym}})
         if term.has(sympy.Mod):
-            moduli = {int(mod.args[1]) for mod in term.atoms(sympy.Mod)}
+            mod_atoms = term.atoms(sympy.Mod)
+            if any(mod.args[0] != sym for mod in mod_atoms):
+                # The critical-point trick below is only exact when each
+                # Mod's argument is the bare symbol: its wraparound then
+                # occurs exactly at sym = modulus - 1. A coefficient on the
+                # argument (e.g. Mod(3*sym, 64)) wraps at other sym values
+                # too -- the true max can occur anywhere sym*coefficient
+                # crosses a multiple of the modulus, not just at sym =
+                # modulus - 1. Evaluating only at that one point can
+                # silently underestimate the span (confirmed: Mod(3*h, 64)
+                # over h in [0, 100) evaluates to a max of 61 at the naive
+                # critical point h=63, but the true max is 63, at h=21).
+                # Fail safe rather than risk accepting a plan that still
+                # overflows on real hardware.
+                return None
+            moduli = {int(mod.args[1]) for mod in mod_atoms}
             candidate_points = {min(range_size, modulus) - 1 for modulus in moduli}
             candidate_points.add(0)
             candidate_points.add(range_size - 1)
