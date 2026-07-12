@@ -1526,6 +1526,23 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
 
         self.assertEqual(span, 4095)
 
+    def test_coordinate_span_elems_multi_mod_same_symbol_uses_each_modulus_critical_point(
+        self,
+    ):
+        # Two Mod() atoms on the same symbol with different moduli: the true
+        # maximum occurs at the *larger* modulus's own wraparound point
+        # (h=127: Mod(127,64)=63, Mod(127,128)=127, sum=190), not at the
+        # smaller modulus's critical point (h=63: 63+63=126). Evaluating only
+        # at a single critical point derived from the smallest modulus would
+        # underestimate the span (127 instead of the true 191).
+        h = sympy.Symbol("h")
+        dep = MemoryDep("buf0", h, (h,), (200,))
+        coord = sympy.Mod(h, 64) + sympy.Mod(h, 128)
+
+        span = soha._coordinate_span_elems(coord, dep, {h: 1})
+
+        self.assertEqual(span, 191)
+
     def test_reduction_indirect_read_guard(self):
         op = _reduction_op((1, 8195, 256, 64), reduction_ranges=(128,))
 

@@ -404,6 +404,19 @@ def _coordinate_span_elems(
     their modulus because their maximum can occur just before wraparound rather
     than at either endpoint.
 
+    A per-symbol term can contain more than one ``Mod`` atom on that same
+    symbol with different moduli (e.g. two overlapping/interleaved stick
+    strides both keyed on the same loop variable).  Each individual Mod atom
+    is piecewise-linear in the symbol and only changes slope at its own
+    wraparound point, so the extrema of their sum over the symbol's domain
+    can only occur at one of those per-atom wraparound points or at the
+    domain endpoints -- never strictly between them.  Evaluating the whole
+    term at every such candidate point and taking the max/min therefore finds
+    the true extrema, rather than assuming (as evaluating at a single
+    critical point derived only from the smallest modulus would) that the
+    smallest-modulus term's own wraparound point also maximizes every other
+    Mod term summed alongside it.
+
     This evaluates each tile as if its symbol always starts at 0, not at that
     tile's offset into the full tensor.  That is safe here: current automatic
     coarse tiling fully unrolls each tile into its own separately generated
@@ -428,10 +441,13 @@ def _coordinate_span_elems(
         range_size //= split_count
         term = coord.subs({other: 0 for other in coord.free_symbols - {sym}})
         if term.has(sympy.Mod):
-            modulus = min(int(mod.args[1]) for mod in term.atoms(sympy.Mod))
-            critical_point = min(range_size, modulus) - 1
-            per_core_max += int(term.subs(sym, critical_point))
-            per_core_min += int(term.subs(sym, 0))
+            moduli = {int(mod.args[1]) for mod in term.atoms(sympy.Mod)}
+            candidate_points = {min(range_size, modulus) - 1 for modulus in moduli}
+            candidate_points.add(0)
+            candidate_points.add(range_size - 1)
+            values = [int(term.subs(sym, point)) for point in candidate_points]
+            per_core_max += max(values)
+            per_core_min += min(values)
             continue
         per_core_max += int(term.subs(sym, range_size - 1))
         per_core_min += int(term.subs(sym, 0))
