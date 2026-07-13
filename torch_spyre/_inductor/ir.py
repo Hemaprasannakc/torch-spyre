@@ -107,7 +107,12 @@ class FixedTiledLayout(FixedLayout):
     __repr__ = __str__
 
 
-def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: list[int]):
+def _resize_device_layout(
+    orig_stl,
+    old_host_size: list[int],
+    new_host_size: list[int],
+    stick_host_dim: int | None = None,
+):
     """Derive a new SpyreTensorLayout for a resized host buffer.
 
     Used in two directions:
@@ -154,6 +159,14 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
     that case Passes 3 and 4 are skipped (tile-count and inner-stick entries are
     frozen at their collapsed values).
 
+    ``stick_host_dim`` (optional): the authoritative stick host-dim index,
+    supplied by callers that know it from named-dim identity.  When given, it is
+    used directly as ``p*`` and is excluded from the non-stick candidate pool,
+    which resolves same-size-dim collisions (transposed layouts where two host
+    dims share a size, e.g. flash-attention QK^T with ``Sq == Skv`` — issue
+    #3116) without relying on the ambiguous size-elimination + contiguous-stride
+    tiebreak.  When ``None`` (all current callers), behaviour is unchanged.
+
     Multi-pass algorithm:
 
     * **Pass 1**: match non-inner-stick device dims to host dims by size.
@@ -185,6 +198,20 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
     ndev = len(orig_sm)
     ndim = len(old_host_size)
 
+    # Trust a caller-provided stick_host_dim only when it is consistent with the
+    # device tile-count structure: the stick host dim must have a corresponding
+    # tile-count device dim of size ceil(size/eps).  Identity recovery can be
+    # imperfect for permuted layouts (an ambiguous inner-stick coordinate match),
+    # and a wrong label would otherwise *override* correct size-based inference
+    # and break reconstruction.  When it does not validate, drop it and fall back.
+    if stick_host_dim is not None:
+        if not (0 <= stick_host_dim < ndim):
+            stick_host_dim = None
+        else:
+            expected_tc = -(-int(old_host_size[stick_host_dim]) // eps)  # ceil
+            if expected_tc not in orig_ds[:-1]:
+                stick_host_dim = None
+
     old_hs = [int(s) for s in FlexibleLayout.contiguous_strides(old_host_size)]
     new_hs = [int(s) for s in FlexibleLayout.contiguous_strides(new_host_size)]
 
@@ -199,11 +226,20 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
         dsz = orig_ds[j]
         if dsz == 1:
             size1_cands = [p for p in range(ndim) if old_host_size[p] == 1]
+            # The authoritative stick host dim is never a non-stick match.
+            if stick_host_dim is not None:
+                size1_cands = [p for p in size1_cands if p != stick_host_dim]
             if len(size1_cands) == 1:
                 matched_host[j] = size1_cands[0]
             # else: sparse placeholder with no host counterpart — skip silently.
         else:
             size_cands = [p for p in range(ndim) if old_host_size[p] == dsz]
+            # When the stick host dim is known (named-dim identity), remove it
+            # from the non-stick candidate pool. This resolves same-size
+            # collisions (e.g. flash-attn QK^T with Sq == Skv, issue #3116)
+            # without falling back to the contiguous-stride tiebreak.
+            if stick_host_dim is not None:
+                size_cands = [p for p in size_cands if p != stick_host_dim]
             if len(size_cands) == 1:
                 # provisional; may be reclassified as tile-count in Pass 1b
                 matched_host[j] = size_cands[0]
@@ -244,7 +280,18 @@ def _resize_device_layout(orig_stl, old_host_size: list[int], new_host_size: lis
     matched_p = set(matched_host.values())
     unmatched_all = [p for p in range(ndim) if p not in matched_p]
     pstar: int | None
-    if not unmatched_all:
+    if stick_host_dim is not None:
+        # Authoritative stick host dim from named-dim identity — no inference by
+        # elimination. It must not also have been matched as a non-stick dim.
+        if stick_host_dim not in unmatched_all:
+            raise RuntimeError(
+                f"_resize_device_layout: caller-provided stick_host_dim="
+                f"{stick_host_dim} was matched as a non-stick device dim "
+                f"(matched_host={matched_host}) in {orig_stl!r} "
+                f"(old_host_size={old_host_size}). Inconsistent dim identity."
+            )
+        pstar = stick_host_dim
+    elif not unmatched_all:
         # Reduction output: stick dim eliminated, pstar=None.
         # unmatched_j must be empty — no device dims should be unclaimed.
         if unmatched_j:
