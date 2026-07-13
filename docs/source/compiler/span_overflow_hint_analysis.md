@@ -883,8 +883,7 @@ tests/inductor/test_span_overflow_hint_analysis.py
 Run:
 
 ```bash
-PYTHONPATH=torch-spyre /home/hemaprasanna/dt-inductor/.venv/bin/python \
-  -m pytest -q torch-spyre/tests/inductor/test_span_overflow_hint_analysis.py
+python3 -m pytest -q torch-spyre/tests/inductor/test_span_overflow_hint_analysis.py
 ```
 
 Current coverage includes:
