@@ -79,6 +79,37 @@ _dispatchkey_kernels_registered = False
 _T = TypeVar("_T")
 _P = ParamSpec("_P")
 
+_ALWAYS_SUPPORTED_VIEW_OPS = (
+    "aten::view", "aten::expand", "aten::permute", "aten::unsqueeze",
+    "aten::squeeze", "aten::reshape", "aten::transpose", "aten::t",
+    "aten::select", "aten::slice", "aten::flatten", "aten::unflatten",
+    "aten::contiguous", "aten::clone", "aten::detach",
+)
+
+
+def is_spyre_supported(node: torch.fx.Node) -> bool:
+    print ("decomposition.py -> is_spyre_unsupported()")
+    from torch_spyre.ops.fallbacks import fallback_ops
+    if node.op != "call_function":
+        return True  # getitem, placeholder, output etc. - leave alone
+    op = node.target
+    if not hasattr(op, "name"):
+        return True  # not an OpOverload (e.g. a builtin) - leave alone
+    op_name = op.name()
+    # Pure view/metadata ops don't get a dedicated per-backend kernel at all -
+    # they're handled generically via stride/shape manipulation on any
+    # backend, so the dispatch-key check below is a false negative for them.
+    # Diverting them to ONNX/zdlc would be pure overhead for a free op, and
+    # (found empirically) corrupts Inductor's own buffer naming for the main
+    # graph when it happens.
+    if op_name.startswith(_ALWAYS_SUPPORTED_VIEW_OPS):
+        return True
+    # True if a *real* spyre kernel exists, False if it's only the
+    # fallback stub from fallbacks.py (or nothing at all)
+    return (
+        torch._C._dispatch_has_kernel_for_dispatch_key(op_name, "PrivateUse1")
+        and op not in fallback_ops  # the list you already build in fallbacks.py
+    )
 
 def register_spyre_decomposition(
     ops: Union[torch._ops.OperatorBase, list],

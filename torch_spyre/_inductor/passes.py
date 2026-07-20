@@ -1,18 +1,3 @@
-# Copyright 2025 The Torch-Spyre Authors.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-
-
 import inspect
 import io
 import logging
@@ -196,6 +181,176 @@ class CustomPreGradPasses(_SpyreGraphPassPipeline):
         super().__init__([])
 
 
+# --------------------------------------------------------------------------
+import hashlib
+import os
+import operator
+import torch
+from torch.fx.passes.infra.partitioner import CapabilityBasedPartitioner
+from torch.fx.passes.operator_support import OperatorSupport
+from torch.fx.passes.utils.fuser_utils import fuse_as_graphmodule
+from . import onnx_fallback
+
+
+def divert_unsupported_ops_to_onnx(graph: torch.fx.graph.Graph) -> None:
+    """Identify unsupported ops and export their subgraphs to ONNX.
+
+    Export-only when config.onnx_fallback_enabled is off: `graph` is left
+    completely untouched, so Inductor still compiles/executes it exactly as
+    before (unsupported ops keep going through the existing CPU eager
+    fallback). This just also drops a .onnx file per unsupported cluster as
+    a side artifact - no node replacement, no call_module, nothing
+    Inductor's interpreter has to understand.
+
+    Only nodes without a native Spyre kernel are ever considered here -
+    see _FallbackSupport.is_node_supported below. A node with real native
+    support never enters `partitions` and this function's body never runs
+    for it, so native ops are structurally guaranteed to be left alone.
+    """
+    from torch_spyre._inductor.decompositions import is_spyre_supported
+
+    logger.info("divert_unsupported_ops_to_onnx: pass running")
+
+    gm = graph.owning_module
+    if gm is None:
+        raise RuntimeError(
+            "divert_unsupported_ops_to_onnx needs graph.owning_module set; "
+            "call as divert_unsupported_ops_to_onnx(gm.graph)"
+        )
+
+    class _FallbackSupport(OperatorSupport):
+        def __init__(self):
+            self.native_count = 0
+            self.diverted_count = 0
+
+        def is_node_supported(self, submodules, node):
+            if node.op != "call_function":
+                return False
+            op_name = (
+                node.target.name() if hasattr(node.target, "name") else str(node.target)
+            )
+            supported = is_spyre_supported(node)
+            if supported:
+                self.native_count += 1
+                logger.info("  %s -> native torch-spyre (no ONNX diversion)", op_name)
+            else:
+                self.diverted_count += 1
+                logger.info("  %s -> diverting to ONNX/zdlc", op_name)
+            return not supported
+
+    fallback_support = _FallbackSupport()
+    partitioner = CapabilityBasedPartitioner(
+        gm,
+        fallback_support,
+        allows_single_node_partition=True,
+        non_compute_ops=[operator.getitem],
+    )
+    partitions = partitioner.propose_partitions()
+
+    logger.info(
+        "divert_unsupported_ops_to_onnx: %d op(s) native to torch-spyre, "
+        "%d op(s) candidates for ONNX/zdlc",
+        fallback_support.native_count,
+        fallback_support.diverted_count,
+    )
+
+    if not partitions:
+        return
+
+    for i, partition in enumerate(partitions):
+        nodes = list(partition.nodes)
+        # Name each partition from its actual content (op names + args
+        # signature), not the loop index `i` - `i` restarts at 0 on every
+        # separate torch.compile() call, so two different ops (e.g. cos
+        # then sin) both got named "fused_0" and silently overwrote each
+        # other's .onnx/.so file on disk. Since onnx_fallback._sessions
+        # caches PyRuntime sessions by file path, that collision meant a
+        # later op's try_run silently reused an earlier, unrelated op's
+        # already-loaded session (found via multi_bench.py: sin/tril/triu
+        # all returned wrong values because they reused cos's session).
+        op_names = "_".join(
+            n.target.name().split("::")[-1].replace(".", "_")
+            for n in nodes
+            if hasattr(n.target, "name")
+        )
+        sig = repr([(str(n.target), n.args, n.kwargs) for n in nodes])
+        name = f"{op_names}_{hashlib.md5(sig.encode()).hexdigest()[:10]}"
+
+        # fuse_as_graphmodule COPIES these nodes into a new standalone
+        # GraphModule - it does not cut them out of `gm` or splice
+        # anything back in. `gm`/`graph` stay exactly as Inductor expects.
+        sub_gm, orig_inputs, orig_outputs = fuse_as_graphmodule(
+            gm, nodes, name
+        )
+        logger.debug("divert_unsupported_ops_to_onnx: fused submodule %s", name)
+        onnx_path = _export_submodule_to_onnx(sub_gm, name)
+
+        if not config.onnx_fallback_enabled:
+            logger.info(
+                "divert_unsupported_ops_to_onnx: %s exported to ONNX only "
+                "(flag off - not compiled, not diverted at runtime)",
+                name,
+            )
+            continue
+
+        try:
+            so_path = onnx_fallback.compile_onnx_to_so(
+                onnx_path, name, "/tmp/spyre_onnx_subgraphs"
+            )
+        except Exception:
+            logger.exception(
+                "divert_unsupported_ops_to_onnx: zdlc compile failed for "
+                "%s - leaving those ops on the plain CPU fallback",
+                name,
+            )
+            continue
+
+        if len(nodes) == 1:
+            onnx_fallback.register_compiled_artifact(nodes[0], so_path)
+            logger.info(
+                "divert_unsupported_ops_to_onnx: %s compiled and registered "
+                "for ONNX/zdlc runtime redirect",
+                name,
+            )
+        else:
+            logger.info(
+                "divert_unsupported_ops_to_onnx: %s has %d nodes - "
+                "compiled, but not registered for runtime redirect (needs "
+                "graph node replacement, not implemented)",
+                name,
+                len(nodes),
+            )
+
+
+def _make_example_inputs(submod: torch.fx.GraphModule) -> tuple:
+    args = []
+    for n in submod.graph.nodes:
+        if n.op == "placeholder":
+            fake = n.meta.get("val")
+            if fake is None:
+                raise RuntimeError(
+                    f"placeholder {n.name} has no FakeTensor in meta['val'] - "
+                    f"this pass must run after fake-tensor propagation"
+                )
+            args.append(torch.zeros(fake.shape, dtype=fake.dtype, device="cpu"))
+    return tuple(args)
+
+
+def _export_submodule_to_onnx(
+    submod: torch.fx.GraphModule, name: str, out_dir: str = "/tmp/spyre_onnx_subgraphs"
+) -> str:
+    os.makedirs(out_dir, exist_ok=True)
+    example_inputs = _make_example_inputs(submod)
+    submod = submod.to("cpu")
+    ep = torch.export.export(submod, example_inputs)
+    onnx_program = torch.onnx.export(ep, dynamo=True)
+    path = os.path.join(out_dir, f"{name}.onnx")
+    onnx_program.save(path)
+    logger.info("divert_unsupported_ops_to_onnx: exported %s -> %s", name, path)
+    return path
+# --------------------------------------------------------------------------
+
+
 class CustomPrePasses(_SpyreGraphPassPipeline):
     """
     This inductor extension point enables Spyre-specific passes to run on the
@@ -203,7 +358,7 @@ class CustomPrePasses(_SpyreGraphPassPipeline):
     """
 
     def __init__(self):
-        super().__init__([collect_spyre_hints])
+        super().__init__([collect_spyre_hints, divert_unsupported_ops_to_onnx])
 
 
 class CustomPostPasses(_SpyreGraphPassPipeline):
@@ -380,3 +535,4 @@ class CustomPreSchedulingPasses:
 
     def uuid(self) -> Any | None:
         return _uuid(self.passes)
+

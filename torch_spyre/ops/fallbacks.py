@@ -175,7 +175,7 @@ def register_fallback(ops, device="cpu"):
                 moved = torch.empty_like(out, device=fallback_device)
             kwargs["out"] = moved
 
-    def _fallback(fn, *args, **kwargs):
+    def _fallback(op, fn, *args, **kwargs):
         # Make args mutable
         args = list(args)
 
@@ -190,8 +190,19 @@ def register_fallback(ops, device="cpu"):
         # Move input tensors to the fallback device
         _move_tensors(args, kwargs)
 
-        # Compute on the fallback device
-        fallback_result = fn(*args, **kwargs)
+        # If a compiled onnx-mlir/zdlc artifact is registered for this exact
+        # op + shape/dtype signature (see _inductor/passes.py and
+        # _inductor/onnx_fallback.py), use it instead of the plain CPU op.
+        # Local import: avoids a circular import at module load time, since
+        # _inductor imports fallback_ops from this module.
+        from torch_spyre._inductor import onnx_fallback
+
+        compiled_result = onnx_fallback.try_run(op, args, kwargs)
+        if compiled_result is not None:
+            fallback_result = compiled_result
+        else:
+            # Compute on the fallback device
+            fallback_result = fn(*args, **kwargs)
 
         # If 'out=' was specified, copy result into it
         if out is not None:
@@ -215,9 +226,9 @@ def register_fallback(ops, device="cpu"):
         for op in ops:
 
             @functools.wraps(fn)
-            def _wrapped(*args, **kwargs):
-                warn_fallback(op, fallback_device)
-                return _fallback(fn, *args, **kwargs)
+            def _wrapped(*args, _op=op, **kwargs):
+                warn_fallback(_op, fallback_device)
+                return _fallback(_op, fn, *args, **kwargs)
 
             fallback_ops.append(op)
 

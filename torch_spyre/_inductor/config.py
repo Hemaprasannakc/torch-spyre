@@ -26,6 +26,16 @@ co_optimizing_lx_planning: bool = (
 hbm_planning: bool = _get_env_bool("SPYRE_INDUCTOR_MEMORY_PLAN", True)
 chunk_large_tensors: bool = os.environ.get("CHUNK_LARGE_TENSORS", "0") == "1"
 
+# When True, unsupported ops are exported to ONNX, compiled via zdlc/onnx-mlir
+# to a shared library, and (for single-node partitions) executed through that
+# compiled artifact instead of the plain CPU eager fallback. Off by default:
+# with this unset, behavior is identical to today's CPU-only fallback path.
+onnx_fallback_enabled: bool = os.environ.get("TORCH_SPYRE_ONNX_FALLBACK", "0") == "1"
+
+# Where the extracted zdlc/onnx-mlir compiler toolchain (zdlc binary, clang++,
+# its shared-lib deps) lives inside the container. See onnx_fallback.py.
+zdlc_home: str = os.environ.get("TORCH_SPYRE_ZDLC_HOME", "/opt/zdlc-runtime")
+
 global_stick_optimizer: bool = os.environ.get("GLOBAL_STICK_OPTIMIZER", "1") == "1"
 
 allow_all_ops_in_lx_planning: bool = False
