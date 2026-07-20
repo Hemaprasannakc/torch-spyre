@@ -109,9 +109,24 @@ def _key_part(a):
 
 
 def _cache_key(op, args, kwargs=()) -> tuple:
+    """Build the lookup key for `_so_by_key`.
+
+    `device` is deliberately excluded from `kwargs`: it's not part of what
+    the compiled .so actually computes (the .so always runs on CPU-side
+    NumPy arrays; where the *result* ultimately gets moved to is handled
+    entirely outside try_run, in fallbacks.py's _move_to_spyre). Including
+    it would also be actively wrong - fallbacks.py's _ensure_device
+    rewrites kwargs["device"] to the CPU fallback device before try_run
+    ever sees it, while the key used at registration time (built from the
+    untouched FX node) still has the original Spyre device. Keying on it
+    would make every op that takes a `device=` kwarg (e.g. arange) always
+    miss, since the two call sites would never agree on its value.
+    """
     kwargs = kwargs.items() if hasattr(kwargs, "items") else kwargs
     arg_parts = tuple(_key_part(a) for a in args)
-    kwarg_parts = tuple(sorted((k, _key_part(v)) for k, v in kwargs))
+    kwarg_parts = tuple(
+        sorted((k, _key_part(v)) for k, v in kwargs if k != "device")
+    )
     return (op.name(), arg_parts, kwarg_parts)
 
 
@@ -155,10 +170,20 @@ def try_run(op, args, kwargs):
 
         session = _get_session(so_path)
         print(f"onnx_fallback: EXECUTING via compiled artifact: {so_path}")
+        # Tensor inputs can arrive positionally or by keyword; the compiled
+        # .so expects one input per traced placeholder regardless of which
+        # form the original call used, so both are gathered here. Keyword
+        # tensors are ordered by name (matching _cache_key's kwarg_parts
+        # ordering) since that's the only ordering available on this side -
+        # unexercised by any op tested so far (all pass tensors
+        # positionally), so this ordering assumption is unverified against
+        # real placeholder order and worth confirming before relying on it.
+        tensor_args = [a for a in args if isinstance(a, torch.Tensor)]
+        tensor_kwargs = [
+            v for k, v in sorted(kwargs.items()) if isinstance(v, torch.Tensor)
+        ]
         np_inputs = [
-            a.detach().cpu().contiguous().numpy()
-            for a in args
-            if isinstance(a, torch.Tensor)
+            t.detach().cpu().contiguous().numpy() for t in tensor_args + tensor_kwargs
         ]
         np_outputs = session.run(np_inputs)
         result = tuple(torch.from_numpy(o) for o in np_outputs)
