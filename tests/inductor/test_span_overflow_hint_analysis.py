@@ -2414,6 +2414,7 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
         compute the right numbers), independent of whether this particular
         toy shape happens to make both ops agree organically.
         """
+        torch.manual_seed(0xAFFE)
         shape = (1, 20, 16, 64)
         x = torch.randn(shape, dtype=torch.float16)
         y = torch.randn(shape, dtype=torch.float16)
@@ -2508,6 +2509,7 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
         of tiling. The assertion is that tiled isn't *meaningfully worse* than
         untiled, not an arbitrary fixed threshold.
         """
+        torch.manual_seed(0xAFFE)
         vocab, hidden = 49152, 4096
         x = torch.randn(1, hidden, dtype=torch.float16)
         weight = torch.randn(vocab, hidden, dtype=torch.float16)
