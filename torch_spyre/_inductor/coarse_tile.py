@@ -856,18 +856,10 @@ def span_overflow_groups(graph: GraphLowering) -> list[tuple]:
         # Scope: the join is reduction-type-agnostic — correct-by-construction
         # for any reduction tiled on a shared output range, since tile t is
         # self-contained (sum/mean/max pair slice-for-slice, same as matmul).
-        # Originally this branch was gated to batch-matmul reductions only,
-        # because only the matmul path (the #1918 LM-head case) had been
-        # validated end-to-end on hardware. The gate has since been dropped;
-        # unit coverage for the join mechanics is in
-        # test_non_matmul_reduction_joins_tiled_producer_group, and on-device
-        # numeric validation for a non-matmul reduction (sum reading a
-        # span-overflowing pointwise producer) is in
+        # Unit coverage: test_non_matmul_reduction_joins_tiled_producer_group.
+        # On-device numeric validation:
         # TestSpanOverflowNumericValidation.
-        # test_pointwise_to_non_matmul_reduction_join_numeric — tiled vs.
-        # untiled mismatch rate against a CPU reference came back
-        # statistically indistinguishable (ordinary fp16 accumulation noise,
-        # not join-introduced error).
+        # test_pointwise_to_non_matmul_reduction_join_numeric.
         #
         # Split-count equality alone is insufficient: two unrelated dims could
         # split into the same count.  _reduction_shares_group_tiled_dim verifies

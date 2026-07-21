@@ -219,16 +219,8 @@ split count are not fused.  A Reduction can only join on an **output**-range
 tile, never the reduction (`k`) range, and each auto-tiled producer feeds at
 most one reduction consumer.
 
-The join is reduction-type-agnostic: any Reduction (`sum`/`mean`/`max`/BMM)
-tiled on a shared output dim may join, not only batch-matmul. The join was
-originally restricted to batch-matmul reductions because that was the only
-path validated end-to-end on hardware (the #1918 LM-head case); that
-restriction has since been dropped, with on-device numeric validation for a
-non-matmul reduction (`sum` reading a tiled pointwise producer) confirming
-the tiled and untiled mismatch rates against a CPU reference are
-statistically indistinguishable — ordinary fp16 accumulation noise, not
-error introduced by the join (see `TestSpanOverflowNumericValidation` in
-`tests/inductor/test_span_overflow_hint_analysis.py`).
+The join is reduction-type-agnostic: any Reduction (`sum`, `mean`, `max`,
+matmul/BMM, ...) tiled on a shared output dim may join.
 
 Code flow:
 
@@ -746,15 +738,7 @@ synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
    split count(s) — verified by `_reduction_shares_group_tiled_dim`, which
    confirms the consumer's tiled loop variable actually indexes the
    producer's tiled dim through the read (matching split counts alone do not
-   qualify). Only output-range tiles may join (never a reduction range). The
-   join is reduction-type-agnostic; it was originally gated to matmul only
-   because that was the only hardware-validated path, but that gate has since
-   been dropped, with on-device numeric validation for a non-matmul reduction
-   (`sum` reading a tiled pointwise producer) confirming the tiled and untiled
-   mismatch rates against a CPU reference are statistically indistinguishable
-   — ordinary fp16 accumulation noise, not error introduced by the join (see
-   `TestSpanOverflowNumericValidation` in
-   `tests/inductor/test_span_overflow_hint_analysis.py`). On
+   qualify). Only output-range tiles may join (never a reduction range). On
    joining, the group is flushed immediately, so a reduction is always the
    last member of its group and each auto-tiled producer feeds at most one
    reduction consumer. A Reduction that cannot join gets an independent
