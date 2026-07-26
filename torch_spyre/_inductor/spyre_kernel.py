@@ -1167,6 +1167,76 @@ def _repair_unit_tiled_symbols(op_spec, old_it_space, new_op_space_splits, new_t
         if sym not in old_syms and str(sym).startswith("z")
     }
 
+    def synthetic_occurrences(sym: sympy.Symbol):
+        occurrences = []
+        for tensor_idx, tensor in enumerate(new_tensors):
+            is_output = tensor_idx == len(new_tensors) - 1
+            for dim_idx, (dim_size, coord) in enumerate(
+                zip(tensor["size"], tensor["coordinates"])
+            ):
+                if sym in sympy.sympify(coord).free_symbols:
+                    occurrences.append((is_output, sympy.sympify(dim_size), dim_idx))
+        return occurrences
+
+    def existing_synthetic_at_host_dim(
+        host_dims: list[int], used: set[sympy.Symbol]
+    ) -> sympy.Symbol | None:
+        output_tensor = new_tensors[-1]
+        output_coords = output_tensor["coordinates"]
+        for host_dim in host_dims:
+            if host_dim >= len(output_coords):
+                continue
+            coord = sympy.sympify(output_coords[host_dim])
+            candidates = sorted(coord.free_symbols & synthetic_syms - used, key=str)
+            if candidates:
+                return candidates[0]
+        return None
+
+    def best_existing_synthetic(
+        host_dims: list[int], used: set[sympy.Symbol]
+    ) -> sympy.Symbol | None:
+        direct = existing_synthetic_at_host_dim(host_dims, used)
+        if direct is not None:
+            return direct
+
+        scored = []
+        for sym in synthetic_syms - used:
+            occurrences = synthetic_occurrences(sym)
+            if not any(is_output for is_output, _, _ in occurrences):
+                continue
+
+            non_unit_occurrences = [
+                occ for occ in occurrences if sympy.simplify(occ[1] - 1) != 0
+            ]
+            if not non_unit_occurrences:
+                continue
+
+            # The reordered-layout case cannot use host_dim as a coordinate index.
+            # Pick a live z* already participating in aligned tensor addresses;
+            # data dims tend to occur in non-broadcast inputs as well as output,
+            # unlike layout filler/tile-count symbols.
+            input_non_unit_count = sum(
+                1 for is_output, _, _ in non_unit_occurrences if not is_output
+            )
+            output_non_unit_count = sum(
+                1 for is_output, _, _ in non_unit_occurrences if is_output
+            )
+            tie_break = -int(str(sym)[1:]) if str(sym)[1:].isdigit() else 0
+            scored.append(
+                (
+                    input_non_unit_count,
+                    output_non_unit_count,
+                    len(non_unit_occurrences),
+                    tie_break,
+                    str(sym),
+                    sym,
+                )
+            )
+
+        if not scored:
+            return None
+        return max(scored, key=lambda item: item[:-1])[-1]
+
     def fresh_synthetic_sym() -> sympy.Symbol:
         used = set(new_op_space_splits) | old_syms
         idx = 0
@@ -1178,36 +1248,22 @@ def _repair_unit_tiled_symbols(op_spec, old_it_space, new_op_space_splits, new_t
                 return sym
             idx += 1
 
-    output_tensor = new_tensors[-1]
-    output_coords = output_tensor["coordinates"]
-
     used: set[sympy.Symbol] = set()
     for level_syms, host_dims in zip(op_spec.tiled_symbols, unit_host_dims):
-        if level_syms:
+        if level_syms or not host_dims:
             continue
 
+        sym = best_existing_synthetic(host_dims, used)
+        if sym is not None:
+            level_syms.append(sym)
+            used.add(sym)
+            continue
+
+        # If alignment did not expose any live z* coordinate, create a unit
+        # symbol as a conservative fallback and install it only on constant unit
+        # coordinates.  Normal cases should take the existing-symbol path above.
+        sym = fresh_synthetic_sym()
         for host_dim in host_dims:
-            if host_dim >= len(output_coords):
-                continue
-
-            # Prefer a synthetic coordinate already introduced by align_tensors.
-            # That symbol is the aligned representation of the physical unit dim
-            # that the outer coarse-tile loop advances.
-            coord = sympy.sympify(output_coords[host_dim])
-            candidates = sorted(coord.free_symbols & synthetic_syms, key=str)
-            for sym in candidates:
-                if sym not in used:
-                    level_syms.append(sym)
-                    used.add(sym)
-                    break
-
-            if level_syms:
-                break
-
-            # If the aligned output coordinate is still constant, create a unit
-            # z* symbol and install it on matching unit tensor dims so the tile
-            # level has an affine symbol to bind to.
-            sym = fresh_synthetic_sym()
             for tensor in new_tensors:
                 if host_dim >= len(tensor["coordinates"]):
                     continue
@@ -1217,9 +1273,8 @@ def _repair_unit_tiled_symbols(op_spec, old_it_space, new_op_space_splits, new_t
                 if tensor_coord.free_symbols:
                     continue
                 tensor["coordinates"][host_dim] = sym
-            level_syms.append(sym)
-            used.add(sym)
-            break
+        level_syms.append(sym)
+        used.add(sym)
 
 
 def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
