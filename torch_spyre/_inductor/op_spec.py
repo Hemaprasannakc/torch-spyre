@@ -153,7 +153,7 @@ class OpSpec:
             The bundle path (compile_op_spec / generate_sdsc) reverses this list to
             outermost-first and builds per-level affine.apply stride maps, mapping
             each level's strides to the correct loop variable by explicit index.
-            unit_tiled_host_dims: Per-loop-level host dimension indices, innermost
+        unit_tiled_host_dims: Per-loop-level host dimension indices, innermost
             first, for coarse-tiled output dims whose per-tile range became 1
             and were therefore omitted from the pre-alignment iteration space.
             Empty entries mean no repair is needed for that level.

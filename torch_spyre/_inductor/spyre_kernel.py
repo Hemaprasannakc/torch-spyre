@@ -1191,23 +1191,29 @@ def _repair_unit_tiled_symbols(op_spec, old_it_space, new_op_space_splits, new_t
     if not unit_host_dims or not op_spec.tiled_symbols or not new_tensors:
         return
 
+    def is_synthetic_symbol(sym: sympy.Symbol) -> bool:
+        name = str(sym)
+        return name.startswith("z") and name[1:].isdigit()
+
     old_syms = set(old_it_space.keys())
     synthetic_syms = {
         sym
         for sym in new_op_space_splits
-        if sym not in old_syms and str(sym).startswith("z")
+        if sym not in old_syms and is_synthetic_symbol(sym)
     }
 
-    def synthetic_occurrences(sym: sympy.Symbol):
-        occurrences = []
-        for tensor_idx, tensor in enumerate(new_tensors):
-            is_output = tensor_idx == len(new_tensors) - 1
-            for dim_idx, (dim_size, coord) in enumerate(
-                zip(tensor["size"], tensor["coordinates"])
-            ):
-                if sym in sympy.sympify(coord).free_symbols:
-                    occurrences.append((is_output, sympy.sympify(dim_size), dim_idx))
-        return occurrences
+    synthetic_occurrences: dict[sympy.Symbol, list[tuple[bool, sympy.Expr, int]]] = {
+        sym: [] for sym in synthetic_syms
+    }
+    for tensor_idx, tensor in enumerate(new_tensors):
+        is_output = tensor_idx == len(new_tensors) - 1
+        for dim_idx, (dim_size, coord) in enumerate(
+            zip(tensor["size"], tensor["coordinates"])
+        ):
+            dim_size = sympy.sympify(dim_size)
+            coord_syms = sympy.sympify(coord).free_symbols & synthetic_syms
+            for sym in coord_syms:
+                synthetic_occurrences[sym].append((is_output, dim_size, dim_idx))
 
     def output_coords_are_host_ordered(output_size, output_coords) -> bool:
         if len(output_coords) != len(output_size):
@@ -1241,7 +1247,7 @@ def _repair_unit_tiled_symbols(op_spec, old_it_space, new_op_space_splits, new_t
             if sympy.sympify(output_size[host_dim]) != 1:
                 continue
             coord = sympy.sympify(output_coords[host_dim])
-            candidates = sorted(coord.free_symbols & synthetic_syms - used, key=str)
+            candidates = sorted((coord.free_symbols & synthetic_syms) - used, key=str)
             if candidates:
                 return candidates[0]
         return None
@@ -1255,12 +1261,12 @@ def _repair_unit_tiled_symbols(op_spec, old_it_space, new_op_space_splits, new_t
 
         scored = []
         for sym in synthetic_syms - used:
-            occurrences = synthetic_occurrences(sym)
+            occurrences = synthetic_occurrences[sym]
             if not any(is_output for is_output, _, _ in occurrences):
                 continue
 
             non_unit_occurrences = [
-                occ for occ in occurrences if sympy.simplify(occ[1] - 1) != 0
+                occ for occ in occurrences if occ[1] != sympy.Integer(1)
             ]
             if not non_unit_occurrences:
                 continue

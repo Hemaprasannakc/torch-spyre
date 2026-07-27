@@ -240,6 +240,22 @@ def _resize_device_layout(
     new_ds = list(orig_ds)
     new_sm = list(orig_sm)
 
+    missing_preserved_identity = [
+        p
+        for p in preserve_unit_host_dims
+        if p not in preserve_unit_device_dims
+        and 0 <= p < ndim
+        and old_host_size[p] == 1
+        and new_host_size[p] != old_host_size[p]
+    ]
+    if missing_preserved_identity:
+        raise RuntimeError(
+            "_resize_device_layout: missing preserved device-dim identity for "
+            f"unit host dims {missing_preserved_identity} "
+            f"(preserve_unit_device_dims={preserve_unit_device_dims}) in "
+            f"{orig_stl!r}."
+        )
+
     # Pass 1: see docstring.
     matched_host = {}  # j → p (non-stick matches, provisional for size>1)
     unmatched_j = []  # device dims not matched → tile-count / placeholder
@@ -258,7 +274,8 @@ def _resize_device_layout(
                 and new_host_size[p] != old_host_size[p]
                 and orig_sm[j] != -1
                 and (orig_sm[j] == old_hs[p] or orig_sm[j] == new_hs[p])
-                and preserve_unit_device_dims.get(p, j) == j
+                and p in preserve_unit_device_dims
+                and preserve_unit_device_dims[p] == j
             ]
             if len(preserved_cands) == 1:
                 matched_host[j] = preserved_cands[0]

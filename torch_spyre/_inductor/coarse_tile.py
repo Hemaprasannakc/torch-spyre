@@ -1395,12 +1395,14 @@ def _allocate_full_buffer(
         # None falls back to size-based inference inside _resize_device_layout.
         stick_hd = _stick_host_dim(tiled_op, orig_layout.device_layout)
         try:
+            loop_info = getattr(tiled_op, "loop_info", None)
+            if loop_info is None:
+                raise RuntimeError("missing coarse tile loop_info")
+
             # Grow uses all tiled host dims.  _resize_device_layout filters this
             # to size-1 dims with real strides, matching the shrink-side identity.
-            tiled_host_dims = {
-                d for dims in tiled_op.loop_info.loop_tiled_dims for d in dims
-            }
-            preserved_device_dims = tiled_op.loop_info.preserve_unit_device_dims
+            tiled_host_dims = {d for dims in loop_info.loop_tiled_dims for d in dims}
+            preserved_device_dims = loop_info.preserve_unit_device_dims
             device_layout = _resize_device_layout(
                 orig_layout.device_layout,
                 tile_size_ints,
@@ -2119,15 +2121,15 @@ def _stamp_group(
                 # the pass runner and aborts compilation.
                 _divide_reduction_ranges(op, count, [rpos] if rpos is not None else [])
 
-        preserved_device_dims = retiled_infos.get(op.get_name())
+        op_retiled_info = retiled_infos.get(op.get_name())
         op.loop_info = CoarseTileInfo(  # type: ignore[attr-defined]
             loop_group_id=nested_group_id,
             loop_count=counts,
             loop_tiled_dims=op_tiled_dims,
             loop_tiled_reduction_dims=op_tiled_reduction_dims,
             preserve_unit_device_dims=(
-                preserved_device_dims.preserve_unit_device_dims
-                if preserved_device_dims is not None
+                op_retiled_info.preserve_unit_device_dims
+                if op_retiled_info is not None
                 else {}
             ),
         )
