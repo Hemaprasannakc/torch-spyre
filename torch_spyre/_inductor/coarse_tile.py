@@ -95,10 +95,11 @@ _SPAN_OVERFLOW_HINT_ID = 10000
 
 
 class _RetiledBufferInfo(NamedTuple):
-    """Host strides before and after a buffer is resized for a coarse tile."""
+    """Metadata captured while resizing a buffer for a coarse tile."""
 
     old_stride: tuple[Expr, ...]
     new_stride: tuple[Expr, ...]
+    preserve_unit_device_dims: dict[int, int]
 
 
 def _auto_span_plan_signature(
@@ -1399,9 +1400,7 @@ def _allocate_full_buffer(
             tiled_host_dims = {
                 d for dims in tiled_op.loop_info.loop_tiled_dims for d in dims
             }
-            preserved_device_dims = getattr(
-                orig_layout, "_coarse_tile_preserve_unit_device_dims", {}
-            )
+            preserved_device_dims = tiled_op.loop_info.preserve_unit_device_dims
             device_layout = _resize_device_layout(
                 orig_layout.device_layout,
                 tile_size_ints,
@@ -2099,11 +2098,18 @@ def _stamp_group(
             if retiled_info is not None:
                 name = op.get_name()
                 prior = retiled_infos.get(name)
-                retiled_infos[name] = (
-                    _RetiledBufferInfo(prior.old_stride, retiled_info.new_stride)
-                    if prior is not None
-                    else retiled_info
-                )
+                if prior is not None:
+                    preserve_unit_device_dims = {
+                        **prior.preserve_unit_device_dims,
+                        **retiled_info.preserve_unit_device_dims,
+                    }
+                    retiled_infos[name] = _RetiledBufferInfo(
+                        prior.old_stride,
+                        retiled_info.new_stride,
+                        preserve_unit_device_dims,
+                    )
+                else:
+                    retiled_infos[name] = retiled_info
             if isinstance(op.data, Reduction):
                 # NOTE: _divide_reduction_ranges mutates data.reduction_ranges
                 # before _validate_reduction_tiling runs in the later
@@ -2113,11 +2119,17 @@ def _stamp_group(
                 # the pass runner and aborts compilation.
                 _divide_reduction_ranges(op, count, [rpos] if rpos is not None else [])
 
+        preserved_device_dims = retiled_infos.get(op.get_name())
         op.loop_info = CoarseTileInfo(  # type: ignore[attr-defined]
             loop_group_id=nested_group_id,
             loop_count=counts,
             loop_tiled_dims=op_tiled_dims,
             loop_tiled_reduction_dims=op_tiled_reduction_dims,
+            preserve_unit_device_dims=(
+                preserved_device_dims.preserve_unit_device_dims
+                if preserved_device_dims is not None
+                else {}
+            ),
         )
 
         logger.debug(
@@ -2260,7 +2272,7 @@ def _divide_ranges(
     _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
     _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
     retiled_info = (
-        _RetiledBufferInfo(old_stride, tuple(layout.stride))
+        _RetiledBufferInfo(old_stride, tuple(layout.stride), {})
         if tiled_dims and old_stride != tuple(layout.stride)
         else None
     )
@@ -2298,8 +2310,13 @@ def _divide_ranges(
         preserve_unit_host_dims=preserve_unit_host_dims,
         preserve_unit_device_dims=preserved_device_dims,
     )
-    layout._coarse_tile_preserve_unit_device_dims = preserved_device_dims
-    return retiled_info
+    if retiled_info is None:
+        return None
+    return _RetiledBufferInfo(
+        retiled_info.old_stride,
+        retiled_info.new_stride,
+        preserved_device_dims,
+    )
 
 
 def _preserved_unit_device_dims(
@@ -2328,6 +2345,18 @@ def _preserved_unit_device_dims(
         ]
         if len(candidates) == 1:
             result[p] = candidates[0]
+        else:
+            logger.debug(
+                "coarse_tile: could not capture preserved unit device dim for "
+                "host_dim=%s old_host_size=%s new_host_size=%s device_size=%s "
+                "stride_map=%s candidates=%s",
+                p,
+                old_host_size,
+                new_host_size,
+                orig_ds,
+                orig_sm,
+                candidates,
+            )
     return result
 
 

@@ -1178,13 +1178,36 @@ def _repair_unit_tiled_symbols(op_spec, old_it_space, new_op_space_splits, new_t
                     occurrences.append((is_output, sympy.sympify(dim_size), dim_idx))
         return occurrences
 
+    def output_coords_are_host_ordered(output_size, output_coords) -> bool:
+        if len(output_coords) != len(output_size):
+            return False
+        expected = iter(old_it_space.keys())
+        for dim_size, coord in zip(output_size, output_coords):
+            if sympy.sympify(dim_size) == 1:
+                continue
+            try:
+                expected_sym = next(expected)
+            except StopIteration:
+                return False
+            if expected_sym not in sympy.sympify(coord).free_symbols:
+                return False
+        return next(expected, None) is None
+
     def existing_synthetic_at_host_dim(
         host_dims: list[int], used: set[sympy.Symbol]
     ) -> sympy.Symbol | None:
         output_tensor = new_tensors[-1]
         output_coords = output_tensor["coordinates"]
+        output_size = output_tensor["size"]
+        # Trust host_dim as a coordinate index only when the aligned output still
+        # follows compact host order.  Reordered device layouts use the scored
+        # live-symbol path below instead.
+        if not output_coords_are_host_ordered(output_size, output_coords):
+            return None
         for host_dim in host_dims:
             if host_dim >= len(output_coords):
+                continue
+            if sympy.sympify(output_size[host_dim]) != 1:
                 continue
             coord = sympy.sympify(output_coords[host_dim])
             candidates = sorted(coord.free_symbols & synthetic_syms - used, key=str)
@@ -1237,17 +1260,6 @@ def _repair_unit_tiled_symbols(op_spec, old_it_space, new_op_space_splits, new_t
             return None
         return max(scored, key=lambda item: item[:-1])[-1]
 
-    def fresh_synthetic_sym() -> sympy.Symbol:
-        used = set(new_op_space_splits) | old_syms
-        idx = 0
-        while True:
-            sym = sympy.Symbol(f"z{idx}")
-            if sym not in used:
-                new_op_space_splits[sym] = (sympy.Integer(1), 1)
-                synthetic_syms.add(sym)
-                return sym
-            idx += 1
-
     used: set[sympy.Symbol] = set()
     for level_syms, host_dims in zip(op_spec.tiled_symbols, unit_host_dims):
         if level_syms or not host_dims:
@@ -1259,22 +1271,10 @@ def _repair_unit_tiled_symbols(op_spec, old_it_space, new_op_space_splits, new_t
             used.add(sym)
             continue
 
-        # If alignment did not expose any live z* coordinate, create a unit
-        # symbol as a conservative fallback and install it only on constant unit
-        # coordinates.  Normal cases should take the existing-symbol path above.
-        sym = fresh_synthetic_sym()
-        for host_dim in host_dims:
-            for tensor in new_tensors:
-                if host_dim >= len(tensor["coordinates"]):
-                    continue
-                if sympy.sympify(tensor["size"][host_dim]) != 1:
-                    continue
-                tensor_coord = sympy.sympify(tensor["coordinates"][host_dim])
-                if tensor_coord.free_symbols:
-                    continue
-                tensor["coordinates"][host_dim] = sym
-        level_syms.append(sym)
-        used.add(sym)
+        raise Unsupported(
+            "Could not find a live synthetic coordinate for coarse-tiled "
+            f"unit host dims {host_dims}."
+        )
 
 
 def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):

@@ -472,6 +472,7 @@ class TestRetileLoadIndexFromStrides(unittest.TestCase):
             _RetiledBufferInfo(
                 old_stride=(Integer(8192), Integer(2048), Integer(1)),
                 new_stride=(Integer(2048), Integer(512), Integer(1)),
+                preserve_unit_device_dims={},
             )
         )
 
@@ -486,6 +487,7 @@ class TestRetileLoadIndexFromStrides(unittest.TestCase):
             _RetiledBufferInfo(
                 old_stride=(Integer(256), Integer(128), Integer(1)),
                 new_stride=(Integer(128), Integer(64), Integer(1)),
+                preserve_unit_device_dims={},
             )
         )
 
@@ -499,6 +501,7 @@ class TestRetileLoadIndexFromStrides(unittest.TestCase):
             _RetiledBufferInfo(
                 old_stride=(Integer(128), Integer(128), Integer(1)),
                 new_stride=(Integer(64), Integer(32), Integer(1)),
+                preserve_unit_device_dims={},
             )
         )
 
@@ -4378,14 +4381,14 @@ class TestRepairUnitTiledSymbols(unittest.TestCase):
 
         self.assertEqual(op_spec.tiled_symbols, [[z1]])
 
-    def test_creates_synthetic_symbol_for_constant_unit_tiled_host_dim(self):
+    def test_raises_for_constant_unit_tiled_host_dim_without_live_symbol(self):
+        from torch_spyre._inductor.errors import Unsupported
         from torch_spyre._inductor.op_spec import OpSpec
         from torch_spyre._inductor.spyre_kernel import _repair_unit_tiled_symbols
 
         c0 = Symbol("c0")
         c1 = Symbol("c1")
         z0 = Symbol("z0")
-        z1 = Symbol("z1")
         op_spec = OpSpec(
             op="add",
             is_reduction=False,
@@ -4407,13 +4410,10 @@ class TestRepairUnitTiledSymbols(unittest.TestCase):
             }
         ]
 
-        _repair_unit_tiled_symbols(
-            op_spec, op_spec.iteration_space, new_space, new_tensors
-        )
-
-        self.assertEqual(op_spec.tiled_symbols, [[z1]])
-        self.assertIn(z1, new_space)
-        self.assertEqual(new_tensors[-1]["coordinates"][1], z1)
+        with self.assertRaises(Unsupported):
+            _repair_unit_tiled_symbols(
+                op_spec, op_spec.iteration_space, new_space, new_tensors
+            )
 
     def test_does_not_repair_without_unit_tile_marker(self):
         from torch_spyre._inductor.op_spec import OpSpec

@@ -1329,6 +1329,35 @@ class TestCoarseTileSpyreHints(InductorTestCase):
                 f"tiled_symbols should NOT contain the Lq symbol (c1), got: {match}",
             )
 
+    def test_hint_unit_tiled_dim_pointwise_correct(self):
+        """Pointwise tiling remains correct when the tiled dim becomes size 1.
+
+        Shape [1, 20, 16, 64] tiled with num_tiles_per_dim={"M": 20}
+        gives per-tile ranges [1, 1, 16, 64].  Inductor squeezes that unit M
+        dim out of the compact iteration space, so this covers both the
+        full-buffer grow identity and the repaired z* tiled symbol path.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        N, M, H, W = 1, 20, 16, 64
+        a = torch.randn(N, M, H, W, dtype=torch.float16)
+        b = torch.randn(N, M, H, W, dtype=torch.float16)
+
+        _declare_tensor_dim("N", N)
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("H", H)
+        _declare_tensor_dim("W", W)
+
+        def fn(a, b):
+            _name_tensor_dims(a, ["N", "M", "H", "W"])
+            _name_tensor_dims(b, ["N", "M", "H", "W"])
+            with spyre_hint(num_tiles_per_dim={"M": 20}):
+                return a + b
+
+        compare_with_cpu(
+            fn, a, b, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
+        )
+
     def test_hint_row_tiling_multi_stick_pointwise_correct(self):
         """Row-tiling a multi-stick pointwise chain produces correct output.
 
