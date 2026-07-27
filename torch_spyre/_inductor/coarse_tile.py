@@ -2311,7 +2311,13 @@ def _divide_ranges(
         preserve_unit_device_dims=preserved_device_dims,
     )
     if retiled_info is None:
-        return None
+        if not preserved_device_dims:
+            return None
+        return _RetiledBufferInfo(
+            old_stride,
+            tuple(layout.stride),
+            preserved_device_dims,
+        )
     return _RetiledBufferInfo(
         retiled_info.old_stride,
         retiled_info.new_stride,

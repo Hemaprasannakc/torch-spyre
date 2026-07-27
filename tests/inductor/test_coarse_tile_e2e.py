@@ -1358,6 +1358,33 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             fn, a, b, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
         )
 
+    def test_hint_outermost_unit_tiled_dim_single_stick_correct(self):
+        """Outermost dim tiling preserves device identity even when strides stay same.
+
+        Shape [20, 64] tiled with num_tiles_per_dim={"M": 20} gives per-tile
+        ranges [1, 64].  Because dim 0 is outermost, host contiguous strides do
+        not change; this specifically guards against dropping the preserved
+        host->device dim identity when no stride rewrite is needed.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        M, W = 20, 64
+        a = torch.randn(M, W, dtype=torch.float16)
+        b = torch.randn(M, W, dtype=torch.float16)
+
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("W", W)
+
+        def fn(a, b):
+            _name_tensor_dims(a, ["M", "W"])
+            _name_tensor_dims(b, ["M", "W"])
+            with spyre_hint(num_tiles_per_dim={"M": 20}):
+                return a + b
+
+        compare_with_cpu(
+            fn, a, b, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
+        )
+
     def test_hint_row_tiling_multi_stick_pointwise_correct(self):
         """Row-tiling a multi-stick pointwise chain produces correct output.
 
