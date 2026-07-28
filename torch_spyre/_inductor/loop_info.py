@@ -50,12 +50,17 @@ class CoarseTileInfo:
         contains the ``data.reduction_ranges`` positional indices that are
         tiled at that level.  An empty sub-list means no reduction dim is
         tiled at that level.  Parallel to ``loop_tiled_dims``.
+    preserve_unit_device_dims:
+        Mapping from host dim to non-stick device dim captured before a tiled
+        host dim collapses to size 1.  Full-buffer allocation uses this durable
+        identity to grow the correct device dim back to the original size.
     """
 
     loop_group_id: tuple[int, ...]
     loop_count: list[sympy.Expr]
     loop_tiled_dims: list[list[int]]
     loop_tiled_reduction_dims: list[list[int]] = field(default_factory=list)
+    preserve_unit_device_dims: dict[int, int] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------

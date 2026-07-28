@@ -33,6 +33,9 @@ from torch._inductor.virtualized import V
 import sympy
 from torch.utils._ordered_set import OrderedSet
 import torch._inductor.ir as ir
+from torch_spyre._inductor.logging_utils import get_inductor_logger
+
+logger = get_inductor_logger("ir")
 
 
 @ir_dataclass
@@ -112,6 +115,8 @@ def _resize_device_layout(
     old_host_size: list[int],
     new_host_size: list[int],
     stick_host_dim: int | None = None,
+    preserve_unit_host_dims: set[int] | None = None,
+    preserve_unit_device_dims: dict[int, int] | None = None,
 ):
     """Derive a new SpyreTensorLayout for a resized host buffer.
 
@@ -167,6 +172,21 @@ def _resize_device_layout(
     #3116) without relying on the ambiguous size-elimination + contiguous-stride
     tiebreak.  When ``None`` (all current callers), behaviour is unchanged.
 
+    ``preserve_unit_host_dims`` (optional): host dims that became or may become
+    size 1 because of coarse tiling.  A size-1 device dim may match one of these
+    host dims only when it still carries a real stride (``orig_sm[j] != -1``)
+    and that stride matches the old or new contiguous host stride.  This keeps
+    true singleton placeholders (``stride_map == -1``) from growing, while
+    preserving the non-stick tiled slot needed to reconstruct a full output
+    layout.
+
+    ``preserve_unit_device_dims`` (optional): explicit host-dim -> device-dim
+    identity for preserved tiled dims, captured before shrink while the tiled
+    non-stick device dim is still distinguishable by size/stride.  Grow uses
+    this to reject the stick tile-count slot when it has the same size and
+    stride as the real tiled slot (for example tiling the dim immediately before
+    a one-stick innermost dimension).
+
     Multi-pass algorithm:
 
     * **Pass 1**: match non-inner-stick device dims to host dims by size.
@@ -197,6 +217,8 @@ def _resize_device_layout(
     eps = orig_stl.elems_per_stick()
     ndev = len(orig_sm)
     ndim = len(old_host_size)
+    preserve_unit_host_dims = preserve_unit_host_dims or set()
+    preserve_unit_device_dims = preserve_unit_device_dims or {}
 
     # Trust a caller-provided stick_host_dim only when it is consistent with the
     # device tile-count structure: the stick host dim must have a corresponding
@@ -218,6 +240,30 @@ def _resize_device_layout(
     new_ds = list(orig_ds)
     new_sm = list(orig_sm)
 
+    missing_preserved_identity = [
+        p
+        for p in preserve_unit_host_dims
+        if p not in preserve_unit_device_dims
+        and 0 <= p < ndim
+        and old_host_size[p] == 1
+        and new_host_size[p] != old_host_size[p]
+    ]
+    if missing_preserved_identity:
+        logger.warning(
+            "_resize_device_layout: missing preserved device-dim identity for "
+            "unit host dims %s (preserve_unit_device_dims=%s) in %r; "
+            "falling back may change the physical device layout",
+            missing_preserved_identity,
+            preserve_unit_device_dims,
+            orig_stl,
+        )
+        raise RuntimeError(
+            "_resize_device_layout: missing preserved device-dim identity for "
+            f"unit host dims {missing_preserved_identity} "
+            f"(preserve_unit_device_dims={preserve_unit_device_dims}) in "
+            f"{orig_stl!r}."
+        )
+
     # Pass 1: see docstring.
     matched_host = {}  # j → p (non-stick matches, provisional for size>1)
     unmatched_j = []  # device dims not matched → tile-count / placeholder
@@ -229,8 +275,25 @@ def _resize_device_layout(
             # The authoritative stick host dim is never a non-stick match.
             if stick_host_dim is not None:
                 size1_cands = [p for p in size1_cands if p != stick_host_dim]
-            if len(size1_cands) == 1:
-                matched_host[j] = size1_cands[0]
+            preserved_cands = [
+                p
+                for p in size1_cands
+                if p in preserve_unit_host_dims
+                and new_host_size[p] != old_host_size[p]
+                and orig_sm[j] != -1
+                and (orig_sm[j] == old_hs[p] or orig_sm[j] == new_hs[p])
+                and p in preserve_unit_device_dims
+                and preserve_unit_device_dims[p] == j
+            ]
+            if len(preserved_cands) == 1:
+                matched_host[j] = preserved_cands[0]
+            elif len(size1_cands) == 1:
+                p = size1_cands[0]
+                if (
+                    p not in preserve_unit_host_dims
+                    or new_host_size[p] == old_host_size[p]
+                ):
+                    matched_host[j] = p
             # else: sparse placeholder with no host counterpart — skip silently.
         else:
             size_cands = [p for p in range(ndim) if old_host_size[p] == dsz]
@@ -321,7 +384,13 @@ def _resize_device_layout(
     for j, p in matched_host.items():
         new_ds[j] = new_host_size[p]
         if new_host_size[p] == 1:
-            new_sm[j] = -1
+            if p in preserve_unit_host_dims:
+                if orig_sm[j] == old_hs[p] or orig_sm[j] == -1:
+                    new_sm[j] = new_hs[p]
+                else:
+                    new_sm[j] = orig_sm[j]
+            else:
+                new_sm[j] = -1
         elif orig_sm[j] == old_hs[p] or orig_sm[j] == -1:
             new_sm[j] = new_hs[p]
         # else: non-contiguous stride; physical layout is invariant — leave unchanged.
@@ -414,7 +483,7 @@ class SpyreEmptyFallback(ir.ExternKernel):
 
     def should_allocate(self) -> bool:
         layout = self.get_layout()
-        if isinstance(layout, FixedTiledLayout) and "pool" in layout.allocation:
+        if isinstance(layout, FixedTiledLayout) and "hbm_pool" in layout.allocation:
             return False
         return True
 
@@ -438,6 +507,125 @@ class SpyreEmptyFallback(ir.ExternKernel):
             layout,
             [],
             (),
+            op_overload=op_overload,
+        )
+        self.name = V.graph.register_buffer(self)
+        V.graph.register_operation(self)
+
+
+class BroadcastAsyncFallback(ir.ExternKernel):
+    """IR node for spyre.broadcast_async — emits a runtime call to async broadcast.
+
+    This starts the broadcast operation asynchronously and returns immediately,
+    allowing computation to proceed while communication is in progress.
+    """
+
+    def codegen(self, wrapper: PythonWrapperCodegen) -> None:
+        """Generate code to call torch.ops.spyre.broadcast_async at runtime."""
+        # Get input tensor name
+        input_tensor = self.inputs[0]
+        input_name = input_tensor.codegen_reference()
+
+        # Get constant args (src_rank, group_name)
+        src_rank, group_name = self.constant_args
+
+        # Generate the async call
+        output_name = self.get_name()
+        generated_code = f"{output_name} = torch.ops.spyre.broadcast_async({input_name}, {src_rank}, '{group_name}')"
+
+        logger.debug(
+            "Codegen broadcast_async: %s -> %s (src=%s, group='%s')",
+            input_name,
+            output_name,
+            src_rank,
+            group_name,
+        )
+
+        wrapper.writeline(generated_code)
+
+    def should_allocate(self) -> bool:
+        return True
+
+    def get_mutation_names(self) -> Sequence[str]:
+        return []
+
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
+
+    def __init__(
+        self,
+        op_overload: torch._ops.OpOverload,
+        x: IRNode,
+        src_rank: int,
+        group_name: str,
+    ) -> None:
+        # Async broadcast returns a tensor with the same layout as input
+        x_device = x.get_device()
+        x_dtype = x.get_dtype()
+        x_size = x.get_size()
+        x_stride = x.get_stride()
+        layout = FixedLayout(x_device, x_dtype, x_size, x_stride)
+        super().__init__(
+            None,
+            layout,
+            [x],
+            (src_rank, group_name),
+            python_kernel_name="torch.ops.spyre.broadcast_async",
+            op_overload=op_overload,
+        )
+        self.name = V.graph.register_buffer(self)
+        V.graph.register_operation(self)
+
+
+class WaitWorkFallback(ir.ExternKernel):
+    """IR node for spyre.wait_work — emits a runtime call to synchronize async operation.
+
+    This blocks until the async broadcast operation completes and returns the
+    same in-place-mutated buffer. No allocation is needed (should_allocate() =
+    False) because the result lives in the input tensor's buffer.
+    """
+
+    def codegen(self, wrapper: PythonWrapperCodegen) -> None:
+        # Get input tensor name (the tensor from broadcast_async)
+        input_tensor = self.inputs[0]
+        input_name = input_tensor.codegen_reference()
+
+        print(f"  Input tensor: {input_name}")
+
+        # Generate the wait call
+        output_name = self.get_name()
+        generated_code = f"{output_name} = torch.ops.spyre.wait_work({input_name})"
+
+        logger.debug("Codegen wait_work: %s -> %s", input_name, output_name)
+
+        wrapper.writeline(generated_code)
+
+    def should_allocate(self) -> bool:
+        return False
+
+    def get_mutation_names(self) -> Sequence[str]:
+        return [self.inputs[0].get_name()]
+
+    def get_unbacked_symbol_defs(self) -> OrderedSet[sympy.Symbol]:
+        return OrderedSet()
+
+    def __init__(
+        self,
+        op_overload: torch._ops.OpOverload,
+        x: IRNode,
+    ) -> None:
+        # Wait returns the same tensor (pass-through)
+        x_device = x.get_device()
+        x_dtype = x.get_dtype()
+        x_size = x.get_size()
+        x_stride = x.get_stride()
+        layout = FixedLayout(x_device, x_dtype, x_size, x_stride)
+        super().__init__(
+            None,
+            layout,
+            [x],
+            (),  # No constant args
+            python_kernel_name="torch.ops.spyre.wait_work",
             op_overload=op_overload,
         )
         self.name = V.graph.register_buffer(self)

@@ -95,10 +95,11 @@ _SPAN_OVERFLOW_HINT_ID = 10000
 
 
 class _RetiledBufferInfo(NamedTuple):
-    """Host strides before and after a buffer is resized for a coarse tile."""
+    """Metadata captured while resizing a buffer for a coarse tile."""
 
     old_stride: tuple[Expr, ...]
     new_stride: tuple[Expr, ...]
+    preserve_unit_device_dims: dict[int, int]
 
 
 def _auto_span_plan_signature(
@@ -1394,11 +1395,30 @@ def _allocate_full_buffer(
         # None falls back to size-based inference inside _resize_device_layout.
         stick_hd = _stick_host_dim(tiled_op, orig_layout.device_layout)
         try:
+            loop_info = getattr(tiled_op, "loop_info", None)
+            tiled_host_dims: set[int]
+            preserved_device_dims: dict[int, int]
+            if loop_info is None:
+                tiled_host_dims = set()
+                preserved_device_dims = {}
+            else:
+                # Grow uses all tiled host dims.  _resize_device_layout filters this
+                # to size-1 dims with real strides, matching the shrink-side identity.
+                tiled_host_dims = {
+                    d
+                    for dims in getattr(loop_info, "loop_tiled_dims", [])
+                    for d in dims
+                }
+                preserved_device_dims = getattr(
+                    loop_info, "preserve_unit_device_dims", {}
+                )
             device_layout = _resize_device_layout(
                 orig_layout.device_layout,
                 tile_size_ints,
                 full_size_ints,
                 stick_host_dim=stick_hd,
+                preserve_unit_host_dims=tiled_host_dims,
+                preserve_unit_device_dims=preserved_device_dims,
             )
         except RuntimeError:
             # Non-standard device layout (e.g. post-restickify HBM strides that
@@ -2089,11 +2109,18 @@ def _stamp_group(
             if retiled_info is not None:
                 name = op.get_name()
                 prior = retiled_infos.get(name)
-                retiled_infos[name] = (
-                    _RetiledBufferInfo(prior.old_stride, retiled_info.new_stride)
-                    if prior is not None
-                    else retiled_info
-                )
+                if prior is not None:
+                    preserve_unit_device_dims = {
+                        **prior.preserve_unit_device_dims,
+                        **retiled_info.preserve_unit_device_dims,
+                    }
+                    retiled_infos[name] = _RetiledBufferInfo(
+                        prior.old_stride,
+                        retiled_info.new_stride,
+                        preserve_unit_device_dims,
+                    )
+                else:
+                    retiled_infos[name] = retiled_info
             if isinstance(op.data, Reduction):
                 # NOTE: _divide_reduction_ranges mutates data.reduction_ranges
                 # before _validate_reduction_tiling runs in the later
@@ -2103,11 +2130,17 @@ def _stamp_group(
                 # the pass runner and aborts compilation.
                 _divide_reduction_ranges(op, count, [rpos] if rpos is not None else [])
 
+        op_retiled_info = retiled_infos.get(op.get_name())
         op.loop_info = CoarseTileInfo(  # type: ignore[attr-defined]
             loop_group_id=nested_group_id,
             loop_count=counts,
             loop_tiled_dims=op_tiled_dims,
             loop_tiled_reduction_dims=op_tiled_reduction_dims,
+            preserve_unit_device_dims=(
+                op_retiled_info.preserve_unit_device_dims
+                if op_retiled_info is not None
+                else {}
+            ),
         )
 
         logger.debug(
@@ -2250,7 +2283,7 @@ def _divide_ranges(
     _clear_cache(layout, _LAYOUT_FREE_SYMS_KEY)
     _clear_cache(op, _COMPUTED_BUF_FREE_SYMS_KEY)
     retiled_info = (
-        _RetiledBufferInfo(old_stride, tuple(layout.stride))
+        _RetiledBufferInfo(old_stride, tuple(layout.stride), {})
         if tiled_dims and old_stride != tuple(layout.stride)
         else None
     )
@@ -2272,10 +2305,76 @@ def _divide_ranges(
     # _resize_device_layout does not have to infer it by size (ambiguous for
     # transposed same-size dims — issue #3116). Tiling-invariant, so safe here.
     stick_hd = _stick_host_dim(op, layout.device_layout)
-    layout.device_layout = _resize_device_layout(
-        layout.device_layout, old_host_size, new_size_ints, stick_host_dim=stick_hd
+    # Preserve all tiled host dims here; _resize_device_layout only applies
+    # the hint to dims that actually collapse to size 1.  Capture the matching
+    # non-stick device dim before shrink so grow can reject stick tile-count
+    # slots with the same size and stride.
+    preserve_unit_host_dims = set(tiled_dims)
+    preserved_device_dims = _preserved_unit_device_dims(
+        layout.device_layout, old_host_size, new_size_ints, preserve_unit_host_dims
     )
-    return retiled_info
+    layout.device_layout = _resize_device_layout(
+        layout.device_layout,
+        old_host_size,
+        new_size_ints,
+        stick_host_dim=stick_hd,
+        preserve_unit_host_dims=preserve_unit_host_dims,
+        preserve_unit_device_dims=preserved_device_dims,
+    )
+    if retiled_info is None:
+        if not preserved_device_dims:
+            return None
+        return _RetiledBufferInfo(
+            old_stride,
+            tuple(layout.stride),
+            preserved_device_dims,
+        )
+    return _RetiledBufferInfo(
+        retiled_info.old_stride,
+        retiled_info.new_stride,
+        preserved_device_dims,
+    )
+
+
+def _preserved_unit_device_dims(
+    orig_stl,
+    old_host_size: list[int],
+    new_host_size: list[int],
+    preserve_unit_host_dims: set[int],
+) -> dict[int, int]:
+    """Map preserved tiled host dims to their non-stick device dim before shrink."""
+    from torch._inductor.ir import FlexibleLayout
+
+    old_hs = [int(s) for s in FlexibleLayout.contiguous_strides(old_host_size)]
+    orig_ds = list(orig_stl.device_size)
+    orig_sm = list(orig_stl.stride_map)
+    ndev = len(orig_ds)
+    result: dict[int, int] = {}
+    for p in preserve_unit_host_dims:
+        if not (0 <= p < len(old_host_size)):
+            continue
+        if old_host_size[p] == new_host_size[p]:
+            continue
+        candidates = [
+            j
+            for j in range(ndev - 1)
+            if orig_ds[j] == old_host_size[p] and orig_sm[j] == old_hs[p]
+        ]
+        if len(candidates) == 1:
+            result[p] = candidates[0]
+        else:
+            logger.debug(
+                "coarse_tile: could not capture preserved unit device dim for "
+                "host_dim=%s old_host_size=%s new_host_size=%s device_size=%s "
+                "stride_map=%s candidates=%s",
+                p,
+                old_host_size,
+                new_host_size,
+                orig_ds,
+                orig_sm,
+                candidates,
+            )
+    return result
 
 
 def _loop_var_to_reduction_ranges_pos(

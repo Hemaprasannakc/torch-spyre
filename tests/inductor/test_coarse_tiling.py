@@ -297,6 +297,10 @@ def _make_snode(scheduler, ir_op, name="buf0"):
     snode.ancestors = OrderedSet()
     snode.min_order = 0
     snode.max_order = 0
+    # PT 2.12 added min/max_input_distance to BaseSchedulerNode (set in __init__,
+    # so absent from MagicMock(spec=...)); init_group_node reads them when fusing.
+    snode.min_input_distance = 0
+    snode.max_input_distance = 0
     snode.unmet_dependencies = OrderedSet()
     snode.is_reduction.return_value = False
     snode.group = (None, None)
@@ -472,6 +476,7 @@ class TestRetileLoadIndexFromStrides(unittest.TestCase):
             _RetiledBufferInfo(
                 old_stride=(Integer(8192), Integer(2048), Integer(1)),
                 new_stride=(Integer(2048), Integer(512), Integer(1)),
+                preserve_unit_device_dims={},
             )
         )
 
@@ -486,6 +491,7 @@ class TestRetileLoadIndexFromStrides(unittest.TestCase):
             _RetiledBufferInfo(
                 old_stride=(Integer(256), Integer(128), Integer(1)),
                 new_stride=(Integer(128), Integer(64), Integer(1)),
+                preserve_unit_device_dims={},
             )
         )
 
@@ -499,6 +505,7 @@ class TestRetileLoadIndexFromStrides(unittest.TestCase):
             _RetiledBufferInfo(
                 old_stride=(Integer(128), Integer(128), Integer(1)),
                 new_stride=(Integer(64), Integer(32), Integer(1)),
+                preserve_unit_device_dims={},
             )
         )
 
@@ -893,8 +900,6 @@ class TestDivideRanges(unittest.TestCase):
     def test_divide_ranges_stride_collision(self):
         """Tiling an outer dim when stride_map has two entries with the same
         value (device_size tiebreak case) produces the correct device_layout."""
-        from torch._inductor.ir import FlexibleLayout
-
         from torch_spyre._C import SpyreTensorLayout
 
         # [2, 2, 2, 16] contiguous, stick on dim3 (last).  host_stride[0]=64
@@ -905,12 +910,7 @@ class TestDivideRanges(unittest.TestCase):
         # Tile dim0: [2,2,2,16] -> [1,2,2,16].
         _divide_ranges(op, Integer(2), tiled_dims=[0])
 
-        expected_strides = [
-            int(s) for s in FlexibleLayout.contiguous_strides([1, 2, 2, 16])
-        ]
-        expected = SpyreTensorLayout(
-            [1, 2, 2, 16], expected_strides, torch.float16, [0, 1, 2, 3]
-        )
+        expected = SpyreTensorLayout([2, 2, 1, 1, 64], [32, 16, 64, 64, 1], _FP16)
         self.assertEqual(layout.device_layout, expected)
 
     def test_divide_ranges_tile_count_size_collision(self):
@@ -920,7 +920,6 @@ class TestDivideRanges(unittest.TestCase):
         [2, 128] with stick on dim1: tile-count device_size = ceil(128/64) = 2,
         which equals old_host_size[0] = 2.  Without the stride check, Pass 1
         misclassifies the tile-count dim as non-stick and never updates it."""
-        from torch._inductor.ir import FlexibleLayout
 
         from torch_spyre._C import SpyreTensorLayout
 
@@ -929,8 +928,7 @@ class TestDivideRanges(unittest.TestCase):
         # Tile dim0: [2, 128] -> [1, 128].
         _divide_ranges(op, Integer(2), tiled_dims=[0])
 
-        expected_strides = [int(s) for s in FlexibleLayout.contiguous_strides([1, 128])]
-        expected = SpyreTensorLayout([1, 128], expected_strides, torch.float16, [0, 1])
+        expected = SpyreTensorLayout([2, 1, 64], [64, 128, 1], _FP16)
         self.assertEqual(layout.device_layout, expected)
 
     def test_resize_device_layout_grow_from_singleton(self):
@@ -949,6 +947,110 @@ class TestDivideRanges(unittest.TestCase):
 
         expected = SpyreTensorLayout([4, 128], [128, 1], torch.float16, [0, 1])
         self.assertEqual(result, expected)
+
+    def test_resize_device_layout_preserved_singleton_with_existing_unit_dim(self):
+        """A tiled dim that collapses next to an existing singleton keeps identity.
+
+        [1,20,16,64] tiled on dim1 by 20 shrinks to [1,1,16,64].
+        The preserved stride lets grow-back choose dim1, not the pre-existing
+        host dim0 singleton.
+        """
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.coarse_tile import (
+            _preserved_unit_device_dims,
+            _resize_device_layout,
+        )
+
+        full = SpyreTensorLayout([1, 20, 16, 64], torch.float16)
+        mapping = _preserved_unit_device_dims(
+            full, [1, 20, 16, 64], [1, 1, 16, 64], {1}
+        )
+        tile = _resize_device_layout(
+            full,
+            [1, 20, 16, 64],
+            [1, 1, 16, 64],
+            preserve_unit_host_dims={1},
+            preserve_unit_device_dims=mapping,
+        )
+        self.assertEqual(list(tile.device_size), [1, 16, 1, 1, 64])
+        self.assertEqual(list(tile.stride_map), [1024, 64, -1, -1, 1])
+
+        grown = _resize_device_layout(
+            tile,
+            [1, 1, 16, 64],
+            [1, 20, 16, 64],
+            preserve_unit_host_dims={1},
+            preserve_unit_device_dims=mapping,
+        )
+        self.assertEqual(list(grown.device_size), [20, 16, 1, 1, 64])
+        self.assertEqual(list(grown.stride_map), [1024, 64, -1, -1, 1])
+
+    def test_resize_device_layout_preserved_singleton_without_existing_unit_dim(self):
+        """A tiled dim can grow back even without a pre-existing host singleton.
+
+        [20,16,64] tiled on dim0 by 20 shrinks to [1,16,64].  The stick
+        tile-count slot also has device_size 1, so grow-back must pick the
+        later non-stick slot carrying the preserved dim0 stride.
+        """
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.coarse_tile import (
+            _preserved_unit_device_dims,
+            _resize_device_layout,
+        )
+
+        full = SpyreTensorLayout([20, 16, 64], torch.float16)
+        mapping = _preserved_unit_device_dims(full, [20, 16, 64], [1, 16, 64], {0})
+        tile = _resize_device_layout(
+            full,
+            [20, 16, 64],
+            [1, 16, 64],
+            preserve_unit_host_dims={0},
+            preserve_unit_device_dims=mapping,
+        )
+        grown = _resize_device_layout(
+            tile,
+            [1, 16, 64],
+            [20, 16, 64],
+            preserve_unit_host_dims={0},
+            preserve_unit_device_dims=mapping,
+        )
+
+        self.assertEqual(grown, full)
+
+    def test_resize_device_layout_preserved_singleton_adjacent_to_stick(self):
+        """Preserved matching must not choose the stick tile-count slot.
+
+        [8,20,16,64] tiled on dim2 by 16 shrinks to [8,20,1,64].
+        Dim2's non-stick slot and the stick tile-count slot both become
+        size 1 with stride 64, so grow-back must use the captured device-dim
+        identity rather than a position-based tie-break.
+        """
+        from torch_spyre._C import SpyreTensorLayout
+        from torch_spyre._inductor.coarse_tile import (
+            _preserved_unit_device_dims,
+            _resize_device_layout,
+        )
+
+        full = SpyreTensorLayout([8, 20, 16, 64], torch.float16)
+        mapping = _preserved_unit_device_dims(
+            full, [8, 20, 16, 64], [8, 20, 1, 64], {2}
+        )
+        tile = _resize_device_layout(
+            full,
+            [8, 20, 16, 64],
+            [8, 20, 1, 64],
+            preserve_unit_host_dims={2},
+            preserve_unit_device_dims=mapping,
+        )
+        grown = _resize_device_layout(
+            tile,
+            [8, 20, 1, 64],
+            [8, 20, 16, 64],
+            preserve_unit_host_dims={2},
+            preserve_unit_device_dims=mapping,
+        )
+
+        self.assertEqual(grown, full)
 
     def test_resize_device_layout_raises_on_unsupported(self):
         """_resize_device_layout raises RuntimeError when the stick host dim
@@ -1313,6 +1415,10 @@ def _make_counted_loop(scheduler, name="loop0", loop_count=sympy.Integer(4)):
     node.ancestors = OrderedSet()
     node.min_order = 0
     node.max_order = 0
+    # PT 2.12 added min/max_input_distance to BaseSchedulerNode (set in __init__,
+    # so absent from MagicMock(spec=...)); init_group_node reads them when fusing.
+    node.min_input_distance = 0
+    node.max_input_distance = 0
     node.unmet_dependencies = OrderedSet()
     node.is_reduction.return_value = False
     node.group = (None, None)
@@ -1788,7 +1894,7 @@ class TestSharedWeightUnitBmmLayout(unittest.TestCase):
                 Integer(0),
                 Mod(c2, 64),
             ],
-            allocation={"pool": 0},
+            allocation={"hbm_pool": 0},
         )
         kernel_arg = TensorArg(
             is_input=True,
@@ -4244,6 +4350,101 @@ class TestHintsToCoarseTileGroupsLogging(unittest.TestCase):
             f"(loop_var=None for hint_id=2 on group_ops[0]); "
             f"got: {scopes_line!r}",
         )
+
+
+class TestRepairUnitTiledSymbols(unittest.TestCase):
+    def test_repairs_empty_tiled_level_from_unit_tiled_host_dim(self):
+        from torch_spyre._inductor.op_spec import OpSpec
+        from torch_spyre._inductor.spyre_kernel import _repair_unit_tiled_symbols
+
+        c0 = Symbol("c0")
+        c1 = Symbol("c1")
+        z0 = Symbol("z0")
+        z1 = Symbol("z1")
+        op_spec = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={c0: (Integer(16), 1), c1: (Integer(64), 1)},
+            args=[],
+            op_info={},
+            tiled_symbols=[[]],
+            unit_tiled_host_dims=[[1]],
+        )
+        new_space = {
+            c0: (Integer(16), 1),
+            c1: (Integer(64), 1),
+            z0: (Integer(1), 1),
+            z1: (Integer(1), 1),
+        }
+        new_tensors = [
+            {
+                "size": [Integer(1), Integer(1), Integer(16), Integer(64)],
+                "coordinates": [z0, z1, c0, c1],
+            }
+        ]
+
+        _repair_unit_tiled_symbols(
+            op_spec, op_spec.iteration_space, new_space, new_tensors
+        )
+
+        self.assertEqual(op_spec.tiled_symbols, [[z1]])
+
+    def test_raises_for_constant_unit_tiled_host_dim_without_live_symbol(self):
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.op_spec import OpSpec
+        from torch_spyre._inductor.spyre_kernel import _repair_unit_tiled_symbols
+
+        c0 = Symbol("c0")
+        c1 = Symbol("c1")
+        z0 = Symbol("z0")
+        op_spec = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={c0: (Integer(16), 1), c1: (Integer(64), 1)},
+            args=[],
+            op_info={},
+            tiled_symbols=[[]],
+            unit_tiled_host_dims=[[1]],
+        )
+        new_space = {
+            c0: (Integer(16), 1),
+            c1: (Integer(64), 1),
+            z0: (Integer(1), 1),
+        }
+        new_tensors = [
+            {
+                "size": [Integer(1), Integer(1), Integer(16), Integer(64)],
+                "coordinates": [z0, Integer(0), c0, c1],
+            }
+        ]
+
+        with self.assertRaises(Unsupported):
+            _repair_unit_tiled_symbols(
+                op_spec, op_spec.iteration_space, new_space, new_tensors
+            )
+
+    def test_does_not_repair_without_unit_tile_marker(self):
+        from torch_spyre._inductor.op_spec import OpSpec
+        from torch_spyre._inductor.spyre_kernel import _repair_unit_tiled_symbols
+
+        c0 = Symbol("c0")
+        z0 = Symbol("z0")
+        op_spec = OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={c0: (Integer(16), 1)},
+            args=[],
+            op_info={},
+            tiled_symbols=[[]],
+        )
+        new_space = {c0: (Integer(16), 1), z0: (Integer(1), 1)}
+        new_tensors = [{"size": [Integer(20), Integer(16)], "coordinates": [z0, c0]}]
+
+        _repair_unit_tiled_symbols(
+            op_spec, op_spec.iteration_space, new_space, new_tensors
+        )
+
+        self.assertEqual(op_spec.tiled_symbols, [[]])
 
 
 if __name__ == "__main__":

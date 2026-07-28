@@ -52,7 +52,11 @@ from .pass_utils import (
     iteration_space,
     indirect_access_subs_from_kernel,
 )
-from .views import compute_coordinates, align_tensors
+from .views import (
+    SYNTHETIC_SYMBOL_PREFIX,
+    align_tensors,
+    compute_coordinates,
+)
 from .logging_utils import get_inductor_logger
 from .op_spec import (
     IndirectAccess,
@@ -60,6 +64,7 @@ from .op_spec import (
     OpSpec,
     TensorArg,
     UnimplementedOp as OpSpecUnimplementedOp,
+    format_op_spec_list,
 )
 from torch_spyre._inductor.provenance import build_debug_handle
 import logging
@@ -195,19 +200,24 @@ def _serialize_value(v):
         return repr(int(v))
     elif isinstance(v, sympy.Basic):
         # Concretize: first try direct float conversion for concrete numerics,
-        # then fall back to substituting size_hints for symbolic expressions.
+        # then fall back to substituting hints for symbolic expressions.
         if hasattr(v, "free_symbols") and v.free_symbols:
-            # Substitute each symbol individually (size_hint handles simple
-            # Symbol lookups reliably), then evaluate.  This works for float
-            # expressions like 1.0/s97 where size_hint on the whole expression
-            # might not handle the float division correctly.
-            subs = {s: V.graph.sizevars.size_hint(s) for s in v.free_symbols}
+            # Substitute each symbol individually (guarding_hint_or_throw handles
+            # simple Symbol lookups reliably), then evaluate.  This works for float
+            # expressions like 1.0/s97 where a hint on the whole expression might
+            # not handle the float division correctly.  This value is baked into
+            # generated kernel source, so use the strict hint: resolve backed
+            # symbols to their true value and raise on unbacked ones rather than
+            # emitting an optimization fallback.
+            subs = {
+                s: V.graph.sizevars.guarding_hint_or_throw(s) for s in v.free_symbols
+            }
             concrete = float(v.subs(subs))
             return repr(concrete)
         try:
             return repr(float(v))
         except (TypeError, ValueError):
-            return repr(V.graph.sizevars.size_hint(v))
+            return repr(V.graph.sizevars.guarding_hint_or_throw(v))
     elif isinstance(v, dict):
         items = ", ".join(f"{repr(k)}: {_serialize_value(val)}" for k, val in v.items())
         return "{" + items + "}"
@@ -360,7 +370,10 @@ class SpyreOpFuncs:
         return PointwiseOp("tanh", [x])
 
     @staticmethod
-    def to_dtype(x, dtype, src_dtype):
+    def to_dtype(x, dtype, src_dtype, use_compute_types=False):
+        # PT 2.12 passes a new `use_compute_types` kwarg through OpsHandler.
+        # Spyre maps directly to fixed hardware ops via DtypeOpTable and
+        # cannot honor compute-type promotion, so accept and ignore.
         assert dtype != src_dtype
 
         op = DtypeOpTable.get_operator(src_dtype, dtype)
@@ -531,7 +544,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         )
         if (
             "lx" not in tensor.layout.allocation
-            and "pool" not in tensor.layout.allocation
+            and "hbm_pool" not in tensor.layout.allocation
         ):
             self.spyre_kernel_args.append((name, tensor_arg))
         return tensor_arg
@@ -610,6 +623,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # which throws on symbolic dimensions.  They are only needed when this
         # op is inside a tiling loop, so skip the computation for non-tiled ops.
         tiled_syms: list[list] = []
+        unit_tiled_host_dims: list[list[int]] = []
         if n_levels > 0:
             # Build host-range-index → iteration-space-key-index map by walking
             # data.ranges and counting only non-unit entries.  loop_tiled_dims
@@ -638,22 +652,42 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
 
             tiled_syms_per_level_outermost: list[list] = []
+            unit_tiled_host_dims_outermost: list[list[int]] = []
             for lvl in range(n_levels):
+                level_unit_host_dims: list[int] = []
                 level_syms: list = []
                 if lvl < len(raw_tiled_dims):
                     for d in raw_tiled_dims[lvl]:
                         mapped = host_to_it.get(d)
                         if mapped is not None and mapped < len(it_space_keys):
                             level_syms.append(it_space_keys[mapped])
+                        elif (
+                            li is not None
+                            and lvl < len(li.loop_count)
+                            and hasattr(ir_node, "data")
+                            and hasattr(ir_node.data, "ranges")
+                            and d < len(ir_node.data.ranges)
+                        ):
+                            # Coarse tiling can divide a tiled host dim down to
+                            # 1. Inductor then omits it from the compact
+                            # iteration space, so remember the host dim and
+                            # repair tiled_symbols after tensor alignment creates
+                            # (or can accept) a unit z* coordinate for it.
+                            try:
+                                if int(ir_node.data.ranges[d]) == 1:
+                                    level_unit_host_dims.append(d)
+                            except (TypeError, ValueError):
+                                pass
                 if lvl < len(raw_tiled_red_dims):
                     for r in raw_tiled_red_dims[lvl]:
                         sym_idx = n_output_it_syms + r
                         if sym_idx < len(it_space_keys):
                             level_syms.append(it_space_keys[sym_idx])
                 tiled_syms_per_level_outermost.append(level_syms)
+                unit_tiled_host_dims_outermost.append(level_unit_host_dims)
             # Reverse so index 0 = innermost level.
             tiled_syms = list(reversed(tiled_syms_per_level_outermost))
-
+            unit_tiled_host_dims = list(reversed(unit_tiled_host_dims_outermost))
         # Collect (max, granularity) bounds for any symbolic iteration-space
         # dims. These are passed through OpSpec so SDSC codegen can emit
         # symbolicDimInfo_ without needing the live ShapeEnv (which is gone
@@ -686,6 +720,23 @@ class SpyreKernel(Kernel[CSEVariable]):
             )
             debug_handle = None
 
+        if not is_reduction and op != "ReStickifyOpHBM" and not indirect_var_names:
+            stick_vars = {
+                next(iter(arg.device_coordinates[-1].free_symbols))
+                for arg in args
+                if arg.device_coordinates and arg.device_coordinates[-1].free_symbols
+            }
+            assert len(stick_vars) <= 1, (
+                f"create_op_spec: stick mismatch for op={op!r} "
+                f"ir_chain={getattr(debug_handle, 'ir_chain', '?')}: "
+                f"args have different stick loop variables: "
+                + ", ".join(
+                    str(arg.device_coordinates[-1])
+                    for arg in args
+                    if arg.device_coordinates
+                )
+            )
+
         return OpSpec(
             op,
             is_reduction,
@@ -694,6 +745,7 @@ class SpyreKernel(Kernel[CSEVariable]):
             op_info,
             tiled_symbols=tiled_syms,
             symbolic_dim_bounds=symbolic_dim_bounds,
+            unit_tiled_host_dims=unit_tiled_host_dims,
             debug_handle=debug_handle,
         )
 
@@ -705,7 +757,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 continue
             layout = buf.get_layout()
             if isinstance(layout, FixedTiledLayout) and (
-                "lx" in layout.allocation or "pool" in layout.allocation
+                "lx" in layout.allocation or "hbm_pool" in layout.allocation
             ):
                 self.remove_buffer(name)
 
@@ -719,7 +771,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
-        if "lx" not in layout.allocation and "pool" not in layout.allocation:
+        if "lx" not in layout.allocation and "hbm_pool" not in layout.allocation:
             _ = self.args.input(name)
 
         if logger.isEnabledFor(logging.DEBUG):
@@ -746,7 +798,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{real_dst_name} does not have FixedTiledLayout")
-        # Pool buffers are intermediates whose address is baked into the TensorArg
+        # HBM-pool buffers are intermediates whose address is baked into the TensorArg
         # allocation dict; registering them as outputs would overflow SEGMENT_OFFSETS.
         # (lx buffers are already excluded from spyre_kernel_args in _tensor_arg.)
         # Also skip buffers marked as removed by Inductor's optimizer (e.g., by LX )
@@ -754,7 +806,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         # buffers that later get marked as dead code.
         real_dst_name = V.graph.scheduler.mutation_real_name.get(name, name)
         is_removed = real_dst_name in V.graph.removed_buffers
-        if "pool" not in layout.allocation and not is_removed:
+        if "hbm_pool" not in layout.allocation and not is_removed:
             # Pass the alias here, not real_dst_name: args.output resolves the
             # mutation alias internally. (load() passes the pre-resolved real
             # name to args.input, which does not resolve.)
@@ -852,10 +904,10 @@ class SpyreKernel(Kernel[CSEVariable]):
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
-        # Pool buffers are intermediates whose address is baked into the TensorArg
+        # HBM-pool buffers are intermediates whose address is baked into the TensorArg
         # allocation dict; registering them as outputs would overflow SEGMENT_OFFSETS.
         # (lx buffers are already excluded from spyre_kernel_args in _tensor_arg.)
-        if "pool" not in layout.allocation:
+        if "hbm_pool" not in layout.allocation:
             _ = self.args.output(name)
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout)
@@ -918,8 +970,21 @@ class SpyreKernel(Kernel[CSEVariable]):
             if self.indirect_vars
             else None
         )
+
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "OP SPECS AFTER CREATION/LOOP-WRAPPING\n%s",
+                format_op_spec_list(self.op_specs),
+            )
+
         for op_spec in _iter_op_specs(self.op_specs):
             simplify_op_spec(op_spec, self.indirect_sizes, indirect_access_subs)
+
+        if logger.isEnabledFor(logging.INFO):
+            logger.info(
+                "OP SPECS AFTER SIMPLIFICATION\n%s",
+                format_op_spec_list(self.op_specs),
+            )
 
         def sympy_str(x: sympy.Expr) -> str:
             if isinstance(x, IndirectAccess):
@@ -929,8 +994,8 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         # Now that all loads/stores have been processed we know the final kernel_args and can map names to indices
         actuals = self.args.python_argdefs()[1]
-        pool_size = getattr(V.graph, "pool_size", 0)
-        has_pool_allocations = pool_size > 0
+        hbm_pool_size = getattr(V.graph, "hbm_pool_size", 0)
+        has_pool_allocations = hbm_pool_size > 0
 
         for name, tensor_arg in self.spyre_kernel_args:
             tensor_arg.arg_index = actuals.index(name)
@@ -955,12 +1020,12 @@ class SpyreKernel(Kernel[CSEVariable]):
         buf.writeline("]")
         return buf.getvalue()
 
-    def _kernel_uses_pool(self) -> bool:
-        """Return True if any op in this kernel references a pool-allocated tensor."""
+    def _kernel_uses_hbm_pool(self) -> bool:
+        """Return True if any op in this kernel references an HBM-pool-allocated tensor."""
         from torch_spyre._inductor.op_spec import TensorArg
 
         return any(
-            "pool" in arg.allocation
+            "hbm_pool" in arg.allocation
             for op in _iter_op_specs(self.op_specs)
             for arg in op.args
             if isinstance(arg, TensorArg)
@@ -971,7 +1036,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         wrapper = V.graph.wrapper_code
         call_args = []
 
-        if self._kernel_uses_pool():
+        if self._kernel_uses_hbm_pool():
             call_args.append("_pool")
 
         # Add remaining kernel arguments, deduplicating tensors that appear as
@@ -1088,6 +1153,15 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                         )
                         + "],"
                     )
+                if op_spec.unit_tiled_host_dims:
+                    buf.writeline(
+                        "unit_tiled_host_dims=["
+                        + ", ".join(
+                            "[" + ", ".join(str(d) for d in level) + "]"
+                            for level in op_spec.unit_tiled_host_dims
+                        )
+                        + "],"
+                    )
                 buf.writeline(
                     f"symbolic_dim_bounds={_serialize_value(op_spec.symbolic_dim_bounds)},"
                 )
@@ -1123,6 +1197,143 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
             buf.writeline("),")
 
 
+def _repair_unit_tiled_symbols(op_spec, old_it_space, new_op_space_splits, new_tensors):
+    """Attach synthetic z* symbols for coarse-tiled host dims that became size 1."""
+    unit_host_dims = getattr(op_spec, "unit_tiled_host_dims", [])
+    if not unit_host_dims or not op_spec.tiled_symbols or not new_tensors:
+        return
+
+    def is_synthetic_symbol(sym: sympy.Symbol) -> bool:
+        name = str(sym)
+        suffix = name[len(SYNTHETIC_SYMBOL_PREFIX) :]
+        return name.startswith(SYNTHETIC_SYMBOL_PREFIX) and suffix.isdigit()
+
+    old_syms = set(old_it_space.keys())
+    synthetic_syms = {
+        sym
+        for sym in new_op_space_splits
+        if sym not in old_syms and is_synthetic_symbol(sym)
+    }
+
+    synthetic_occurrences: dict[sympy.Symbol, list[tuple[bool, sympy.Expr]]] = {
+        sym: [] for sym in synthetic_syms
+    }
+    for tensor_idx, tensor in enumerate(new_tensors):
+        is_output = tensor_idx == len(new_tensors) - 1
+        for dim_size, coord in zip(tensor["size"], tensor["coordinates"]):
+            dim_size = sympy.sympify(dim_size)
+            coord_syms = sympy.sympify(coord).free_symbols & synthetic_syms
+            for sym in coord_syms:
+                synthetic_occurrences[sym].append((is_output, dim_size))
+
+    def output_coords_are_host_ordered(output_size, output_coords) -> bool:
+        if len(output_coords) != len(output_size):
+            return False
+        expected = iter(old_it_space.keys())
+        for dim_size, coord in zip(output_size, output_coords):
+            if sympy.sympify(dim_size) == 1:
+                continue
+            try:
+                expected_sym = next(expected)
+            except StopIteration:
+                return False
+            if expected_sym not in sympy.sympify(coord).free_symbols:
+                return False
+        return next(expected, None) is None
+
+    def existing_synthetic_at_host_dim(
+        host_dims: list[int], used: set[sympy.Symbol]
+    ) -> sympy.Symbol | None:
+        output_tensor = new_tensors[-1]
+        output_coords = output_tensor["coordinates"]
+        output_size = output_tensor["size"]
+        # Trust host_dim as a coordinate index only when the aligned output still
+        # follows compact host order.  Reordered device layouts use the scored
+        # live-symbol path below instead.
+        if not output_coords_are_host_ordered(output_size, output_coords):
+            return None
+        for host_dim in host_dims:
+            if host_dim >= len(output_coords):
+                continue
+            if sympy.sympify(output_size[host_dim]) != 1:
+                continue
+            coord = sympy.sympify(output_coords[host_dim])
+            candidates = sorted((coord.free_symbols & synthetic_syms) - used, key=str)
+            if candidates:
+                return candidates[0]
+        return None
+
+    def best_existing_synthetic(
+        host_dims: list[int], used: set[sympy.Symbol]
+    ) -> sympy.Symbol | None:
+        direct = existing_synthetic_at_host_dim(host_dims, used)
+        if direct is not None:
+            return direct
+
+        scored = []
+        for sym in synthetic_syms - used:
+            occurrences = synthetic_occurrences[sym]
+            if not any(is_output for is_output, _ in occurrences):
+                continue
+
+            non_unit_occurrences = [
+                occ for occ in occurrences if occ[1] != sympy.Integer(1)
+            ]
+            if not non_unit_occurrences:
+                continue
+
+            # The reordered-layout case cannot use host_dim as a coordinate index.
+            # Pick a live z* already participating in aligned tensor addresses;
+            # data dims tend to occur in non-broadcast inputs as well as output,
+            # unlike layout filler/tile-count symbols.
+            input_non_unit_count = sum(
+                1 for is_output, _ in non_unit_occurrences if not is_output
+            )
+            output_non_unit_count = sum(
+                1 for is_output, _ in non_unit_occurrences if is_output
+            )
+            suffix = str(sym)[len(SYNTHETIC_SYMBOL_PREFIX) :]
+            tie_break = -int(suffix) if suffix.isdigit() else 0
+            scored.append(
+                (
+                    input_non_unit_count,
+                    output_non_unit_count,
+                    len(non_unit_occurrences),
+                    tie_break,
+                    str(sym),
+                    sym,
+                )
+            )
+
+        if not scored:
+            return None
+        winner = max(scored, key=lambda item: item[:-1])
+        logger.debug(
+            "_repair_unit_tiled_symbols: selected synthetic symbol %s by "
+            "occurrence score for host_dims=%s; scored_candidates=%s",
+            winner[-1],
+            host_dims,
+            scored,
+        )
+        return winner[-1]
+
+    used: set[sympy.Symbol] = set()
+    for level_syms, host_dims in zip(op_spec.tiled_symbols, unit_host_dims):
+        if level_syms or not host_dims:
+            continue
+
+        sym = best_existing_synthetic(host_dims, used)
+        if sym is not None:
+            level_syms.append(sym)
+            used.add(sym)
+            continue
+
+        raise Unsupported(
+            "Could not find a live synthetic coordinate for coarse-tiled "
+            f"unit host dims {host_dims}."
+        )
+
+
 def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
     # Both parameters must be provided together for gather kernels — indirect_sizes
     # decomposes symbols in align_tensors; indirect_access_subs replaces them with IndirectAccess.
@@ -1137,6 +1348,8 @@ def simplify_op_spec(op_spec, indirect_sizes=None, indirect_access_subs=None):
         indirect_sizes,
     )
     op_spec.iteration_space = new_op_space_splits
+
+    _repair_unit_tiled_symbols(op_spec, it_space, new_op_space_splits, new_tensors)
 
     for arg, t in zip(op_spec.args, new_tensors):
         arg.device_size = t["size"]
