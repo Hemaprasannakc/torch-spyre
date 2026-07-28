@@ -249,6 +249,14 @@ def _resize_device_layout(
         and new_host_size[p] != old_host_size[p]
     ]
     if missing_preserved_identity:
+        logger.warning(
+            "_resize_device_layout: missing preserved device-dim identity for "
+            "unit host dims %s (preserve_unit_device_dims=%s) in %r; "
+            "falling back may change the physical device layout",
+            missing_preserved_identity,
+            preserve_unit_device_dims,
+            orig_stl,
+        )
         raise RuntimeError(
             "_resize_device_layout: missing preserved device-dim identity for "
             f"unit host dims {missing_preserved_identity} "

@@ -25,6 +25,9 @@ from torch._inductor.virtualized import V
 from .errors import Unsupported
 
 
+SYNTHETIC_SYMBOL_PREFIX = "z"
+
+
 def find_repeat_vars(index_exprs, var_ranges):
     repeat_info = {}
     for var, var_range in var_ranges.items():
@@ -547,7 +550,7 @@ def align_tensors(
         if _synthetic_var_idx < len(new_vars):
             var = new_vars[_synthetic_var_idx]
         else:
-            var = sympy.symbols(f"z{len(new_vars)}")
+            var = sympy.symbols(f"{SYNTHETIC_SYMBOL_PREFIX}{len(new_vars)}")
             new_vars.append(var)
         _synthetic_var_idx += 1
         return var

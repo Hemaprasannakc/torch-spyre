@@ -1396,13 +1396,22 @@ def _allocate_full_buffer(
         stick_hd = _stick_host_dim(tiled_op, orig_layout.device_layout)
         try:
             loop_info = getattr(tiled_op, "loop_info", None)
+            tiled_host_dims: set[int]
+            preserved_device_dims: dict[int, int]
             if loop_info is None:
-                raise RuntimeError("missing coarse tile loop_info")
-
-            # Grow uses all tiled host dims.  _resize_device_layout filters this
-            # to size-1 dims with real strides, matching the shrink-side identity.
-            tiled_host_dims = {d for dims in loop_info.loop_tiled_dims for d in dims}
-            preserved_device_dims = loop_info.preserve_unit_device_dims
+                tiled_host_dims = set()
+                preserved_device_dims = {}
+            else:
+                # Grow uses all tiled host dims.  _resize_device_layout filters this
+                # to size-1 dims with real strides, matching the shrink-side identity.
+                tiled_host_dims = {
+                    d
+                    for dims in getattr(loop_info, "loop_tiled_dims", [])
+                    for d in dims
+                }
+                preserved_device_dims = getattr(
+                    loop_info, "preserve_unit_device_dims", {}
+                )
             device_layout = _resize_device_layout(
                 orig_layout.device_layout,
                 tile_size_ints,

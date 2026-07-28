@@ -52,7 +52,11 @@ from .pass_utils import (
     iteration_space,
     indirect_access_subs_from_kernel,
 )
-from .views import compute_coordinates, align_tensors
+from .views import (
+    SYNTHETIC_SYMBOL_PREFIX,
+    align_tensors,
+    compute_coordinates,
+)
 from .logging_utils import get_inductor_logger
 from .op_spec import (
     IndirectAccess,
@@ -1201,7 +1205,8 @@ def _repair_unit_tiled_symbols(op_spec, old_it_space, new_op_space_splits, new_t
 
     def is_synthetic_symbol(sym: sympy.Symbol) -> bool:
         name = str(sym)
-        return name.startswith("z") and name[1:].isdigit()
+        suffix = name[len(SYNTHETIC_SYMBOL_PREFIX) :]
+        return name.startswith(SYNTHETIC_SYMBOL_PREFIX) and suffix.isdigit()
 
     old_syms = set(old_it_space.keys())
     synthetic_syms = {
@@ -1210,18 +1215,16 @@ def _repair_unit_tiled_symbols(op_spec, old_it_space, new_op_space_splits, new_t
         if sym not in old_syms and is_synthetic_symbol(sym)
     }
 
-    synthetic_occurrences: dict[sympy.Symbol, list[tuple[bool, sympy.Expr, int]]] = {
+    synthetic_occurrences: dict[sympy.Symbol, list[tuple[bool, sympy.Expr]]] = {
         sym: [] for sym in synthetic_syms
     }
     for tensor_idx, tensor in enumerate(new_tensors):
         is_output = tensor_idx == len(new_tensors) - 1
-        for dim_idx, (dim_size, coord) in enumerate(
-            zip(tensor["size"], tensor["coordinates"])
-        ):
+        for dim_size, coord in zip(tensor["size"], tensor["coordinates"]):
             dim_size = sympy.sympify(dim_size)
             coord_syms = sympy.sympify(coord).free_symbols & synthetic_syms
             for sym in coord_syms:
-                synthetic_occurrences[sym].append((is_output, dim_size, dim_idx))
+                synthetic_occurrences[sym].append((is_output, dim_size))
 
     def output_coords_are_host_ordered(output_size, output_coords) -> bool:
         if len(output_coords) != len(output_size):
@@ -1270,7 +1273,7 @@ def _repair_unit_tiled_symbols(op_spec, old_it_space, new_op_space_splits, new_t
         scored = []
         for sym in synthetic_syms - used:
             occurrences = synthetic_occurrences[sym]
-            if not any(is_output for is_output, _, _ in occurrences):
+            if not any(is_output for is_output, _ in occurrences):
                 continue
 
             non_unit_occurrences = [
@@ -1284,12 +1287,13 @@ def _repair_unit_tiled_symbols(op_spec, old_it_space, new_op_space_splits, new_t
             # data dims tend to occur in non-broadcast inputs as well as output,
             # unlike layout filler/tile-count symbols.
             input_non_unit_count = sum(
-                1 for is_output, _, _ in non_unit_occurrences if not is_output
+                1 for is_output, _ in non_unit_occurrences if not is_output
             )
             output_non_unit_count = sum(
-                1 for is_output, _, _ in non_unit_occurrences if is_output
+                1 for is_output, _ in non_unit_occurrences if is_output
             )
-            tie_break = -int(str(sym)[1:]) if str(sym)[1:].isdigit() else 0
+            suffix = str(sym)[len(SYNTHETIC_SYMBOL_PREFIX) :]
+            tie_break = -int(suffix) if suffix.isdigit() else 0
             scored.append(
                 (
                     input_non_unit_count,
@@ -1303,7 +1307,15 @@ def _repair_unit_tiled_symbols(op_spec, old_it_space, new_op_space_splits, new_t
 
         if not scored:
             return None
-        return max(scored, key=lambda item: item[:-1])[-1]
+        winner = max(scored, key=lambda item: item[:-1])
+        logger.debug(
+            "_repair_unit_tiled_symbols: selected synthetic symbol %s by "
+            "occurrence score for host_dims=%s; scored_candidates=%s",
+            winner[-1],
+            host_dims,
+            scored,
+        )
+        return winner[-1]
 
     used: set[sympy.Symbol] = set()
     for level_syms, host_dims in zip(op_spec.tiled_symbols, unit_host_dims):

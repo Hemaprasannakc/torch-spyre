@@ -1709,6 +1709,21 @@ class TestCoarseTileSpyreHints(InductorTestCase):
             fn, a, b, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
         )
 
+        a_dev = a.to("spyre")
+        b_dev = b.to("spyre")
+        cfn = torch.compile(fn)
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
+
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec for M-tiled add")
+        self.assertIn("count=sympify('20')", src, "Expected loop count 20 in LoopSpec")
+
     def test_hint_outermost_unit_tiled_dim_single_stick_correct(self):
         """Outermost dim tiling preserves device identity even when strides stay same.
 
@@ -1735,6 +1750,21 @@ class TestCoarseTileSpyreHints(InductorTestCase):
         compare_with_cpu(
             fn, a, b, run_compile=True, run_eager=False, atol=0.01, rtol=0.01
         )
+
+        a_dev = a.to("spyre")
+        b_dev = b.to("spyre")
+        cfn = torch.compile(fn)
+        with (
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(cfn, a_dev, b_dev)
+
+        self.assertTrue(len(source_codes) > 0)
+        src = source_codes[0]
+        self.assertIn("LoopSpec(", src, "Expected LoopSpec for M-tiled add")
+        self.assertIn("count=sympify('20')", src, "Expected loop count 20 in LoopSpec")
 
     def test_hint_row_tiling_multi_stick_pointwise_correct(self):
         """Row-tiling a multi-stick pointwise chain produces correct output.
