@@ -89,20 +89,33 @@ def _consumer_shares_group_tiled_dim(
     This check is agnostic to both ops' types — what makes the join safe is
     that the tiled dim is an **output range**, not the reduction range: tile
     ``t`` of an output dim is self-contained (it reads only tile ``t`` of the
-    producer).  ``span_overflow_groups`` therefore applies it to any Reduction
-    consumer (not just batch-matmul) joining a Pointwise-rooted run, and to any
-    Pointwise consumer joining a Reduction-rooted run (BMM -> PW).
+    producer).  ``span_overflow_groups`` therefore applies it to every
+    producer/consumer combination it groups: Pointwise or Reduction on either
+    side.
 
-    In the latter direction the check is not merely a safety net but load-
-    bearing.  A Reduction's output dim positions need not line up with its
-    Pointwise consumer's: the consumer inherits the group's ``host_dim``
-    *positionally* (see the conform branch in ``span_overflow_groups``), so if
-    the numbering diverges, ``can_conform_pointwise_tile`` would validate the
-    wrong dim, possibly pass by coincidence, and ``_dims_to_hints`` would then
-    resolve a ``loop_var`` for a dim that does not correspond to the producer's
-    tile — a desynchronized loop nest computing wrong results silently.
-    Requiring the loop-variable correspondence below makes that case fail
-    closed.
+    Once a **Reduction** sits on either side the check stops being a formality
+    and becomes the thing keeping the pass correct, in two distinct ways.
+
+    With a Reduction *producer* and a Pointwise consumer (BMM -> PW): the
+    producer's output dim positions need not line up with the consumer's, yet
+    the consumer inherits the group's ``host_dim`` *positionally* (see the
+    conform branch in ``span_overflow_groups``).  If the numbering diverges,
+    ``can_conform_pointwise_tile`` would validate the wrong dim, possibly pass
+    by coincidence, and ``_dims_to_hints`` would resolve a ``loop_var`` for a
+    dim unrelated to the producer's tile — a desynchronized loop nest computing
+    wrong results silently.
+
+    With a Reduction on *both* sides (BMM -> BMM, BMM -> sum): the producer's
+    tiled dim may land on the consumer's **reduction (K) range** rather than an
+    output range.  In ``bmm(bmm(q, k), v)``, a producer tiling its N dim feeds a
+    consumer whose K *is* that N, so tile ``t`` of the producer is a partial
+    slice of the consumer's reduction — pairing them per-iteration computes a
+    partial sum.  K never appears in the consumer's output coordinates, so the
+    intersection is empty and the pair is rejected, while the safe variants of
+    the same chain (producer tiling B or M, or tiling N with the consumer
+    reading it as its B operand) still verify.
+
+    Both cases fail closed via the loop-variable correspondence below.
 
     The automatic span-overflow planner only ever tiles output ranges (see
     ``SpanOverflowTileLevel``: ``is_reduction`` is always False on the auto
@@ -118,11 +131,16 @@ def _consumer_shares_group_tiled_dim(
         return False
     try:
         consumer_coords = op_out_coords(op)
-        reads = {
-            dep.name: dep
-            for dep in op.get_read_writes().reads
-            if isinstance(dep, MemoryDep)
-        }
+        # Group deps by name rather than keying a dict on it: one op can read
+        # the same buffer through *several* deps at different indices (a matmul
+        # taking the same tiled producer as both operands, e.g. ``x @ x.T``).
+        # Collapsing them would verify one access pattern and silently leave
+        # the others unchecked, which is exactly the case Reduction-to-Reduction
+        # grouping makes reachable.  Every dep must correspond.
+        reads: dict[str, list[MemoryDep]] = {}
+        for dep in op.get_read_writes().reads:
+            if isinstance(dep, MemoryDep):
+                reads.setdefault(dep.name, []).append(dep)
         indirect = indirect_sizes_from_op(op)
     except (AttributeError, TypeError, ValueError, RuntimeError, KeyError, IndexError):
         # op_out_coords internally calls host_coordinates, which can raise the
@@ -141,22 +159,30 @@ def _consumer_shares_group_tiled_dim(
 
     group_by_name = {gop.get_name(): (gop, dims) for gop, dims in current_group}
     verified_any = False
-    for name, dep in reads.items():
+    for name, deps in reads.items():
         if name not in group_by_name:
             continue
         producer, producer_dims = group_by_name[name]
-        try:
-            producer_coords = host_coordinates(producer.get_layout(), dep, indirect)
-        except (TypeError, ValueError, RuntimeError, KeyError, IndexError):
-            return False
-        for host_dim_p, _split, _is_reduction in producer_dims:
-            if host_dim_p >= len(producer_coords):
+        for dep in deps:
+            try:
+                producer_coords = host_coordinates(producer.get_layout(), dep, indirect)
+            except (TypeError, ValueError, RuntimeError, KeyError, IndexError):
                 return False
-            if not (producer_coords[host_dim_p].free_symbols & consumer_tiled_syms):
-                # Consumer's tiled loop var does not index this producer's tiled
-                # dim -> not the same logical dim -> unsafe to share a loop.
-                return False
-            verified_any = True
+            for host_dim_p, _split, _is_reduction in producer_dims:
+                if host_dim_p >= len(producer_coords):
+                    return False
+                if not (producer_coords[host_dim_p].free_symbols & consumer_tiled_syms):
+                    # Consumer's tiled loop var does not index this producer's
+                    # tiled dim -> not the same logical dim -> unsafe to share
+                    # a loop.  For a Reduction consumer this is also what
+                    # rejects a producer whose tiled dim lands on the consumer's
+                    # reduction (K) range: K never appears in the consumer's
+                    # output coordinates, so the intersection is empty and tile
+                    # t of the producer -- a partial slice of the consumer's
+                    # reduction -- can never be paired with tile t of the
+                    # consumer's output.
+                    return False
+                verified_any = True
     return verified_any
 
 
@@ -250,32 +276,31 @@ def span_overflow_groups(
         instead of its own.
 
     A Reduction op does not extend a Pointwise run.  Any Reduction
-    (matmul/BMM, sum, mean, ...) may **join** an open Pointwise run's group
-    when it reads a producer in that run and tiles the same shared logical
-    (output) dim at the same split count — e.g. an F.linear matmul reading its
-    auto-tiled restickified weight, or a plain ``sum`` reading a tiled
-    pointwise producer (see the reduction-join branch below and
-    ``_consumer_shares_group_tiled_dim``).  The join is reduction-type-
-    agnostic: what makes it safe is that the tiled dim is an output range, not
-    the reduction range (tile ``t`` is self-contained either way).  On
-    joining, the group is flushed immediately, so a reduction is always the
-    last member of a Pointwise-rooted group and each auto-tiled producer feeds
-    at most one reduction consumer.
+    (matmul/BMM, sum, mean, ...) may **join** an open run's group when it
+    reads a producer in that run and tiles the same shared logical (output)
+    dim at the same split count — e.g. an F.linear matmul reading its
+    auto-tiled restickified weight, a plain ``sum`` reading a tiled pointwise
+    producer, or a second matmul reading the first's tiled output (see the
+    reduction-join branch below and ``_consumer_shares_group_tiled_dim``).
+    The join is reduction-type-agnostic: what makes it safe is that the tiled
+    dim is an output range, not the reduction range (tile ``t`` is
+    self-contained either way).  On joining, the group is flushed immediately,
+    so a Reduction is always the last member of its group and each auto-tiled
+    producer feeds at most one reduction consumer.
 
     A Reduction that cannot join instead **opens its own run**
-    (``current_root_is_reduction``), so a directly-connected Pointwise
-    consumer can fuse into its loop (BMM -> PW).  Tile ``t`` of a
+    (``current_root_is_reduction``), so a directly-connected consumer can fuse
+    into its loop (BMM -> PW, BMM -> BMM, BMM -> sum).  Tile ``t`` of a
     Reduction's *output* dim is self-contained exactly as a Pointwise tile is,
     so the producer's per-tile slice feeds the consumer in the same iteration.
-    Such a consumer must additionally read the run and pass
-    ``_consumer_shares_group_tiled_dim`` — see that helper for why the
-    positional ``host_dim`` reuse the Pointwise paths rely on is not safe once
-    the producer is a Reduction.  If nothing joins, the run flushes to exactly
-    the singleton group an unjoined Reduction used to produce eagerly.
-    Chaining *past* a Reduction-rooted run's producer with another Reduction
-    (BMM -> BMM, BMM -> sum) is deliberately still rejected: the reduction-join
-    branch is gated to Pointwise-rooted runs, since that path has no on-device
-    validation yet.  An op that
+    A **Pointwise** consumer of such a run must additionally read the run and
+    pass ``_consumer_shares_group_tiled_dim`` — the Pointwise fast paths
+    otherwise reuse the run's ``host_dim`` positionally, which is unsound once
+    the producer is a Reduction (see that helper).  A **Reduction** consumer
+    already goes through that check on the join branch, which is also what
+    rejects a producer whose tiled dim lands on the consumer's reduction (K)
+    range.  If nothing joins, the run flushes to exactly the singleton group an
+    unjoined Reduction used to produce eagerly.  An op that
     reads a buffer from an already-closed group, or from the open run without
     being fusable into it, still raises ``Unsupported``: two independent loop
     nests over the same span-overflow-sized data can desynchronize, and for ops
@@ -542,14 +567,20 @@ def span_overflow_groups(
         # fails closed if the consumer tiles its reduction (K) range rather than
         # an output range (see its docstring) — only output-range tiles may join.
         #
-        # Restricted to Pointwise-rooted runs (``not current_root_is_reduction``).
-        # A Reduction-rooted run exists to let a Pointwise consumer fuse with a
-        # Reduction producer (BMM -> PW); letting a Reduction consumer join one
-        # too would silently enable Reduction -> Reduction chaining (BMM -> BMM,
-        # BMM -> sum), which every condition here would otherwise accept.  That
-        # path has no on-device numeric validation yet, so it stays rejected via
-        # the normal conflict path below rather than being enabled as a side
-        # effect of Reduction-rooted runs.
+        # The run may be Pointwise-rooted (PW -> BMM, the LM-head case) or
+        # Reduction-rooted (BMM -> BMM, BMM -> sum): what licenses the join is
+        # the shared *output*-range tile, not either op's type.  For a Reduction
+        # producer the correspondence check carries real weight rather than
+        # merely confirming an obvious pairing.  Consider chained matmuls,
+        # ``bmm(bmm(q, k), v)``: if the producer tiles its N dim and the
+        # consumer reads that buffer as its A operand, the producer's N *is* the
+        # consumer's K, so tile t of the producer is a partial slice of the
+        # consumer's reduction range and pairing them per-iteration would
+        # compute a partial sum and call it a result.  K never appears in the
+        # consumer's output coordinates, so the intersection is empty and
+        # _consumer_shares_group_tiled_dim rejects it — while the safe variants
+        # of the same chain (producer tiling B or M, or tiling N with the
+        # consumer reading it as its B operand) still verify and join.
         #
         # The group is flushed immediately after the reduction joins: a
         # reduction terminates the extendable run (its output shape/tiling
@@ -562,7 +593,6 @@ def span_overflow_groups(
         if (
             is_reduction_op
             and current_signature is not None
-            and not current_root_is_reduction
             and (read_deps & current_group_names)
             and [s for _, s, _ in signature] == [s for _, s, _ in current_signature]
             and _consumer_shares_group_tiled_dim(op, signature, current_group)
