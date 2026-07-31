@@ -214,13 +214,24 @@ op='batchmatmul'   # same loop, tiled on the corresponding output n dim
 
 The join is gated: split counts must match *and* the consumer's tiled loop
 variable must actually index the producer's tiled dim through the read
-(`_reduction_shares_group_tiled_dim`), so unrelated dims that merely share a
+(`_consumer_shares_group_tiled_dim`), so unrelated dims that merely share a
 split count are not fused.  A Reduction can only join on an **output**-range
 tile, never the reduction (`k`) range, and each auto-tiled producer feeds at
 most one reduction consumer.
 
 The join is reduction-type-agnostic: any Reduction (`sum`, `mean`, `max`,
 matmul/BMM, ...) tiled on a shared output dim may join.
+
+The reverse direction is also supported: a Reduction that joins nothing
+**opens a run of its own**, so a directly-connected Pointwise consumer can fuse
+into its loop (BMM → PW).  Tile `t` of a Reduction's output dim is
+self-contained just as a Pointwise tile is, so the BMM's per-tile result feeds
+the consumer in the same iteration rather than being materialized in full for a
+second loop nest.  Such a consumer must read the run *and* clear
+`_consumer_shares_group_tiled_dim`: a Reduction's output dims need not sit at
+the same positions as its consumer's, and the consumer inherits the run's
+`host_dim` positionally, so without that check it could conform against the
+wrong dim and be stamped with a desynchronizing `loop_var`.
 
 Code flow:
 
@@ -733,18 +744,28 @@ synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
    (b) an op's own plan disagrees but the op directly reads a buffer written
    by the open run and the run's split is *also* legal and sufficient for
    that op on its own (`can_conform_pointwise_tile`) — the op then adopts the
-   run's split instead of its own. A Reduction op does not start or extend
-   a run and is never a conform target, but any Reduction (matmul/BMM,
-   `sum`, `mean`, `max`, ...) may **join** an open run's group when it reads
-   a producer in that run and tiles the same shared output dim at the same
-   split count(s) — verified by `_reduction_shares_group_tiled_dim`, which
-   confirms the consumer's tiled loop variable actually indexes the
-   producer's tiled dim through the read (matching split counts alone do not
-   qualify). Only output-range tiles may join (never a reduction range). On
-   joining, the group is flushed immediately, so a reduction is always the
-   last member of its group and each auto-tiled producer feeds at most one
-   reduction consumer. A Reduction that cannot join gets an independent
-   singleton group, or raises `Unsupported` if it reads an auto-tiled producer;
+   run's split instead of its own. A Reduction op does not extend a
+   Pointwise run and is never a conform target, but any Reduction
+   (matmul/BMM, `sum`, `mean`, `max`, ...) may **join** an open Pointwise
+   run's group when it reads a producer in that run and tiles the same shared
+   output dim at the same split count(s) — verified by
+   `_consumer_shares_group_tiled_dim`, which confirms the consumer's tiled
+   loop variable actually indexes the producer's tiled dim through the read
+   (matching split counts alone do not qualify). Only output-range tiles may
+   join (never a reduction range). On joining, the group is flushed
+   immediately, so a reduction is always the last member of a
+   Pointwise-rooted group and each auto-tiled producer feeds at most one
+   reduction consumer.  A Reduction that joins nothing instead **opens a
+   Reduction-rooted run** (`current_root_is_reduction`) rather than being
+   emitted as a closed singleton, so a directly-connected Pointwise consumer
+   can fuse into its loop (BMM → PW).  Such a consumer must read the run *and*
+   clear `_consumer_shares_group_tiled_dim` — required, not belt-and-braces,
+   since a Reduction's output dim numbering need not match its consumer's
+   while the consumer inherits the run's `host_dim` positionally.  If nothing
+   joins, the run flushes to exactly the singleton group an unjoined Reduction
+   produced before.  The reduction-join above is gated to Pointwise-rooted
+   runs, so Reduction → Reduction chaining (BMM → BMM, BMM → `sum`) is still
+   rejected rather than enabled as a side effect;
 6. rejects any op that reads a buffer from an already-closed auto-tiled
    group, from a producer already tiled by a user `spyre_hint` (checked via
    the same `dim_hints` attribute `assign_dim_hints` leaves behind, since
@@ -863,21 +884,26 @@ violates the hardware span limit or silently creates unsynchronized tile loops.
   directly reads the run and can legally conform to the run's split
   (`can_conform_pointwise_tile` in `span_overflow_hint_analysis.py`).
   Pointwise ops are never grouped with each other across a closed group, and a
-  Reduction op never starts, extends, or conforms to a Pointwise run — but any
-  Reduction (matmul/BMM, `sum`, `mean`, `max`, ...) may **join** an open run's
-  group as its terminal member when it tiles the same shared output dim at the
-  same split count (see step 5 above); the group is flushed immediately on
-  joining, so a Reduction is always the last member of its group and never a
-  mid-chain link. What's still unsupported:
+  Reduction op never extends or conforms to a Pointwise run — but any
+  Reduction (matmul/BMM, `sum`, `mean`, `max`, ...) may **join** an open
+  Pointwise run's group as its terminal member when it tiles the same shared
+  output dim at the same split count (see step 5 above); the group is flushed
+  immediately on joining, so a Reduction is always the last member of a
+  Pointwise-rooted group. A Reduction that joins nothing instead opens its own
+  run, so a Pointwise consumer reading it can fuse into its loop (BMM → PW,
+  step 5b). What's still unsupported:
   - fusion across an already-closed group (a chain where an earlier producer's
     group already flushed before reaching the consumer);
   - a second consumer reading a producer that a Reduction has already joined
     (one auto-tiled producer feeds at most one Reduction consumer);
-  - Reduction-to-Reduction or Reduction-to-Pointwise chaining (nothing can
-    extend past a Reduction, since its output shape/tiling differs from its
-    inputs');
+  - Reduction-to-Reduction chaining (BMM → BMM, BMM → `sum`): the
+    reduction-join branch is gated to Pointwise-rooted runs, so a Reduction
+    consumer cannot join a Reduction-rooted run. Every other join condition
+    would accept it; the gate is explicit because that path has no on-device
+    numeric validation yet;
   - a Pointwise op that reads a tiled producer but cannot legally conform to
-    its split.
+    its split, or whose tiled loop var does not index the producer's tiled dim
+    (`_consumer_shares_group_tiled_dim`).
 
   In all of these, the adapter raises `Unsupported` instead of emitting two
   independent loop groups, since independent loop nests over the same
@@ -966,6 +992,19 @@ Current coverage includes:
 - a reduction-range tile (`is_reduction=True`) never joins even when split
   counts and read correspondence would otherwise qualify
   (`test_reduction_range_tile_never_joins`);
+- the BMM → PW direction: a Reduction producer opens a run that a Pointwise
+  consumer joins, by exact signature match or by conforming to the run's
+  split, each op keeping its own `loop_var`
+  (`test_bmm_producer_groups_with_pointwise_consumer`,
+  `test_pointwise_consumer_conforms_to_bmm_producer_split`);
+- the guards that keep that widening safe: rejection when the consumer's
+  tiled loop var does not index the producer's tiled dim, no join without a
+  real read edge, Reduction → Reduction chaining still rejected, and unrelated
+  neighbouring Reductions still landing in separate groups
+  (`test_bmm_producer_pointwise_consumer_rejected_when_dim_not_shared`,
+  `test_pointwise_not_reading_bmm_run_does_not_join_it`,
+  `test_bmm_rooted_run_does_not_accept_reduction_consumer`,
+  `test_two_independent_reductions_still_produce_separate_groups`);
 - a second consumer reading a producer already joined by another reduction is
   rejected with a distinct message
   (`test_second_reduction_consumer_of_joined_producer_rejected`);
