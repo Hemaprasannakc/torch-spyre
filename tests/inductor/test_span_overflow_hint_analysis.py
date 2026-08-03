@@ -1031,6 +1031,103 @@ class TestSpanOverflowGroups(InductorTestCase):
         self.assertEqual(producer.dim_hints[0].hint_id, consumer.dim_hints[0].hint_id)
         self.assertEqual(consumer.dim_hints[0].split_count, 5)
 
+    def _assert_joins_on_shared_dim(
+        self, producer, consumer, producer_host_dim=1, consumer_host_dim=2, split=5
+    ):
+        """Run the pass on a pair that should join, and assert it did.
+
+        Shared by the Reduction-producer matrix tests below.  The pass branches
+        on ``isinstance(op.data, Reduction)`` and never inspects
+        ``reduction_type``, so those tests vary only the two op types and reuse
+        one scenario rather than restating the patch stack each time.
+
+        ``host_coordinates`` is patched so the producer's tiled coordinate is
+        indexed by whichever symbol tiles the consumer's output dim -- i.e. the
+        correspondence holds and the join is licensed.
+        """
+        consumer_sym = _out_coords_for_bhld(None)[consumer_host_dim]
+
+        def fake_plan(op, _max_cores):
+            return self._fake_plan(
+                producer_host_dim if op.get_name() == "buf0" else consumer_host_dim,
+                split,
+            )
+
+        def host_coords(layout, dep, indirect):
+            coords = [sympy.Symbol(f"p{i}") for i in range(4)]
+            coords[producer_host_dim] = consumer_sym
+            return coords
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+                fake_plan,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
+                _out_coords_for_bhld,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.host_coordinates",
+                host_coords,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.indirect_sizes_from_op",
+                lambda op: {},
+            ),
+            config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
+        ):
+            groups = _apply_span_overflow(_graph([producer, consumer]))
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0][0], [producer, consumer])
+        self.assertEqual(producer.dim_hints[0].hint_id, consumer.dim_hints[0].hint_id)
+        self.assertEqual(producer.dim_hints[0].split_count, split)
+        self.assertEqual(consumer.dim_hints[0].split_count, split)
+        return groups
+
+    def test_non_matmul_reduction_producer_groups_with_pointwise_consumer(self):
+        """A plain ``sum`` **producer** opens a run its Pointwise consumer joins.
+
+        The sibling tests all use a batch-matmul producer.  Nothing in the pass
+        inspects ``reduction_type`` -- a run is opened by any op whose data is a
+        Reduction -- so a ``sum`` producer is supported by construction.  This
+        pins that, so the support is a tested claim rather than an inference
+        from the type check.
+        """
+        producer, consumer = self._reduction_producer_pointwise_consumer(
+            reduction_type="sum"
+        )
+        # Pointwise consumers join on an exact signature match, so both tile the
+        # same host_dim here (unlike the Reduction-consumer cases, which match on
+        # split count across differing positions).
+        self._assert_joins_on_shared_dim(
+            producer, consumer, producer_host_dim=1, consumer_host_dim=1
+        )
+        self.assertEqual(producer.dim_hints[0].loop_var, sympy.Symbol("h"))
+        self.assertEqual(consumer.dim_hints[0].loop_var, sympy.Symbol("h"))
+
+    def test_non_matmul_reduction_producer_groups_with_reduction_consumer(self):
+        """Reduction -> Reduction with **neither** side a matmul (``sum`` ->
+        ``sum``).  Completes the producer/consumer type matrix: the join is
+        licensed by the shared output-range tile, not by either op being a
+        batch-matmul."""
+        producer, consumer = self._reduction_producer_reduction_consumer(
+            producer_type="sum", consumer_type="sum"
+        )
+        self._assert_joins_on_shared_dim(producer, consumer)
+        self.assertEqual(producer.dim_hints[0].loop_var, sympy.Symbol("h"))
+        self.assertEqual(consumer.dim_hints[0].loop_var, sympy.Symbol("l"))
+
+    def test_non_matmul_reduction_producer_groups_with_bmm_consumer(self):
+        """A plain ``sum`` producer read by a matmul consumer -- the remaining
+        cell of the producer/consumer type matrix, and the mirror of
+        ``test_bmm_producer_groups_with_non_matmul_reduction_consumer``."""
+        producer, consumer = self._reduction_producer_reduction_consumer(
+            producer_type="sum", consumer_type=BATCH_MATMUL_OP
+        )
+        self._assert_joins_on_shared_dim(producer, consumer)
+
     def test_bmm_to_bmm_rejected_when_producer_tiles_consumer_reduction_dim(self):
         """The wrong-answer case Reduction -> Reduction grouping makes
         reachable, and the reason the correspondence check is load-bearing
