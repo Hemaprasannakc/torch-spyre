@@ -2398,8 +2398,11 @@ def _insert_read_copy_ops(
                     tile_size_ints.append(int(tile_ranges[it_idx]))
                     it_idx += 1
             if it_idx != len(tile_ranges):
-                # TODO(#3197): support tiled ops whose iteration space does not
-                # map one-to-one onto an input's dimensions.
+                # TODO(span-overflow-read-copy): support tiled ops whose
+                # iteration space does not map one-to-one onto an input's
+                # dimensions.  Replace this marker with the tracking issue
+                # number once filed; the three xfailed tests named at the
+                # bottom of this comment are the ones it unblocks.
                 #
                 # The walk above pairs each of full_buf's non-unit dims with
                 # the next entry of tile_ranges (== dep.size, the op's
@@ -2433,8 +2436,26 @@ def _insert_read_copy_ops(
                 # Only the POST-stickify caller reaches here -- manual
                 # spyre_hint runs pre-stickify, gets a plain FixedLayout, and
                 # takes the else branch below.  Manual tiling of this exact
-                # 4-D bmm batch-dim case is verified working end to end, so
-                # what is missing is this branch, not the tiling machinery.
+                # 4-D bmm batch-dim case is verified working end to end
+                # (test_bmm_to_pointwise_join_numeric_via_manual_hint), so what
+                # is missing is this branch, not the tiling machinery.
+                #
+                # #3293 moved the hint path pre-stickify specifically so
+                # stickification builds the layout from already-divided ranges,
+                # "eliminating _resize_device_layout" -- and noted the
+                # span-overflow path "retains the FixedTiledLayout construction
+                # with _resize_device_layout as before".  Span-overflow cannot
+                # follow: it needs device_layout to measure spans at all, so it
+                # cannot run pre-stickify.  It is therefore the last caller on
+                # that path, which is likely why this gap survived.  Worth
+                # settling whether the fix is to repair the resize or to have
+                # stickification supply this layout, before investing in the
+                # former.
+                #
+                # Blocks: test_bmm_to_pointwise_join_numeric,
+                # test_bmm_to_reduction_join_numeric (this branch), and
+                # test_lm_head_matmul_join_numeric (xfailed since #3218 with
+                # the identical failure).
                 #
                 # Raise Unsupported rather than letting the bare assert fire:
                 # this is a known gap reachable from ordinary user code, so it

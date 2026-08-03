@@ -1662,8 +1662,7 @@ class TestSpanOverflowGroups(InductorTestCase):
         ):
             with self.assertRaisesRegex(
                 Unsupported,
-                "already auto-tiled producer.*whose coarse-tile group is "
-                "already closed",
+                "already-tiled producer.*not in an open group this op can join",
             ):
                 _apply_span_overflow(_graph([producer, consumer]))
 

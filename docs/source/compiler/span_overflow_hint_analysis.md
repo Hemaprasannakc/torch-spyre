@@ -937,9 +937,14 @@ violates the hardware span limit or silently creates unsynchronized tile loops.
   that are both inside the same manual `spyre_hint` group are unaffected,
   since users can explicitly group them into one shared coarse-tile group; the
   conflict check only fires when an *automatically*-tiled op reads a
-  manually-hinted producer that it was not itself grouped with. A typical
-  failure still looks like `Cannot auto-tile buf0: it reads already auto-tiled
-  producer(s) ['buf1']`.
+  manually-hinted producer that it was not itself grouped with.
+
+  Two distinct rejection messages tell these cases apart. Reading a producer
+  whose group has already been flushed — or one tiled by a user `spyre_hint` —
+  gives `it reads already-tiled producer(s) [...] that are not in an open group
+  this op can join`. Reading a producer in the *open* group but failing a join
+  condition gives `it reads auto-tiled producer(s) [...] in the open group but
+  cannot join them`, followed by the conditions a consumer must satisfy.
 - The planner does not yet model expected Work Division splits when choosing
   coarse-tile counts.  Candidate detection uses `core_split_estimate=1`, so
   coarse tiling must make spans safe by itself.  This is conservative and avoids
@@ -1025,6 +1030,16 @@ Current coverage includes:
   each op keeping its own `loop_var`
   (`test_bmm_producer_groups_with_bmm_consumer`,
   `test_bmm_producer_groups_with_non_matmul_reduction_consumer`);
+- the same three directions with a **non-matmul Reduction producer**
+  (`sum` → Pointwise, `sum` → `sum`, `sum` → matmul), completing the
+  producer/consumer type matrix.  The pass branches on
+  `isinstance(op.data, Reduction)` and never inspects `reduction_type`, so
+  this is support by construction — these pin it as a tested claim rather
+  than an inference from the type check, and the `sum` → `sum` case has
+  neither side a matmul
+  (`test_non_matmul_reduction_producer_groups_with_pointwise_consumer`,
+  `test_non_matmul_reduction_producer_groups_with_reduction_consumer`,
+  `test_non_matmul_reduction_producer_groups_with_bmm_consumer`);
 - the guards that keep that widening safe: rejection when the consumer's
   tiled loop var does not index the producer's tiled dim, no join without a
   real read edge, and unrelated neighbouring Reductions still landing in
@@ -1066,6 +1081,17 @@ Current coverage includes:
   Reduction-consumer one matters most: a consumer paired against the wrong
   producer slice does not crash, it returns a partial sum, so only a CPU
   comparison distinguishes it from a correct result.
+
+  Both are currently `expectedFailure` against a pre-existing limitation in
+  `_insert_read_copy_ops` (see the TODO there), which also keeps
+  `test_lm_head_matmul_join_numeric` xfailed from #3218. Their **passing**
+  counterpart is `test_bmm_to_pointwise_join_numeric_via_manual_hint`: the same
+  shapes, tiled dim and resulting BMM → PW group requested through a manual
+  `spyre_hint` instead, compared against a CPU reference. It localizes the gap
+  — the grouping, the shared loop nest and the per-tile addressing are all
+  correct on hardware, and only the post-stickify caller is blocked, because
+  `_maybe_coarse_tile_hints` runs pre-stickification and takes the plain
+  `FixedLayout` branch instead.
 
 ## Key Files
 

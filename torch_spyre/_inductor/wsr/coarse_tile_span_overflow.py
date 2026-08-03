@@ -467,10 +467,12 @@ def span_overflow_groups(
                     "auto-tiled producer is not yet supported (#3217)."
                 )
             raise Unsupported(
-                f"Cannot auto-tile {op.get_name()}: it reads already auto-tiled "
-                f"producer(s) {completed_conflicts} whose coarse-tile group is "
-                "already closed. Automatic span-overflow grouping can only fuse "
-                "a consumer into a producer's group while that group is still "
+                f"Cannot auto-tile {op.get_name()}: it reads already-tiled "
+                f"producer(s) {completed_conflicts} that are not in an open "
+                "group this op can join — either their coarse-tile group has "
+                "already been flushed, or they were tiled by a user "
+                "spyre_hint. Automatic span-overflow grouping can only fuse a "
+                "consumer into a producer's group while that group is still "
                 "open (the producers must be contiguous with the consumer), so "
                 "tiling this producer and consumer independently can produce "
                 "unsynchronized loop nests."
