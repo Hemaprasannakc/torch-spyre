@@ -1031,6 +1031,88 @@ class TestSpanOverflowGroups(InductorTestCase):
         self.assertEqual(producer.dim_hints[0].hint_id, consumer.dim_hints[0].hint_id)
         self.assertEqual(consumer.dim_hints[0].split_count, 5)
 
+    def test_bmm_producer_chain_through_pointwise_to_bmm_consumer(self):
+        """A three-op chain lands in ONE group: bmm -> pointwise -> bmm.
+
+        The two-op tests each cover a single join.  This covers the property
+        that makes those joins useful together: a Reduction-rooted run is not
+        closed by a Pointwise member, so the run survives 'buf1' and is still
+        open when the second matmul arrives.  That is the shape attention has
+        (matmul -> softmax -> matmul), and without it a chain could only ever
+        fuse two ops.
+
+        Also pins where the run *does* close: 'buf2' is a Reduction consumer,
+        so it joins and flushes.  Anything after it would be rejected, which
+        ``test_reduction_consumer_still_terminates_its_group`` covers.
+        """
+        producer = _reduction_op(
+            _E2E_SHAPE, name="buf0", reduction_type=BATCH_MATMUL_OP
+        )
+        middle = _pointwise_op(_E2E_SHAPE, name="buf1")
+        consumer = _reduction_op(
+            _E2E_SHAPE, name="buf2", reduction_type=BATCH_MATMUL_OP
+        )
+
+        def _reads(buf_name, sym):
+            return MagicMock(
+                return_value=SimpleNamespace(
+                    reads={MemoryDep(buf_name, sym, (sym,), (8195,))},
+                    writes=_default_read_writes_for_output(
+                        "buf1" if buf_name == "buf0" else "buf2",
+                        _E2E_SHAPE,
+                        middle.layout,
+                    ).writes,
+                )
+            )
+
+        middle.get_read_writes = _reads("buf0", sympy.Symbol("h"))
+        consumer.get_read_writes = _reads("buf1", sympy.Symbol("h"))
+
+        def fake_plan(op, _max_cores):
+            # buf0/buf1 tile host_dim=1 (h); buf2 tiles host_dim=2 (l).  The
+            # pointwise joins on an exact signature match, the matmul on the
+            # shared split count across differing positions.
+            return self._fake_plan(2 if op.get_name() == "buf2" else 1, 5)
+
+        def host_coords(layout, dep, indirect):
+            # Each read's producer must be indexed by the symbol tiling the
+            # consumer's own output dim: buf1 tiles h and reads buf0, buf2
+            # tiles l and reads buf1.
+            sym = sympy.Symbol("h") if dep.name == "buf0" else sympy.Symbol("l")
+            return [sympy.Symbol("b"), sym, sympy.Symbol("x"), sympy.Symbol("y")]
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+                fake_plan,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
+                _out_coords_for_bhld,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.host_coordinates",
+                host_coords,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.indirect_sizes_from_op",
+                lambda op: {},
+            ),
+            config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
+        ):
+            groups = _apply_span_overflow(_graph([producer, middle, consumer]))
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0][0], [producer, middle, consumer])
+        shared_hint = producer.dim_hints[0].hint_id
+        for op in (producer, middle, consumer):
+            self.assertEqual(op.dim_hints[0].hint_id, shared_hint)
+            self.assertEqual(op.dim_hints[0].split_count, 5)
+        # Each op still resolves its own loop_var: buf0/buf1 tile h, buf2 l.
+        self.assertEqual(producer.dim_hints[0].loop_var, sympy.Symbol("h"))
+        self.assertEqual(middle.dim_hints[0].loop_var, sympy.Symbol("h"))
+        self.assertEqual(consumer.dim_hints[0].loop_var, sympy.Symbol("l"))
+
     def _assert_joins_on_shared_dim(
         self, producer, consumer, producer_host_dim=1, consumer_host_dim=2, split=5
     ):

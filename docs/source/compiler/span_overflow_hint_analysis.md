@@ -1030,6 +1030,12 @@ Current coverage includes:
   each op keeping its own `loop_var`
   (`test_bmm_producer_groups_with_bmm_consumer`,
   `test_bmm_producer_groups_with_non_matmul_reduction_consumer`);
+- a three-op chain `bmm -> pointwise -> bmm` landing in **one** group, which is
+  what makes the individual joins useful together: a Reduction-rooted run is
+  not closed by a Pointwise member, so it survives to the second matmul. This
+  is attention's shape (matmul → softmax → matmul); without it a chain could
+  only ever fuse two ops
+  (`test_bmm_producer_chain_through_pointwise_to_bmm_consumer`);
 - the same three directions with a **non-matmul Reduction producer**
   (`sum` → Pointwise, `sum` → `sum`, `sum` → matmul), completing the
   producer/consumer type matrix.  The pass branches on
