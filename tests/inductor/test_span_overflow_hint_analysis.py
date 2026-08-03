@@ -3217,6 +3217,54 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
                 rtol=0.05,
             )
 
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
+    def test_bmm_to_pointwise_join_numeric_via_manual_hint(self):
+        """The BMM -> PW group this branch builds automatically, executed for
+        real -- but requested with a manual ``spyre_hint`` instead.
+
+        Same shapes, same tiled dim, same resulting group as
+        ``test_bmm_to_pointwise_join_numeric``; only *who asks for the tile*
+        differs.  This passes, which localizes the gap precisely: grouping a
+        BMM producer with a pointwise consumer, the shared loop nest, and the
+        per-tile addressing are all correct on hardware for this exact case.
+
+        The automatic version is xfailed because the two callers reach
+        different code: ``_maybe_coarse_tile_hints`` runs PRE-stickification,
+        so the operands still carry a plain ``FixedLayout`` and
+        ``_insert_read_copy_ops`` takes its ``else`` branch, while
+        ``_maybe_coarse_tile_span_overflow`` runs POST-stickification, hits the
+        ``FixedTiledLayout`` branch, and cannot map a bmm's iteration space
+        onto an operand's dimensions (see the TODO there).
+
+        Kept here rather than in ``test_coarse_tile_e2e.py`` because its value
+        is as the control for the two xfailed tests above -- it is what they
+        should look like once that branch is fixed.
+        """
+        from torch_spyre._inductor import spyre_hint
+
+        torch.manual_seed(0xAFFE)
+        B, H, M, K, N = 1, 20, 16, 64, 32
+        a = torch.randn(B, H, M, K, dtype=torch.float16) * 0.1
+        b = torch.randn(B, H, K, N, dtype=torch.float16) * 0.1
+        for dim_name, size in (("B", B), ("H", H), ("M", M), ("K", K), ("N", N)):
+            _pnd.declare_tensor_dim(dim_name, size)
+
+        def fn(a, b):
+            _pnd.name_tensor_dims(a, ["B", "H", "M", "K"])
+            _pnd.name_tensor_dims(b, ["B", "H", "K", "N"])
+            with spyre_hint(num_tiles_per_dim={"H": 5}):
+                return torch.matmul(a, b) * 2.0
+
+        compare_with_cpu(
+            fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
+        )
+
     @staticmethod
     def _forced_plan_on_host_dim1(split_count, expect_size):
         """Force every op whose output dim 1 is ``expect_size`` onto one plan.
