@@ -576,8 +576,8 @@ class TestSpanOverflowGroups(InductorTestCase):
         ):
             with self.assertRaisesRegex(
                 Unsupported,
-                "already auto-tiled producer.*grouping currently only synchronizes "
-                "compatible contiguous pointwise ops",
+                "reads auto-tiled producer.*cannot join them.*same shared "
+                "output dimension at the same split count",
             ):
                 _apply_span_overflow(_graph([producer, matmul]))
 
@@ -702,8 +702,8 @@ class TestSpanOverflowGroups(InductorTestCase):
         ):
             with self.assertRaisesRegex(
                 Unsupported,
-                "already auto-tiled producer.*grouping currently only synchronizes "
-                "compatible contiguous pointwise ops",
+                "reads auto-tiled producer.*cannot join them.*same shared "
+                "output dimension at the same split count",
             ):
                 _apply_span_overflow(_graph([producer, reduction]))
 
@@ -871,8 +871,8 @@ class TestSpanOverflowGroups(InductorTestCase):
         ):
             with self.assertRaisesRegex(
                 Unsupported,
-                "already auto-tiled producer.*buf0.*grouping currently only "
-                "synchronizes compatible contiguous pointwise ops",
+                "reads auto-tiled producer.*buf0.*cannot join them.*same "
+                "shared output dimension at the same split count",
             ):
                 _apply_span_overflow(_graph([producer, consumer]))
 
@@ -1082,8 +1082,8 @@ class TestSpanOverflowGroups(InductorTestCase):
         ):
             with self.assertRaisesRegex(
                 Unsupported,
-                "already auto-tiled producer.*buf0.*grouping currently only "
-                "synchronizes compatible contiguous pointwise ops",
+                "reads auto-tiled producer.*buf0.*cannot join them.*same "
+                "shared output dimension at the same split count",
             ):
                 _apply_span_overflow(_graph([producer, consumer]))
 
@@ -1150,8 +1150,8 @@ class TestSpanOverflowGroups(InductorTestCase):
         ):
             with self.assertRaisesRegex(
                 Unsupported,
-                "already auto-tiled producer.*buf0.*grouping currently only "
-                "synchronizes compatible contiguous pointwise ops",
+                "reads auto-tiled producer.*buf0.*cannot join them.*same "
+                "shared output dimension at the same split count",
             ):
                 _apply_span_overflow(_graph([producer, consumer]))
 
@@ -1339,8 +1339,8 @@ class TestSpanOverflowGroups(InductorTestCase):
         ):
             with self.assertRaisesRegex(
                 Unsupported,
-                "already auto-tiled producer.*grouping currently only synchronizes "
-                "compatible contiguous pointwise ops",
+                "reads auto-tiled producer.*cannot join them.*same shared "
+                "output dimension at the same split count",
             ):
                 _apply_span_overflow(_graph([producer, reduction]))
 
@@ -1429,8 +1429,8 @@ class TestSpanOverflowGroups(InductorTestCase):
         ):
             with self.assertRaisesRegex(
                 Unsupported,
-                "already auto-tiled producer.*buf0.*grouping currently only "
-                "synchronizes compatible contiguous pointwise ops",
+                "reads auto-tiled producer.*buf0.*cannot join them.*same "
+                "shared output dimension at the same split count",
             ):
                 _apply_span_overflow(_graph([op0, op1]))
 
@@ -1565,8 +1565,8 @@ class TestSpanOverflowGroups(InductorTestCase):
         ):
             with self.assertRaisesRegex(
                 Unsupported,
-                "already auto-tiled producer.*grouping currently only synchronizes "
-                "compatible contiguous pointwise ops",
+                "already auto-tiled producer.*whose coarse-tile group is "
+                "already closed",
             ):
                 _apply_span_overflow(_graph([producer, consumer]))
 
@@ -3116,6 +3116,179 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
                 run_compile=True,
                 run_eager=False,
                 source_check=report_join_evidence,
+                atol=0.05,
+                rtol=0.05,
+            )
+
+    @staticmethod
+    def _forced_plan_on_host_dim1(split_count, expect_size):
+        """Force every op whose output dim 1 is ``expect_size`` onto one plan.
+
+        The sibling pointwise test scopes its forced plan by buffer *name*
+        ('buf0'/'buf1'), which it could only do because a real hardware run
+        surfaced those names in an ``Unsupported`` message first.  A matmul
+        graph lowers to more buffers than that (a restickified operand among
+        them) and their names are not knowable without running it, so these
+        tests key on the output shape instead: any op carrying the shared
+        tiled dim gets the shared plan, and anything else falls back to the
+        real planner rather than being handed a nonsensical tile.
+
+        Divisibility is checked here rather than left to ``coarse_tile``, so a
+        bad ``split_count`` fails as a plain assertion in the test setup
+        instead of as an ``Unsupported`` from deep in the pass.
+        """
+        real_plan = plan_span_overflow_tile
+        assert expect_size % split_count == 0
+
+        def forced(op, max_cores):
+            ranges = list(getattr(op.data, "ranges", None) or [])
+            try:
+                shares_tiled_dim = len(ranges) >= 2 and int(ranges[1]) == expect_size
+            except (TypeError, ValueError):
+                shares_tiled_dim = False
+            if not shares_tiled_dim:
+                return real_plan(op, max_cores)
+            return SpanOverflowTilePlan(
+                levels=(
+                    SpanOverflowTileLevel(selected_host_dim=1, split_count=split_count),
+                ),
+                chunking_infos=(
+                    ChunkingInfo(
+                        total_bytes=1,
+                        per_core_span=1,
+                        core_split_estimate=1,
+                        selected_device_dim_size=split_count,
+                        selected_device_span_stride_elems=1,
+                        selected_host_dim=1,
+                        stick_elems=64,
+                        reason="forced for numeric join validation",
+                    ),
+                ),
+                reason="forced for numeric join validation",
+            )
+
+        return forced
+
+    def _assert_single_loop_spec(self, *expected_ops):
+        """Return a source_check asserting one shared LoopSpec over the ops.
+
+        Load-bearing: without it these pass even if the join never happened
+        and each op got its own loop (or tiling was skipped entirely), which
+        is exactly the failure mode they exist to catch.
+        """
+
+        def check(src):
+            loop_spec_count = src.count("LoopSpec(")
+            present = {name: (f"op='{name}'" in src) for name in expected_ops}
+            print(
+                f"[join evidence] LoopSpec count={loop_spec_count}; "
+                + "; ".join(f"op='{k}' present={v}" for k, v in present.items())
+            )
+            self.assertEqual(
+                loop_spec_count,
+                1,
+                "expected producer and consumer to share one LoopSpec (a real "
+                "join), since plan_span_overflow_tile was forced to agree for "
+                "both ops -- source:\n" + src,
+            )
+            for name, found in present.items():
+                self.assertTrue(found, f"expected op='{name}' in source:\n{src}")
+
+        return check
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_bmm_to_pointwise_join_numeric(self):
+        """A BMM producer whose Pointwise consumer joins its group -- the
+        BMM -> PW direction -- executed for real and compared against a CPU
+        reference.
+
+        Every other BMM -> PW test mocks kernel launch and inspects the
+        grouping decision only.  A group can be structurally perfect and still
+        compute wrong values: the producer's per-tile output becomes
+        loop-internal scratch that the consumer reads in the same iteration,
+        and nothing but a real run proves that per-tile addressing pairs the
+        right slices.
+
+        The plan is forced so both ops tile host_dim=1 at split 5 (the
+        technique the sibling pointwise test settled on after an organic-plan
+        version failed on hardware, because the two ops' independent span
+        searches do not land on the same split for a toy shape).  Kernel
+        launch is NOT mocked, so the forced plan still runs for real.
+        """
+        torch.manual_seed(0xAFFE)
+        H = 20
+        a = torch.randn(1, H, 16, 64, dtype=torch.float16)
+        b = torch.randn(1, H, 64, 32, dtype=torch.float16)
+
+        def fn(a, b):
+            return torch.matmul(a, b) * 2.0
+
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+            self._forced_plan_on_host_dim1(5, H),
+        ):
+            compare_with_cpu(
+                fn,
+                a,
+                b,
+                run_compile=True,
+                run_eager=False,
+                source_check=self._assert_single_loop_spec(BATCH_MATMUL_OP, "mul"),
+                atol=0.05,
+                rtol=0.05,
+            )
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_bmm_to_reduction_join_numeric(self):
+        """A BMM producer whose Reduction consumer joins its group -- the
+        BMM -> Reduction direction -- executed for real.
+
+        This is the direction with the most room to go silently wrong: a
+        Reduction consumer paired against the wrong producer slice does not
+        crash, it computes a partial sum and returns it.  A CPU comparison is
+        the only thing that distinguishes that from a correct result, which is
+        why this test exists rather than relying on the grouping unit tests.
+
+        ``sum(dim=2)`` reduces a dim that is neither op's tiled dim, so the
+        tiled dim stays an output range for both -- the case the join is
+        licensed for.  The complementary illegal case (producer tiling a dim
+        that is the consumer's reduction range) is covered structurally by
+        ``test_bmm_to_bmm_rejected_when_producer_tiles_consumer_reduction_dim``,
+        which asserts it is refused rather than executed.
+        """
+        torch.manual_seed(0xAFFE)
+        H = 20
+        a = torch.randn(1, H, 16, 64, dtype=torch.float16)
+        b = torch.randn(1, H, 64, 32, dtype=torch.float16)
+
+        def fn(a, b):
+            return torch.matmul(a, b).sum(dim=2)
+
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+            self._forced_plan_on_host_dim1(5, H),
+        ):
+            compare_with_cpu(
+                fn,
+                a,
+                b,
+                run_compile=True,
+                run_eager=False,
+                source_check=self._assert_single_loop_spec(BATCH_MATMUL_OP, "sum"),
                 atol=0.05,
                 rtol=0.05,
             )

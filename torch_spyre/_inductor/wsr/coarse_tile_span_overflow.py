@@ -468,10 +468,12 @@ def span_overflow_groups(
                 )
             raise Unsupported(
                 f"Cannot auto-tile {op.get_name()}: it reads already auto-tiled "
-                f"producer(s) {completed_conflicts}. Automatic span-overflow "
-                "grouping currently only synchronizes compatible contiguous "
-                "pointwise ops, so tiling this producer and consumer independently "
-                "can produce unsynchronized loop nests."
+                f"producer(s) {completed_conflicts} whose coarse-tile group is "
+                "already closed. Automatic span-overflow grouping can only fuse "
+                "a consumer into a producer's group while that group is still "
+                "open (the producers must be contiguous with the consumer), so "
+                "tiling this producer and consumer independently can produce "
+                "unsynchronized loop nests."
             )
 
         is_reduction_op = isinstance(op.data, Reduction)
@@ -617,11 +619,15 @@ def span_overflow_groups(
                 pending_conflicts,
             )
             raise Unsupported(
-                f"Cannot auto-tile {op.get_name()}: it reads already auto-tiled "
-                f"producer(s) {pending_conflicts}. Automatic span-overflow "
-                "grouping currently only synchronizes compatible contiguous "
-                "pointwise ops, so tiling this producer and consumer independently "
-                "can produce unsynchronized loop nests."
+                f"Cannot auto-tile {op.get_name()}: it reads auto-tiled "
+                f"producer(s) {pending_conflicts} in the open group but cannot "
+                "join them. Automatic span-overflow grouping requires the "
+                "consumer to tile the same shared output dimension at the same "
+                "split count(s) as the producer — its tiled loop variable must "
+                "actually index the producer's tiled dim through the read (a "
+                "Pointwise consumer may instead conform to the producer's "
+                "split). Tiling this producer and consumer independently can "
+                "produce unsynchronized loop nests."
             )
 
         if not is_reduction_op:

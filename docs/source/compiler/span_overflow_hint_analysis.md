@@ -1057,6 +1057,15 @@ Current coverage includes:
   rates against the same CPU reference to separate ordinary fp16
   accumulation noise from join-introduced error), in
   `TestSpanOverflowNumericValidation`.
+- on-device numeric validation of the Reduction-*producer* directions —
+  `test_bmm_to_pointwise_join_numeric` and `test_bmm_to_reduction_join_numeric`,
+  also in `TestSpanOverflowNumericValidation`. Both force the shared plan (the
+  real planner's independent searches do not agree on a toy shape) but do not
+  mock kernel launch, and both assert a single shared `LoopSpec` — without that
+  assertion they would pass even if the join never happened. The
+  Reduction-consumer one matters most: a consumer paired against the wrong
+  producer slice does not crash, it returns a partial sum, so only a CPU
+  comparison distinguishes it from a correct result.
 
 ## Key Files
 
