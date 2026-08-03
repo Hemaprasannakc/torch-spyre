@@ -2398,23 +2398,30 @@ def _insert_read_copy_ops(
                     tile_size_ints.append(int(tile_ranges[it_idx]))
                     it_idx += 1
             if it_idx != len(tile_ranges):
-                # TODO(#3197): support tiled Reduction ops whose iteration
-                # space does not map one-to-one onto an input's dimensions.
+                # TODO(#3197): support tiled ops whose iteration space does not
+                # map one-to-one onto an input's dimensions.
                 #
                 # The walk above pairs each of full_buf's non-unit dims with
                 # the next entry of tile_ranges (== dep.size, the op's
-                # iteration extents).  That holds for Pointwise, where the
-                # iteration space *is* the buffer shape, and for a matmul
-                # tiled on M/K whose operands use every loop var.  It does not
-                # hold for a bmm tiled on a batch dim:
+                # iteration extents), assuming the two have the same number of
+                # non-unit entries.  That holds only when every input has the
+                # output's shape.  Three ways it breaks, all the same failure:
                 #
-                #     out[b, m, n] = sum_k A[b, m, k] * B[b, k, n]
-                #
-                # the loop carries b/m/n/k while A has no n dimension at all,
-                # so one extent is left over.  B is worse -- its dims run
-                # b/k/n against a b/m/n/k loop, so even after dropping the
-                # unused var the orders disagree and a positional walk would
-                # hand k's extent to n's dimension.
+                #   * broadcast input of lower rank -- an rmsnorm weight
+                #     (16384,) against an iteration space [16, 1000, 16384]:
+                #     one buffer dim, three extents.  Note the walk does not
+                #     merely run out, it pairs the 16384 dim with extent 16, so
+                #     without this check it would build a wrong buffer rather
+                #     than fail;
+                #   * broadcast input with leading unit dims -- a rope cos
+                #     (1, 1, 2048, 2048) against [32, 16, 1024, 2048]: the two
+                #     1s are skipped, leaving two extents unconsumed;
+                #   * a reduction whose input does not use every loop var --
+                #     out[b, m, n] = sum_k A[b, m, k] * B[b, k, n] carries
+                #     b/m/n/k while A has no n dimension at all.  B is worse
+                #     still: its dims run b/k/n against a b/m/n/k loop, so even
+                #     after dropping the unused var the orders disagree and a
+                #     positional walk would hand k's extent to n's dimension.
                 #
                 # Both need dimension matching via dep.index's coefficients
                 # rather than by position.  That was attempted and reverted:
@@ -2438,9 +2445,11 @@ def _insert_read_copy_ops(
                     f"{dep.name!r} for {tiled_op.get_name()!r}: its iteration "
                     f"extents {list(tile_ranges)} do not map one-to-one onto "
                     f"the buffer's dimensions {full_size_ints}. Automatic "
-                    "span-overflow tiling of a reduction whose input does not "
-                    "use every loop variable (e.g. a batch-tiled bmm operand) "
-                    "is not yet supported."
+                    "span-overflow tiling is not yet supported for inputs "
+                    "that do not share the output's shape — a broadcast input "
+                    "(lower rank, or leading unit dims), or a reduction input "
+                    "that does not use every loop variable such as a "
+                    "batch-tiled bmm operand."
                 )
             # Authoritative stick host dim from coordinate identity (issue
             # #3116); None falls back to size-based inference inside
