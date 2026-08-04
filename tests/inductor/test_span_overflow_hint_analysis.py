@@ -3644,8 +3644,18 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
     # _insert_read_copy_ops handles a tiled *Pointwise* reading a full buffer
     # (test_pointwise_to_pointwise_join_numeric passes, and its add reads graph
     # inputs) but not a tiled *Reduction*.  A matmul trips the rank assert; a
-    # sum clears it and yields a kernel the backend rejects.  Possibly the same
-    # dxp_standalone SIGABRT as #3414.
+    # sum clears it and yields a kernel the backend rejects.
+    #
+    # The backend's own diagnostic, captured by re-running its command:
+    #
+    #   terminate called after throwing an instance of 'DtException'
+    #     what():  DtException: Could not find any suitable dimension mapping,
+    #              file /project_src/deeptools/ddc/ddl/ddl_conversion.cpp line 2497
+    #
+    # So deeptools cannot map the tiled reduction's dimensions during DDL
+    # conversion, throws, and nobody catches it -- hence SIGABRT rather than a
+    # diagnosable error.  This is NOT #3414, which is a different failure in a
+    # different place ("Immediate value out of boundary ... L3_ADDEARIMM").
     #
     # Codegen depth for all three passes -- see
     # TestSpanOverflowPointwiseCodegen -- so these isolate execution alone.

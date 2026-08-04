@@ -1042,7 +1042,11 @@ Current coverage includes:
   `sum` too), reading a full-size buffer does not.  So
   `_insert_read_copy_ops` handles a tiled Pointwise reading a full buffer but
   not a tiled Reduction: a matmul trips its rank assert, a `sum` clears the
-  assert and yields a kernel the backend rejects;
+  assert and yields a kernel the backend rejects with
+  `DtException: Could not find any suitable dimension mapping`
+  (`ddl_conversion.cpp:2497`), uncaught, hence SIGABRT rather than a
+  diagnosable error.  Distinct from #3414, which fails elsewhere with
+  `Immediate value out of boundary ... L3_ADDEARIMM`;
 - on-device execution of Pointwise -> Pointwise
   (`test_pointwise_to_pointwise_join_numeric`).  The oldest automatic direction
   (#3058) had codegen-only coverage until now -- its numbers had never been
