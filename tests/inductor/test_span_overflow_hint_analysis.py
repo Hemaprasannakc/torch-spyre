@@ -3087,6 +3087,149 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
             lambda x: x.sum(dim=2).sum(dim=-1), x, expect_ops=("sum",)
         )
 
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_pointwise_producer_to_pointwise_codegen_shares_one_loop_spec(self):
+        """Pointwise -> Pointwise, the oldest supported direction (#3058).
+
+        ``test_codegen_contains_auto_span_overflow_loop_spec`` covers a *single*
+        tiled op; this covers a two-op producer/consumer group, so the matrix
+        below has a baseline that predates this branch.
+        """
+        x = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        y = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        self._assert_one_loop_spec(
+            lambda x, y: (x + y) * 2.0, x, y, expect_ops=("add", "mul")
+        )
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_pointwise_producer_to_reduction_codegen_shares_one_loop_spec(self):
+        """Pointwise -> Reduction (#3270), at codegen depth.
+
+        Its on-device counterpart
+        (``test_pointwise_to_non_matmul_reduction_join_numeric``) already
+        passes; this pins the same direction one layer earlier so a codegen
+        regression is distinguishable from an execution one.
+        """
+        x = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        y = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        self._assert_one_loop_spec(
+            lambda x, y: (x + y).sum(dim=2), x, y, expect_ops=("add", "sum")
+        )
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_reduction_producer_to_bmm_codegen_shares_one_loop_spec(self):
+        """Reduction -> matmul reaches codegen -- the one matmul direction that
+        currently can.
+
+        Worth pinning precisely because it is the exception.  Every other
+        matmul direction is stopped in ``_insert_read_copy_ops`` (see the
+        xfailed tests below).  This one survives only because ``keepdim=True``
+        leaves M=1, which is squeezed out of the iteration space and happens to
+        make the ranks line up again -- so it is a shape coincidence, not
+        matmul support.  If the read-copy limitation is ever fixed, this should
+        keep passing; if this starts failing, the squeeze behaviour changed.
+        """
+        x = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        b = torch.randn(1, 20, 64, 32, dtype=torch.float16).to("spyre")
+        self._assert_one_loop_spec(
+            lambda x, b: torch.matmul(x.sum(dim=2, keepdim=True), b),
+            x,
+            b,
+            expect_ops=("sum", BATCH_MATMUL_OP),
+        )
+
+    # The three matmul directions below are all stopped in
+    # _insert_read_copy_ops before codegen -- a matmul operand does not use
+    # every loop variable, so the iteration space cannot be walked onto its
+    # dimensions (see the TODO there).  They are xfailed rather than omitted so
+    # the matrix is complete and they flip green on their own once that is
+    # fixed.
+    #
+    # Note the first one is #3218's already-shipped pointwise -> matmul case,
+    # not a direction this branch adds: test_lm_head_matmul_join_numeric passed
+    # when #3270 added it and was xfailed by #3293. So the blocker predates and
+    # outlives this change.
+    @unittest.expectedFailure
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_pointwise_producer_to_bmm_codegen_shares_one_loop_spec(self):
+        """Pointwise -> matmul (#3218's shipped direction). Blocked."""
+        a = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        b = torch.randn(1, 20, 64, 32, dtype=torch.float16).to("spyre")
+        self._assert_one_loop_spec(
+            lambda a, b: torch.matmul(a * 2.0, b),
+            a,
+            b,
+            expect_ops=("mul", BATCH_MATMUL_OP),
+        )
+
+    @unittest.expectedFailure
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_bmm_producer_to_pointwise_codegen_shares_one_loop_spec(self):
+        """matmul -> Pointwise, added by this branch. Blocked."""
+        a = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        b = torch.randn(1, 20, 64, 32, dtype=torch.float16).to("spyre")
+        self._assert_one_loop_spec(
+            lambda a, b: torch.matmul(a, b) * 2.0,
+            a,
+            b,
+            expect_ops=(BATCH_MATMUL_OP, "mul"),
+        )
+
+    @unittest.expectedFailure
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_bmm_producer_to_reduction_codegen_shares_one_loop_spec(self):
+        """matmul -> Reduction, added by this branch. Blocked."""
+        a = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        b = torch.randn(1, 20, 64, 32, dtype=torch.float16).to("spyre")
+        self._assert_one_loop_spec(
+            lambda a, b: torch.matmul(a, b).sum(dim=2),
+            a,
+            b,
+            expect_ops=(BATCH_MATMUL_OP, "sum"),
+        )
+
     @patch("torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES", 8192)
     @config.patch(
         {
