@@ -2957,8 +2957,135 @@ class TestSpanOverflowLargeShapeContract(InductorTestCase):
         self.assertEqual(auto_wrapped[0].loop_count, manual_wrapped[0].loop_count)
 
 
+def _forced_span_plan_on_dim1(split_count, expect_size):
+    """Force every op whose output dim 1 is ``expect_size`` onto one plan.
+
+    Keys on output shape rather than buffer name: a Reduction graph lowers to
+    more buffers than a two-op pointwise one, and their names are not knowable
+    without first running it.  Anything not carrying the shared tiled dim falls
+    back to the real planner rather than being handed a nonsensical tile.
+
+    Forcing is necessary rather than convenient: two ops' independent span
+    searches do not land on the same split for a toy shape (see
+    ``test_pointwise_to_non_matmul_reduction_join_numeric``, whose earlier
+    organic-plan version failed on hardware for exactly that reason), so
+    without this the join under test would never form.
+    """
+    real_plan = plan_span_overflow_tile
+    assert expect_size % split_count == 0
+
+    def forced(op, max_cores):
+        ranges = list(getattr(op.data, "ranges", None) or [])
+        try:
+            shares_tiled_dim = len(ranges) >= 2 and int(ranges[1]) == expect_size
+        except (TypeError, ValueError):
+            shares_tiled_dim = False
+        if not shares_tiled_dim:
+            return real_plan(op, max_cores)
+        return SpanOverflowTilePlan(
+            levels=(
+                SpanOverflowTileLevel(selected_host_dim=1, split_count=split_count),
+            ),
+            chunking_infos=(
+                ChunkingInfo(
+                    total_bytes=1,
+                    per_core_span=1,
+                    core_split_estimate=1,
+                    selected_device_dim_size=split_count,
+                    selected_device_span_stride_elems=1,
+                    selected_host_dim=1,
+                    stick_elems=64,
+                    reason="forced for join validation",
+                ),
+            ),
+            reason="forced for join validation",
+        )
+
+    return forced
+
+
 class TestSpanOverflowPointwiseCodegen(InductorTestCase):
     """Small codegen test for scheduler/codegen LoopSpec emission."""
+
+    _PLAN_PATCH = (
+        "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile"
+    )
+
+    def _assert_one_loop_spec(self, fn, *args, expect_ops=()):
+        """Compile ``fn`` for real and assert its group emits ONE LoopSpec.
+
+        Kernel launch/compile are mocked, so this stops at generated source --
+        one layer deeper than the grouping unit tests (which end at the group
+        decision) and one layer shallower than
+        ``TestSpanOverflowNumericValidation`` (which executes).  It proves the
+        group survives ``coarse_tile`` and reaches codegen as a single shared
+        loop, which the grouping tests alone cannot show.
+        """
+        with (
+            patch(self._PLAN_PATCH, _forced_span_plan_on_dim1(5, 20)),
+            patch(_LAUNCH_JOBPLAN),
+            patch(_PREPARE_KERNEL),
+            patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn, dynamic=False), *args)
+        self.assertTrue(source_codes)
+        src = source_codes[0]
+        self.assertEqual(
+            src.count("LoopSpec("),
+            1,
+            "producer and consumer should share ONE LoopSpec -- source:\n" + src,
+        )
+        self.assertIn("count=sympify('5')", src)
+        for op_name in expect_ops:
+            self.assertIn(f"op='{op_name}'", src)
+        return src
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_reduction_producer_to_pointwise_codegen_shares_one_loop_spec(self):
+        """Reduction producer -> Pointwise consumer reaches codegen as one loop.
+
+        The grouping tests prove the pass *decides* to group these; this proves
+        the decision survives ``coarse_tile`` and is emitted as a single shared
+        ``LoopSpec`` rather than two loops or none.
+
+        The matmul equivalents cannot be covered this way yet: any auto-tiled
+        group containing a matmul is stopped in ``_insert_read_copy_ops`` before
+        codegen (the #3293 regression -- see
+        ``test_bmm_to_pointwise_join_numeric``). That blocks #3218's already
+        shipped `pw -> bmm` case too, not just the ones added here.
+        """
+        x = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        self._assert_one_loop_spec(
+            lambda x: x.sum(dim=2) * 2.0, x, expect_ops=("sum", "mul")
+        )
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_reduction_producer_to_reduction_codegen_shares_one_loop_spec(self):
+        """Reduction producer -> Reduction consumer reaches codegen as one loop.
+
+        Neither side is a matmul, so this exercises the Reduction-to-Reduction
+        join end of the grouping change at codegen depth.  The group is flushed
+        as soon as the second reduction joins, so one LoopSpec is also the
+        assertion that nothing further was folded in.
+        """
+        x = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
+        self._assert_one_loop_spec(
+            lambda x: x.sum(dim=2).sum(dim=-1), x, expect_ops=("sum",)
+        )
 
     @patch("torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES", 8192)
     @config.patch(

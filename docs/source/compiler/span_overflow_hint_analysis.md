@@ -1030,6 +1030,15 @@ Current coverage includes:
   each op keeping its own `loop_var`
   (`test_bmm_producer_groups_with_bmm_consumer`,
   `test_bmm_producer_groups_with_non_matmul_reduction_consumer`);
+- codegen depth for the Reduction-producer directions: `sum -> pointwise` and
+  `sum -> sum` compile for real (kernel launch mocked) and emit a **single
+  shared `LoopSpec`**, proving the group survives `coarse_tile` rather than only
+  being decided correctly
+  (`test_reduction_producer_to_pointwise_codegen_shares_one_loop_spec`,
+  `test_reduction_producer_to_reduction_codegen_shares_one_loop_spec`).  The
+  matmul equivalents cannot be covered at this depth yet: any auto-tiled group
+  containing a matmul is stopped in `_insert_read_copy_ops` before codegen,
+  which blocks #3218's already-shipped `pointwise -> bmm` case as well;
 - a three-op chain `bmm -> pointwise -> bmm` landing in **one** group, which is
   what makes the individual joins useful together: a Reduction-rooted run is
   not closed by a Pointwise member, so it survives to the second matmul. This
