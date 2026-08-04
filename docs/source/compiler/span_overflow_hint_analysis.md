@@ -1021,79 +1021,6 @@ Current coverage includes:
 - a reduction-range tile (`is_reduction=True`) never joins even when split
   counts and read correspondence would otherwise qualify
   (`test_reduction_range_tile_never_joins`);
-- the BMM → PW direction: a Reduction producer opens a run that a Pointwise
-  consumer joins, by exact signature match or by conforming to the run's
-  split, each op keeping its own `loop_var`
-  (`test_bmm_producer_groups_with_pointwise_consumer`,
-  `test_pointwise_consumer_conforms_to_bmm_producer_split`);
-- the BMM → Reduction direction, for both a matmul and a plain `sum` consumer,
-  each op keeping its own `loop_var`
-  (`test_bmm_producer_groups_with_bmm_consumer`,
-  `test_bmm_producer_groups_with_non_matmul_reduction_consumer`);
-- on-device execution of the three Reduction-*producer* directions
-  (`test_reduction_to_pointwise_join_numeric`,
-  `test_reduction_to_reduction_join_numeric`,
-  `test_reduction_to_bmm_join_numeric`), all `expectedFailure`.  They die in
-  `dxp_standalone`, and the cause is the read-copy path rather than grouping: a
-  lone tiled `sum` with no consumer and no group fails identically, while the
-  same computation untiled passes.  What decides it is what the tiled reduction
-  *reads* -- reading an in-group producer works
-  (`test_pointwise_to_non_matmul_reduction_join_numeric` passes with a tiled
-  `sum` too), reading a full-size buffer does not.  So
-  `_insert_read_copy_ops` handles a tiled Pointwise reading a full buffer but
-  not a tiled Reduction: a matmul trips its rank assert, a `sum` clears the
-  assert and yields a kernel the backend rejects with
-  `DtException: Could not find any suitable dimension mapping`
-  (`ddl_conversion.cpp:2497`), uncaught, hence SIGABRT rather than a
-  diagnosable error.  Distinct from #3414, which fails elsewhere with
-  `Immediate value out of boundary ... L3_ADDEARIMM`;
-- on-device execution of Pointwise -> Pointwise
-  (`test_pointwise_to_pointwise_join_numeric`).  The oldest automatic direction
-  (#3058) had codegen-only coverage until now -- its numbers had never been
-  checked, because the one on-device pointwise test covered
-  Pointwise -> Reduction instead;
-- codegen depth for the Reduction-producer directions: `sum -> pointwise` and
-  `sum -> sum` compile for real (kernel launch mocked) and emit a **single
-  shared `LoopSpec`**, proving the group survives `coarse_tile` rather than only
-  being decided correctly
-  (`test_reduction_producer_to_pointwise_codegen_shares_one_loop_spec`,
-  `test_reduction_producer_to_reduction_codegen_shares_one_loop_spec`).  The
-  matmul equivalents cannot be covered at this depth yet: any auto-tiled group
-  containing a matmul is stopped in `_insert_read_copy_ops` before codegen,
-  which blocks #3218's already-shipped `pointwise -> bmm` case as well;
-- a three-op chain `bmm -> pointwise -> bmm` landing in **one** group, which is
-  what makes the individual joins useful together: a Reduction-rooted run is
-  not closed by a Pointwise member, so it survives to the second matmul. This
-  is attention's shape (matmul → softmax → matmul); without it a chain could
-  only ever fuse two ops
-  (`test_bmm_producer_chain_through_pointwise_to_bmm_consumer`);
-- the same three directions with a **non-matmul Reduction producer**
-  (`sum` → Pointwise, `sum` → `sum`, `sum` → matmul), completing the
-  producer/consumer type matrix.  The pass branches on
-  `isinstance(op.data, Reduction)` and never inspects `reduction_type`, so
-  this is support by construction — these pin it as a tested claim rather
-  than an inference from the type check, and the `sum` → `sum` case has
-  neither side a matmul
-  (`test_non_matmul_reduction_producer_groups_with_pointwise_consumer`,
-  `test_non_matmul_reduction_producer_groups_with_reduction_consumer`,
-  `test_non_matmul_reduction_producer_groups_with_bmm_consumer`);
-- the guards that keep that widening safe: rejection when the consumer's
-  tiled loop var does not index the producer's tiled dim, no join without a
-  real read edge, and unrelated neighbouring Reductions still landing in
-  separate groups
-  (`test_bmm_producer_pointwise_consumer_rejected_when_dim_not_shared`,
-  `test_pointwise_not_reading_bmm_run_does_not_join_it`,
-  `test_two_independent_reductions_still_produce_separate_groups`);
-- the wrong-answer case Reduction → Reduction makes reachable — a producer
-  tiling a dim that is the consumer's reduction (`k`) range, as in
-  `bmm(bmm(q, k), v)` — rejected even though split counts match and a read
-  edge exists, including when only one of several reads through the same
-  producer corresponds
-  (`test_bmm_to_bmm_rejected_when_producer_tiles_consumer_reduction_dim`,
-  `test_join_rejected_when_only_one_of_two_reads_corresponds`);
-- a Reduction consumer still terminating its group, so one auto-tiled producer
-  still feeds at most one Reduction consumer
-  (`test_reduction_consumer_still_terminates_its_group`);
 - a second consumer reading a producer already joined by another reduction is
   rejected with a distinct message
   (`test_second_reduction_consumer_of_joined_producer_rejected`);
@@ -1109,26 +1036,37 @@ Current coverage includes:
   rates against the same CPU reference to separate ordinary fp16
   accumulation noise from join-introduced error), in
   `TestSpanOverflowNumericValidation`.
-- on-device numeric validation of the Reduction-*producer* directions —
-  `test_bmm_to_pointwise_join_numeric` and `test_bmm_to_reduction_join_numeric`,
-  also in `TestSpanOverflowNumericValidation`. Both force the shared plan (the
-  real planner's independent searches do not agree on a toy shape) but do not
-  mock kernel launch, and both assert a single shared `LoopSpec` — without that
-  assertion they would pass even if the join never happened. The
-  Reduction-consumer one matters most: a consumer paired against the wrong
-  producer slice does not crash, it returns a partial sum, so only a CPU
-  comparison distinguishes it from a correct result.
 
-  Both are currently `expectedFailure` against a pre-existing limitation in
-  `_insert_read_copy_ops` (see the TODO there), which also keeps
-  `test_lm_head_matmul_join_numeric` xfailed from #3218. Their **passing**
-  counterpart is `test_bmm_to_pointwise_join_numeric_via_manual_hint`: the same
-  shapes, tiled dim and resulting BMM → PW group requested through a manual
-  `spyre_hint` instead, compared against a CPU reference. It localizes the gap
-  — the grouping, the shared loop nest and the per-tile addressing are all
-  correct on hardware, and only the post-stickify caller is blocked, because
-  `_maybe_coarse_tile_hints` runs pre-stickification and takes the plain
-  `FixedLayout` branch instead.
+Producer/consumer grouping is covered at three depths -- the grouping decision
+(mocked), codegen (compiled with kernel launch mocked, asserting one shared
+`LoopSpec`), and execution (run against a CPU reference):
+
+| Producer -> Consumer | Grouping | Codegen | Execution |
+|---|---|---|---|
+| pointwise -> pointwise | pass | pass | pass |
+| pointwise -> reduction | pass | pass | pass |
+| reduction -> pointwise | pass | pass | xfail |
+| reduction -> reduction | pass | pass | xfail |
+| reduction -> matmul | pass | pass | xfail |
+| pointwise -> matmul | pass | xfail | xfail |
+| matmul -> pointwise | pass | xfail | xfail |
+| matmul -> reduction | pass | xfail | xfail |
+| matmul -> matmul | pass | n/a | n/a |
+| matmul -> pointwise -> matmul | pass | not tested | not tested |
+
+Two causes account for every xfail, and each test carries a `TODO` naming its
+own.  A tiled **matmul** cannot read a full-size buffer: `_insert_read_copy_ops`
+matches loop counters to input dimensions one-to-one, and a matmul operand
+always has one fewer.  A tiled **reduction** reading a full-size buffer reaches
+codegen but is rejected by the backend.  `matmul -> matmul` is marked n/a rather
+than xfail because it is refused by design -- a Reduction consumer has no
+conform path, so both plans must independently agree.
+
+Rejection behaviour is covered too: a consumer whose tiled loop var does not
+index the producer's tiled dim, a producer whose tiled dim is the consumer's
+reduction (`k`) range (the partial-sum case, as in `bmm(bmm(q, k), v)`), a
+consumer reading the producer through several deps where only one corresponds,
+and a Reduction consumer still terminating its group.
 
 ## Key Files
 
