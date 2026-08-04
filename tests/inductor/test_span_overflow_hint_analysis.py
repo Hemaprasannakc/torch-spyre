@@ -3601,13 +3601,6 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
             "sencores": 4,
             "lx_planning": True,
             "allow_all_ops_in_lx_planning": True,
-        }
-    )
-    @config.patch(
-        {
-            "sencores": 4,
-            "lx_planning": True,
-            "allow_all_ops_in_lx_planning": True,
             "ignore_span_overflow_hints": False,
         }
     )
@@ -3789,6 +3782,13 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
                 rtol=0.05,
             )
 
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+        }
+    )
     def test_bmm_to_pointwise_join_numeric_via_manual_hint(self):
         """The BMM -> PW group this branch builds automatically, executed for
         real -- but requested with a manual ``spyre_hint`` instead.
