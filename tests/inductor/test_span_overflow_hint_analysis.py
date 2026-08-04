@@ -3575,6 +3575,55 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
             "allow_all_ops_in_lx_planning": True,
         }
     )
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_pointwise_to_pointwise_join_numeric(self):
+        """Pointwise -> Pointwise executed for real against a CPU reference.
+
+        This is the oldest automatic direction (#3058) and the only one whose
+        numbers had never been checked: the pointwise coverage was codegen-only
+        (kernel launch mocked, source text asserted), and the sole on-device
+        test in this class covered Pointwise -> Reduction.  So a group whose
+        members are all pointwise was verified to be *decided* and *emitted*
+        correctly, never to compute correctly.
+
+        Not a direction this branch adds -- included because the gap is only
+        visible once the matrix is written out, and this path is not blocked by
+        the read-copy limitation that xfails the matmul ones.
+
+        The plan is forced so both ops tile host_dim=1 at split 5; without it
+        their independent span searches need not agree on a toy shape and the
+        join under test would not form.  Kernel launch is NOT mocked.
+        """
+        torch.manual_seed(0xAFFE)
+        shape = (1, 20, 16, 64)
+        x = torch.randn(shape, dtype=torch.float16)
+        y = torch.randn(shape, dtype=torch.float16)
+
+        def fn(x, y):
+            return (x + y) * 2.0
+
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+            _forced_span_plan_on_dim1(5, 20),
+        ):
+            compare_with_cpu(
+                fn,
+                x,
+                y,
+                run_compile=True,
+                run_eager=False,
+                source_check=self._assert_single_loop_spec("add", "mul"),
+                atol=0.05,
+                rtol=0.05,
+            )
+
     def test_bmm_to_pointwise_join_numeric_via_manual_hint(self):
         """The BMM -> PW group this branch builds automatically, executed for
         real -- but requested with a manual ``spyre_hint`` instead.

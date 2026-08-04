@@ -1030,6 +1030,11 @@ Current coverage includes:
   each op keeping its own `loop_var`
   (`test_bmm_producer_groups_with_bmm_consumer`,
   `test_bmm_producer_groups_with_non_matmul_reduction_consumer`);
+- on-device execution of Pointwise -> Pointwise
+  (`test_pointwise_to_pointwise_join_numeric`).  The oldest automatic direction
+  (#3058) had codegen-only coverage until now -- its numbers had never been
+  checked, because the one on-device pointwise test covered
+  Pointwise -> Reduction instead;
 - codegen depth for the Reduction-producer directions: `sum -> pointwise` and
   `sum -> sum` compile for real (kernel launch mocked) and emit a **single
   shared `LoopSpec`**, proving the group survives `coarse_tile` rather than only
