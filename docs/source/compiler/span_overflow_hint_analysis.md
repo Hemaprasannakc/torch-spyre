@@ -1030,6 +1030,19 @@ Current coverage includes:
   each op keeping its own `loop_var`
   (`test_bmm_producer_groups_with_bmm_consumer`,
   `test_bmm_producer_groups_with_non_matmul_reduction_consumer`);
+- on-device execution of the three Reduction-*producer* directions
+  (`test_reduction_to_pointwise_join_numeric`,
+  `test_reduction_to_reduction_join_numeric`,
+  `test_reduction_to_bmm_join_numeric`), all `expectedFailure`.  They die in
+  `dxp_standalone`, and the cause is the read-copy path rather than grouping: a
+  lone tiled `sum` with no consumer and no group fails identically, while the
+  same computation untiled passes.  What decides it is what the tiled reduction
+  *reads* -- reading an in-group producer works
+  (`test_pointwise_to_non_matmul_reduction_join_numeric` passes with a tiled
+  `sum` too), reading a full-size buffer does not.  So
+  `_insert_read_copy_ops` handles a tiled Pointwise reading a full buffer but
+  not a tiled Reduction: a matmul trips its rank assert, a `sum` clears the
+  assert and yields a kernel the backend rejects;
 - on-device execution of Pointwise -> Pointwise
   (`test_pointwise_to_pointwise_join_numeric`).  The oldest automatic direction
   (#3058) had codegen-only coverage until now -- its numbers had never been

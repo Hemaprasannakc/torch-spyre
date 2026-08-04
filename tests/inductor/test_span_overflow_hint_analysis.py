@@ -3624,6 +3624,117 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
                 rtol=0.05,
             )
 
+    # The three Reduction-producer directions below execute a group whose
+    # PRODUCER is a tiled reduction reading a full-size buffer (a graph input).
+    # All three die in dxp_standalone.  Isolated to the read-copy path, not to
+    # grouping:
+    #
+    #   lone sum, NO tiling                PASS
+    #   lone sum, TILED (no group at all)  dxp_standalone SIGABRT
+    #   sum -> pw, NO tiling               PASS
+    #   sum -> pw, TILED (grouped)         dxp_standalone SIGABRT
+    #
+    # A single tiled sum with no consumer fails identically, so the group is
+    # irrelevant.  What matters is what the tiled reduction reads:
+    # test_pointwise_to_non_matmul_reduction_join_numeric passes with a tiled
+    # sum too, but there the sum reads its in-group producer rather than a
+    # full-size buffer.
+    #
+    # Same root as the matmul xfails, one stage later:
+    # _insert_read_copy_ops handles a tiled *Pointwise* reading a full buffer
+    # (test_pointwise_to_pointwise_join_numeric passes, and its add reads graph
+    # inputs) but not a tiled *Reduction*.  A matmul trips the rank assert; a
+    # sum clears it and yields a kernel the backend rejects.  Possibly the same
+    # dxp_standalone SIGABRT as #3414.
+    #
+    # Codegen depth for all three passes -- see
+    # TestSpanOverflowPointwiseCodegen -- so these isolate execution alone.
+    @unittest.expectedFailure
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_reduction_to_pointwise_join_numeric(self):
+        """Reduction -> Pointwise executed for real. Blocked in dxp_standalone."""
+        torch.manual_seed(0xAFFE)
+        x = torch.randn(1, 20, 16, 64, dtype=torch.float16)
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+            _forced_span_plan_on_dim1(5, 20),
+        ):
+            compare_with_cpu(
+                lambda x: x.sum(dim=2) * 2.0,
+                x,
+                run_compile=True,
+                run_eager=False,
+                atol=0.05,
+                rtol=0.05,
+            )
+
+    @unittest.expectedFailure
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_reduction_to_reduction_join_numeric(self):
+        """Reduction -> Reduction executed for real. Blocked in dxp_standalone."""
+        torch.manual_seed(0xAFFE)
+        x = torch.randn(1, 20, 16, 64, dtype=torch.float16)
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+            _forced_span_plan_on_dim1(5, 20),
+        ):
+            compare_with_cpu(
+                lambda x: x.sum(dim=2).sum(dim=-1),
+                x,
+                run_compile=True,
+                run_eager=False,
+                atol=0.05,
+                rtol=0.05,
+            )
+
+    @unittest.expectedFailure
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+        }
+    )
+    def test_reduction_to_bmm_join_numeric(self):
+        """Reduction -> matmul executed for real. Blocked in dxp_standalone.
+
+        This is the one matmul direction that reaches codegen (keepdim=True
+        leaves M=1, which squeezes out and realigns the ranks -- see
+        ``test_reduction_producer_to_bmm_codegen_shares_one_loop_spec``), so it
+        is the only matmul cell where execution is even reachable to fail.
+        """
+        torch.manual_seed(0xAFFE)
+        x = torch.randn(1, 20, 16, 64, dtype=torch.float16) * 0.1
+        b = torch.randn(1, 20, 64, 32, dtype=torch.float16) * 0.1
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+            _forced_span_plan_on_dim1(5, 20),
+        ):
+            compare_with_cpu(
+                lambda x, b: torch.matmul(x.sum(dim=2, keepdim=True), b),
+                x,
+                b,
+                run_compile=True,
+                run_eager=False,
+                atol=0.05,
+                rtol=0.05,
+            )
+
     def test_bmm_to_pointwise_join_numeric_via_manual_hint(self):
         """The BMM -> PW group this branch builds automatically, executed for
         real -- but requested with a manual ``spyre_hint`` instead.
