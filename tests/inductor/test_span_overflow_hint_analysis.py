@@ -3180,7 +3180,19 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         }
     )
     def test_pointwise_producer_to_bmm_codegen_shares_one_loop_spec(self):
-        """Pointwise -> matmul (#3218's shipped direction). Blocked."""
+        """Pointwise -> matmul (#3218's shipped direction). Blocked.
+
+        TODO(span-overflow-read-copy): un-xfail once a tiled matmul can read a
+        full-size buffer.  This direction is a REGRESSION, not a missing
+        feature: its on-device counterpart test_lm_head_matmul_join_numeric
+        passed when #3270 added it (21 Jul) and was marked expectedFailure by
+        #3293 (28 Jul) with no stated cause.  #3293's note on a sibling test it
+        xfailed in the same commit says the xfails were "a deliberate decision
+        to unblock the merge, not a claim about a specific bisected root
+        cause".  Which part of that refactor caused it is still unknown -- the
+        obvious theory (auto moved after stickification) is wrong, since the
+        auto path always ran there.
+        """
         a = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
         b = torch.randn(1, 20, 64, 32, dtype=torch.float16).to("spyre")
         self._assert_one_loop_spec(
@@ -3200,7 +3212,13 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         }
     )
     def test_bmm_producer_to_pointwise_codegen_shares_one_loop_spec(self):
-        """matmul -> Pointwise, added by this branch. Blocked."""
+        """matmul -> Pointwise, added by this branch. Blocked.
+
+        TODO(span-overflow-read-copy): un-xfail with the direction above -- the
+        same rank assert, reached the same way.  A matmul operand does not use
+        every loop variable (A has no N), so the iteration space cannot be
+        walked onto its dimensions.
+        """
         a = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
         b = torch.randn(1, 20, 64, 32, dtype=torch.float16).to("spyre")
         self._assert_one_loop_spec(
@@ -3220,7 +3238,11 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         }
     )
     def test_bmm_producer_to_reduction_codegen_shares_one_loop_spec(self):
-        """matmul -> Reduction, added by this branch. Blocked."""
+        """matmul -> Reduction, added by this branch. Blocked.
+
+        TODO(span-overflow-read-copy): un-xfail with the two directions above.
+        Same rank assert, same cause.
+        """
         a = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
         b = torch.randn(1, 20, 64, 32, dtype=torch.float16).to("spyre")
         self._assert_one_loop_spec(
@@ -3272,6 +3294,9 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
     def test_reduction_input_span_codegen_contains_auto_loop_spec(self):
         """Decision xfail: failing in CI (Actions run 30385154736, job
         90362759197) on PR #3293. We've decided to xfail the coarse tiling
+
+        TODO(3293-decision-xfail): investigate and un-xfail; no root cause
+        was bisected when this was marked.
         tests to allow us to merge to main -- deliberate decision to unblock
         the merge, not a claim about a specific bisected root cause. Un-xfail
         once the underlying regression is investigated and fixed.
@@ -3386,6 +3411,9 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
     def test_auto_span_overflow_matches_equivalent_spyre_hint_loop_spec(self):
         """Decision xfail: failing in CI (Actions run 30385154736, job
         90362759197) on PR #3293. We've decided to xfail the coarse tiling
+
+        TODO(3293-decision-xfail): investigate and un-xfail; no root cause
+        was bisected when this was marked.
         tests to allow us to merge to main -- deliberate decision to unblock
         the merge, not a claim about a specific bisected root cause. Un-xfail
         once the underlying regression is investigated and fixed.
@@ -3669,7 +3697,16 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
         }
     )
     def test_reduction_to_pointwise_join_numeric(self):
-        """Reduction -> Pointwise executed for real. Blocked in dxp_standalone."""
+        """Reduction -> Pointwise executed for real. Blocked in dxp_standalone.
+
+        TODO(deeptools-ddl-dim-mapping): un-xfail once a coarse-tiled reduction
+        reading a full-size buffer can be lowered.  Codegen succeeds; deeptools
+        then throws DtException "Could not find any suitable dimension mapping"
+        (ddl_conversion.cpp:2497) and nothing catches it, so it aborts.  Not
+        filed yet, and NOT #3414 -- that fails elsewhere with "Immediate value
+        out of boundary ... L3_ADDEARIMM".  Reproduces with a lone tiled sum,
+        no grouping involved.
+        """
         torch.manual_seed(0xAFFE)
         x = torch.randn(1, 20, 16, 64, dtype=torch.float16)
         with patch(
@@ -3695,7 +3732,11 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
         }
     )
     def test_reduction_to_reduction_join_numeric(self):
-        """Reduction -> Reduction executed for real. Blocked in dxp_standalone."""
+        """Reduction -> Reduction executed for real. Blocked in dxp_standalone.
+
+        TODO(deeptools-ddl-dim-mapping): un-xfail with the direction above --
+        same DtException from the same place.
+        """
         torch.manual_seed(0xAFFE)
         x = torch.randn(1, 20, 16, 64, dtype=torch.float16)
         with patch(
@@ -3727,6 +3768,9 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
         leaves M=1, which squeezes out and realigns the ranks -- see
         ``test_reduction_producer_to_bmm_codegen_shares_one_loop_spec``), so it
         is the only matmul cell where execution is even reachable to fail.
+
+        TODO(deeptools-ddl-dim-mapping): un-xfail with the other two Reduction
+        producer directions -- same DtException from ddl_conversion.cpp.
         """
         torch.manual_seed(0xAFFE)
         x = torch.randn(1, 20, 16, 64, dtype=torch.float16) * 0.1
@@ -3862,6 +3906,9 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
 
         return check
 
+    # TODO(span-overflow-read-copy): un-xfail together with the codegen xfails
+    # in TestSpanOverflowPointwiseCodegen -- one fix covers all of them.
+    #
     # Blocked by a pre-existing coarse_tile.py defect, not by the grouping this
     # branch adds: _insert_read_copy_ops cannot build a copy-buffer layout for a
     # tiled *Reduction* that reads a full-size buffer from outside its loop
@@ -3931,6 +3978,9 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
                 rtol=0.05,
             )
 
+    # TODO(span-overflow-read-copy): un-xfail together with the codegen xfails
+    # in TestSpanOverflowPointwiseCodegen -- one fix covers all of them.
+    #
     # Blocked by a pre-existing coarse_tile.py defect, not by the grouping this
     # branch adds: _insert_read_copy_ops cannot build a copy-buffer layout for a
     # tiled *Reduction* that reads a full-size buffer from outside its loop
@@ -3999,6 +4049,12 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
                 rtol=0.05,
             )
 
+    # TODO(span-overflow-read-copy): un-xfail together with
+    # test_pointwise_producer_to_bmm_codegen_shares_one_loop_spec -- this is
+    # the on-device half of the same direction.  Added PASSING by #3270 on
+    # 21 Jul; marked expectedFailure by #3293 on 28 Jul with no stated cause.
+    # It now fails in _insert_read_copy_ops before codegen, so it is the same
+    # rank assert as the codegen xfails, not a numeric problem.
     @unittest.expectedFailure
     def test_lm_head_matmul_join_numeric(self):
         """F.linear with an oversized vocab-dim weight: the restickified
