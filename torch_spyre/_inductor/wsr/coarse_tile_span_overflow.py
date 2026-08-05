@@ -36,6 +36,7 @@ from ..pass_utils import op_out_coords, host_coordinates, indirect_sizes_from_op
 from ..ir import FixedTiledLayout
 from .span_overflow_hint_analysis import (
     SpanOverflowTilePlan,
+    _bmm_k_symbol,
     can_conform_pointwise_tile,
     plan_span_overflow_tile,
 )
@@ -93,13 +94,10 @@ def _reduction_shares_group_tiled_dim(
     ``span_overflow_groups``) applies this to any Reduction op, not just
     batch-matmul.
 
-    The automatic span-overflow planner only ever tiles output ranges (see
-    ``SpanOverflowTileLevel``: ``is_reduction`` is always False on the auto
-    path, because reduction-range tiling would require partial-result
-    accumulation), so every signature reaching here should already be
-    output-only.  We assert that invariant explicitly below and fail closed if
-    a future planner change ever emits a reduction-range tile — such a tile
-    would break the loop-carried accumulation this join assumes away.
+    The automatic planner normally tiles output ranges. Its BMM fallback can
+    tile K, so a reduction-range signature can now reach this check. Such a
+    plan must remain an independent group because joining it to a producer
+    would break the loop-carried partial-result accumulation.
     """
     # Guard: only output-range tiles may join.  A reduction (K) range tile
     # would need cross-tile accumulation and cannot share a per-tile loop nest.
@@ -166,23 +164,37 @@ def _dims_to_hints(
     out_coords = op_out_coords(op)
     hints: list[DimHint] = []
     for (host_dim, split_count, is_reduction), hint_id in zip(dims, hint_ids):
-        if host_dim >= len(out_coords):
-            raise Unsupported(
-                f"Cannot adapt span-overflow plan for {op.get_name()}: "
-                f"host_dim={host_dim} is out of bounds for "
-                f"{len(out_coords)} output coordinates."
-            )
-
-        coord = out_coords[host_dim]
-        free_symbols = coord.free_symbols
-        if len(free_symbols) != 1:
-            raise Unsupported(
-                f"Cannot adapt span-overflow plan for {op.get_name()}: "
-                f"host_dim={host_dim} output coordinate {coord} has "
-                f"{len(free_symbols)} free symbols; expected exactly one loop var."
-            )
-
-        loop_var = next(iter(free_symbols))
+        if is_reduction:
+            reduction_ranges = list(getattr(op.data, "reduction_ranges", []))
+            if host_dim >= len(reduction_ranges):
+                raise Unsupported(
+                    f"Cannot adapt span-overflow reduction plan for {op.get_name()}: "
+                    f"host_dim={host_dim} is out of bounds for reduction ranges "
+                    f"{reduction_ranges}."
+                )
+            loop_var = _bmm_k_symbol(op)
+            if loop_var is None:
+                raise Unsupported(
+                    f"Cannot adapt span-overflow reduction plan for {op.get_name()}: "
+                    "could not identify the BMM K loop variable."
+                )
+            coord = loop_var
+        else:
+            if host_dim >= len(out_coords):
+                raise Unsupported(
+                    f"Cannot adapt span-overflow plan for {op.get_name()}: "
+                    f"host_dim={host_dim} is out of bounds for "
+                    f"{len(out_coords)} output coordinates."
+                )
+            coord = out_coords[host_dim]
+            free_symbols = coord.free_symbols
+            if len(free_symbols) != 1:
+                raise Unsupported(
+                    f"Cannot adapt span-overflow plan for {op.get_name()}: "
+                    f"host_dim={host_dim} output coordinate {coord} has "
+                    f"{len(free_symbols)} free symbols; expected exactly one loop var."
+                )
+            loop_var = next(iter(free_symbols))
         logger.debug(
             "[span-overflow groups] op=%s host_dim=%d coord=%s "
             "loop_var=%s split_count=%s hint_id=%d is_reduction=%s",
@@ -354,6 +366,17 @@ def span_overflow_groups(
         current_group_names = {grouped_op.get_name() for grouped_op, _ in current_group}
 
         plan = plan_span_overflow_tile(op, config.sencores)
+
+        print(
+            "\n[AUTO SPAN PLAN]",
+            f"op={op.get_name()}",
+            f"op_type={op.data.reduction_type if isinstance(op.data, Reduction) else type(op.data).__name__}",
+            f"ranges={list(op.data.ranges)}",
+            f"reduction_ranges={list(getattr(op.data, 'reduction_ranges', []))}",
+            f"plan={plan}",
+            sep="\n  ",
+        )
+
         if plan is None:
             # op needs no coarse tiling of its own.  It's always safe to leave
             # it outside any loop: insert_tiling_propagation's outside-consumer

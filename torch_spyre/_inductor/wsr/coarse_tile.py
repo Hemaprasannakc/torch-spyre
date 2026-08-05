@@ -1604,6 +1604,49 @@ def _validate_reduction_tiling(op: ComputedBuffer) -> None:
             )
 
 
+def _refresh_direct_reduction_read_advances(op: ComputedBuffer) -> None:
+    """Rebuild read advances after output/reduction unit-dim squeezing.
+
+    MemoryDep symbols use the squeezed output dims followed by squeezed
+    reduction dims. CoarseTileInfo stores raw positions, so a direct BMM K
+    read needs this bridge when the post-stickify path intentionally avoids
+    materializing generic read copies.
+    """
+    loop_info = op.loop_info  # type: ignore[attr-defined]
+    output_squeezed_count = sum(int(size) != 1 for size in op.data.ranges)
+    reduction_squeeze_pos: dict[int, int] = {}
+    next_pos = 0
+    for raw_pos, size in enumerate(op.data.reduction_ranges):
+        if int(size) != 1:
+            reduction_squeeze_pos[raw_pos] = next_pos
+            next_pos += 1
+
+    per_level_extents: list[dict[int, Expr]] = [
+        {} for _ in loop_info.loop_tiled_reduction_dims
+    ]
+    for raw_pos in {
+        dim for level in loop_info.loop_tiled_reduction_dims for dim in level
+    }:
+        dep_dim = output_squeezed_count + reduction_squeeze_pos[raw_pos]
+        levels = [
+            level_idx
+            for level_idx, dims in enumerate(loop_info.loop_tiled_reduction_dims)
+            if raw_pos in dims
+        ]
+        running = sympy.sympify(op.data.reduction_ranges[raw_pos])
+        for level_idx in reversed(levels):
+            per_level_extents[level_idx][dep_dim] = running
+            running = running * loop_info.loop_count[level_idx]
+
+    reads = [dep for dep in op.get_read_writes().reads if isinstance(dep, MemoryDep)]
+    op.loop_info = dataclasses.replace(  # type: ignore[attr-defined]
+        loop_info,
+        tiled_dims_per_read=[
+            _tiled_dims_for_dep(dep, per_level_extents) for dep in reads
+        ],
+    )
+
+
 def _propagate_tiled_op(
     op: ComputedBuffer,
     operations: list[Operation],
@@ -1622,15 +1665,30 @@ def _propagate_tiled_op(
     # _insert_copy_op fix, but on the read side).  This must run before the
     # Reduction/has_tiled_reduction branch below, since
     # _propagate_tiled_reduction_op never touches op's own reads.
+    has_tiled_reduction = isinstance(op.data, Reduction) and (
+        loop_info is not None
+        and any(dims for dims in getattr(loop_info, "loop_tiled_reduction_dims", []))
+    )
     full_deps = _full_buffer_read_deps(op)
-    if full_deps:
+    # Automatic span-overflow tiling runs after stickification. For a
+    # reduction-range tile, keep direct reads of the already-fixed BMM inputs:
+    # their loop metadata emits the required K tile-advance expressions.
+    # A generic read copy would instead materialize the reduction dependency's
+    # squeezed [N, K] iteration space, which is not the input's [B, M, K] or
+    # [B, K, N] logical layout and cannot be mapped by DDC. Manual/pre-stickify
+    # tiling keeps the existing copy path and is stickified afterward.
+    skip_read_copies = (
+        has_tiled_reduction
+        and getattr(op.data, "reduction_type", None) == BATCH_MATMUL_OP
+        and isinstance(op.layout, FixedTiledLayout)
+    )
+    if full_deps and not skip_read_copies:
         op = _insert_read_copy_ops(op, full_deps, operations)
+    elif skip_read_copies:
+        _refresh_direct_reduction_read_advances(op)
 
     if isinstance(op.data, Reduction):
         _validate_reduction_tiling(op)
-        has_tiled_reduction = loop_info is not None and any(
-            dims for dims in getattr(loop_info, "loop_tiled_reduction_dims", [])
-        )
         if has_tiled_reduction:
             _propagate_tiled_reduction_op(op, operations)
             return

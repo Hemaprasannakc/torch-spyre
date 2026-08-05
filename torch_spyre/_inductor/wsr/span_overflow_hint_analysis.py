@@ -82,6 +82,15 @@ class InputSpanInfo:
 
 
 @dataclass(frozen=True)
+class BMMKSpanInfo:
+    """Input span facts controlled by BMM's single reduction range K."""
+
+    chunking_info: ChunkingInfo
+    dep_name: str
+    k_symbol: sympy.Symbol
+
+
+@dataclass(frozen=True)
 class SpanOverflowTileLevel:
     """One coarse-tile loop level to apply to the op's iteration space.
 
@@ -89,9 +98,9 @@ class SpanOverflowTileLevel:
     op with ranges ``[M, N]``, ``selected_host_dim=0`` tiles ``M`` and
     ``selected_host_dim=1`` tiles ``N``.  ``split_count`` is the number of
     equal-sized chunks to create for that dimension, so the dimension size must
-    be divisible by it.  ``is_reduction`` is false for the current automatic
-    span-overflow planner because it only tiles output ranges; reduction-range
-    tiling would require partial-result accumulation.
+    be divisible by it. ``is_reduction`` distinguishes an output range from a
+    reduction range. The automatic planner's BMM-only fallback can emit
+    ``selected_host_dim=0, is_reduction=True`` for K.
     """
 
     selected_host_dim: int
@@ -368,6 +377,34 @@ def _bmm_output_symbol_to_dim(
         )
         return {}
     return symbol_to_dim
+
+
+def _bmm_k_symbol(
+    op: ComputedBuffer,
+    input_deps: list[tuple[MemoryDep, FixedTiledLayout]] | None = None,
+) -> sympy.Symbol | None:
+    """Return BMM's unique reduction-only input symbol, or ``None``."""
+    if not _is_batch_matmul_reduction(op):
+        return None
+    if len(list(getattr(op.data, "reduction_ranges", []))) != 1:
+        return None
+    if input_deps is None:
+        input_deps = _input_read_deps(op)
+    output_symbols = set(_output_symbol_to_dim(op))
+    reduction_symbols = {
+        sym
+        for dep, _layout in input_deps
+        for sym in dep.ranges
+        if sym not in output_symbols
+    }
+    if len(reduction_symbols) != 1:
+        logger.debug(
+            "span_overflow_bmm_k: op=%s skipped; expected one K symbol, got %s",
+            op.get_name(),
+            sorted(reduction_symbols, key=str),
+        )
+        return None
+    return next(iter(reduction_symbols))
 
 
 def _input_read_deps(op: ComputedBuffer) -> list[tuple[MemoryDep, FixedTiledLayout]]:
@@ -675,6 +712,126 @@ def _input_span_infos_controlled_by_output_dims(
                     )
                 )
     return infos
+
+
+def _bmm_k_span_infos(
+    op: ComputedBuffer,
+    max_cores: int,
+    k_split: int = 1,
+) -> list[BMMKSpanInfo]:
+    """Return BMM input overflows that shrink when K is split."""
+    del max_cores  # Conservatively assume no work-division help.
+    input_deps = _input_read_deps(op)
+    k_symbol = _bmm_k_symbol(op, input_deps)
+    if k_symbol is None:
+        return []
+
+    infos: list[BMMKSpanInfo] = []
+    for dep, layout in input_deps:
+        if not _layout_has_static_span_metadata(layout):
+            continue
+        try:
+            device_coords = _device_coordinates_for_span(layout, dep)
+        except (TypeError, ValueError, RuntimeError, Unsupported):
+            continue
+        device_size = [int(s) for s in layout.device_layout.device_size]
+        itemsize = layout.dtype.itemsize
+        stick_elems = layout.device_layout.elems_per_stick()
+        for device_dim, coord in enumerate(device_coords[:-1]):
+            if k_symbol not in coord.free_symbols:
+                continue
+            coord_span_elems = _coordinate_span_elems(coord, dep, {k_symbol: k_split})
+            if coord_span_elems is None:
+                continue
+            inner_stride_elems = _tile_aware_inner_stride_elems(
+                device_coords,
+                device_size,
+                dep,
+                device_dim + 1,
+                {k_symbol: 0},
+                {0: k_split},
+            )
+            if inner_stride_elems is None:
+                continue
+            per_core_span = coord_span_elems * inner_stride_elems * itemsize
+            if per_core_span <= MAX_SPAN_BYTES:
+                continue
+            infos.append(
+                BMMKSpanInfo(
+                    chunking_info=ChunkingInfo(
+                        total_bytes=math.prod(device_size) * itemsize,
+                        per_core_span=per_core_span,
+                        core_split_estimate=1,
+                        selected_device_dim_size=coord_span_elems,
+                        selected_device_span_stride_elems=inner_stride_elems,
+                        selected_host_dim=0,
+                        stick_elems=stick_elems,
+                        reason=f"BMM K input span overflow for {dep.name}",
+                    ),
+                    dep_name=dep.name,
+                    k_symbol=k_symbol,
+                )
+            )
+    return infos
+
+
+def _bmm_k_alignment_error(op: ComputedBuffer, split_count: int) -> str | None:
+    """Return why a BMM K split violates an input layout boundary."""
+    reduction_ranges = list(getattr(op.data, "reduction_ranges", []))
+    if len(reduction_ranges) != 1:
+        return "BMM K tiling requires exactly one reduction range"
+    try:
+        k_size = int(reduction_ranges[0])
+    except (TypeError, ValueError):
+        return "BMM K tiling requires a static integral K range"
+    if split_count <= 1 or split_count > _MAX_AUTO_TILE_SPLIT_COUNT:
+        return f"unsupported K split count {split_count}"
+    if k_size % split_count != 0:
+        return f"K size {k_size} is not divisible by split {split_count}"
+
+    input_deps = _input_read_deps(op)
+    k_symbol = _bmm_k_symbol(op, input_deps)
+    if k_symbol is None:
+        return "could not identify the BMM K symbol"
+    for dep, layout in input_deps:
+        if not _layout_has_static_span_metadata(layout):
+            return f"input dependency {dep.name} has a non-static layout"
+        for host_dim, coord in enumerate(host_coordinates(layout, dep, None)):
+            if k_symbol not in coord.free_symbols:
+                continue
+            error = _post_tile_stick_alignment_error(layout, host_dim, split_count)
+            if error is not None:
+                return f"input dependency {dep.name} host dim {host_dim}: {error}"
+    return None
+
+
+def _bmm_k_split_candidates(op: ComputedBuffer, required_split: int) -> list[int]:
+    """Return bounded exact divisors of static BMM K."""
+    reduction_ranges = list(getattr(op.data, "reduction_ranges", []))
+    if len(reduction_ranges) != 1:
+        return []
+    try:
+        k_size = int(reduction_ranges[0])
+    except (TypeError, ValueError):
+        return []
+    if k_size <= 1:
+        return []
+    divisors = sorted(
+        {
+            divisor
+            for i in range(1, math.isqrt(k_size) + 1)
+            if k_size % i == 0
+            for divisor in (i, k_size // i)
+        }
+    )
+    legal = [
+        split
+        for split in divisors
+        if split >= max(2, required_split)
+        and split <= _MAX_AUTO_TILE_SPLIT_COUNT
+        and _bmm_k_alignment_error(op, split) is None
+    ]
+    return _cap_split_candidates(legal, required_split)
 
 
 def _output_write_dep(op: ComputedBuffer) -> MemoryDep | None:
@@ -1404,6 +1561,71 @@ def _search_min_cost_tile_plan(
     )
 
 
+def _search_bmm_k_tile_plan(
+    op: ComputedBuffer,
+    max_cores: int,
+) -> SpanOverflowTilePlan | None:
+    """Find a BMM-only reduction-range plan after B/M/N planning fails."""
+    initial_infos = _bmm_k_span_infos(op, max_cores)
+    if not initial_infos:
+        return None
+    required_split = max(
+        math.ceil(info.chunking_info.per_core_span / MAX_SPAN_BYTES)
+        for info in initial_infos
+    )
+    split_candidates = _bmm_k_split_candidates(op, required_split)
+    logger.debug(
+        "[span-overflow BMM K search] op=%s required=%d candidates=%s",
+        op.get_name(),
+        required_split,
+        split_candidates,
+    )
+    first_alignment_error: str | None = None
+    for split_count in split_candidates:
+        alignment_error = _bmm_k_alignment_error(op, split_count)
+        if alignment_error is not None:
+            first_alignment_error = first_alignment_error or alignment_error
+            continue
+        if _bmm_k_span_infos(op, max_cores, k_split=split_count):
+            continue
+        level = SpanOverflowTileLevel(
+            selected_host_dim=0,
+            split_count=split_count,
+            is_reduction=True,
+        )
+        logger.info(
+            "[span-overflow BMM K search] op=%s selected_split=%d level=%s",
+            op.get_name(),
+            split_count,
+            level,
+        )
+        return SpanOverflowTilePlan(
+            levels=(level,),
+            chunking_infos=tuple(info.chunking_info for info in initial_infos),
+            reason="; ".join(
+                sorted(
+                    {
+                        info.chunking_info.reason
+                        for info in initial_infos
+                        if info.chunking_info.reason is not None
+                    }
+                )
+            ),
+        )
+
+    detail = (
+        f" First alignment error: {first_alignment_error}."
+        if first_alignment_error is not None
+        else ""
+    )
+    raise Unsupported(
+        f"Cannot auto-tile {op.get_name()} on BMM K: no legal exact divisor "
+        f"at or above required split {required_split} makes all K-controlled "
+        f"input spans fit within {MAX_SPAN_BYTES / (1024**2):.3f} MB."
+        f"{detail}"
+    )
+
+
 def _has_indirect_reads(op: ComputedBuffer) -> bool:
     """Return True if the op uses indirect/gather-style input reads.
 
@@ -1579,6 +1801,23 @@ def plan_span_overflow_tile(
             len(output_candidates),
             len(input_candidates),
         )
-        return _search_min_cost_tile_plan(op, max_cores, candidates)
+        if not _is_batch_matmul_reduction(op):
+            return _search_min_cost_tile_plan(op, max_cores, candidates)
+
+        # Preserve the existing B/M/N policy. K is tried only as an independent
+        # fallback, and only when the output itself already fits because K tiling
+        # cannot reduce the C[B, M, N] write span.
+        output_failure: Unsupported | None = None
+        try:
+            output_plan = _search_min_cost_tile_plan(op, max_cores, candidates)
+        except Unsupported as exc:
+            output_failure = exc
+            output_plan = None
+        if output_plan is not None:
+            return output_plan
+        if output_candidates:
+            assert output_failure is not None
+            raise output_failure
+        return _search_bmm_k_tile_plan(op, max_cores)
 
     return None

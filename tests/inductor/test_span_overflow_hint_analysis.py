@@ -61,6 +61,7 @@ from torch_spyre._inductor.propagate_hints import DimHint
 from torch_spyre._inductor.wsr.coarse_tile import coarse_tile
 from torch_spyre._inductor.wsr.coarse_tile_span_overflow import (
     _SPAN_OVERFLOW_HINT_ID,
+    _dims_to_hints,
     span_overflow_groups,
 )
 from torch_spyre._inductor.ir import FixedTiledLayout
@@ -1214,6 +1215,158 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertEqual(infos, [])
         self.assertIsNone(plan)
 
+    def test_bmm_input_span_controlled_by_b_dim_plans_output_tile(self):
+        op = _reduction_op(
+            (4_194_304, 1, 16),
+            reduction_ranges=(64,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+
+        b, m, n, k = sympy.symbols("b m n k")
+
+        # BMM lhs shape is conceptually [B, M, K]. Here M is broadcast/unit,
+        # and the large physical span is controlled by B.
+        lhs_dep = MemoryDep(
+            "lhs",
+            b * 64 + k,
+            (b, k),
+            (4_194_304, 64),
+        )
+        lhs_layout = _fixed_tiled_layout((4_194_304, 64))
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+                MAX_SPAN_BYTES,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr."
+                "span_overflow_hint_analysis."
+                "_output_span_candidates_from_op",
+                return_value=[],
+            ),
+            patch(
+                "torch_spyre._inductor.wsr."
+                "span_overflow_hint_analysis._input_read_deps",
+                return_value=[(lhs_dep, lhs_layout)],
+            ),
+            patch(
+                "torch_spyre._inductor.wsr."
+                "span_overflow_hint_analysis._output_symbol_to_dim",
+                return_value={
+                    b: 0,
+                    m: 1,
+                    n: 2,
+                },
+            ),
+            patch(
+                "torch_spyre._inductor.wsr."
+                "span_overflow_hint_analysis."
+                "_remaining_span_candidates_after_tile",
+                return_value=[],
+            ),
+            patch(
+                "torch_spyre._inductor.wsr."
+                "span_overflow_hint_analysis."
+                "_search_bmm_k_tile_plan"
+            ) as k_search,
+        ):
+            plan = plan_span_overflow_tile(
+                op,
+                max_cores=1,
+            )
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(len(plan.levels), 1)
+
+        level = plan.levels[0]
+
+        self.assertEqual(
+            level.selected_host_dim,
+            0,  # ranges[0] = B
+        )
+        self.assertEqual(level.split_count, 2)
+        self.assertFalse(level.is_reduction)
+
+        # A valid B output tile must be selected before considering K.
+        k_search.assert_not_called()
+
+    def test_bmm_input_span_controlled_by_m_dim_plans_output_tile(self):
+        op = _reduction_op(
+            (1, 4_194_304, 16),
+            reduction_ranges=(64,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+
+        b, m, n, k = sympy.symbols("b m n k")
+
+        # BMM lhs shape is conceptually [B, M, K]. The large physical
+        # input span is controlled by the output M dimension.
+        lhs_dep = MemoryDep(
+            "lhs",
+            m * 64 + k,
+            (m, k),
+            (4_194_304, 64),
+        )
+        lhs_layout = _fixed_tiled_layout((4_194_304, 64))
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+                MAX_SPAN_BYTES,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr."
+                "span_overflow_hint_analysis."
+                "_output_span_candidates_from_op",
+                return_value=[],
+            ),
+            patch(
+                "torch_spyre._inductor.wsr."
+                "span_overflow_hint_analysis._input_read_deps",
+                return_value=[(lhs_dep, lhs_layout)],
+            ),
+            patch(
+                "torch_spyre._inductor.wsr."
+                "span_overflow_hint_analysis._output_symbol_to_dim",
+                return_value={
+                    b: 0,
+                    m: 1,
+                    n: 2,
+                },
+            ),
+            patch(
+                "torch_spyre._inductor.wsr."
+                "span_overflow_hint_analysis."
+                "_remaining_span_candidates_after_tile",
+                return_value=[],
+            ),
+            patch(
+                "torch_spyre._inductor.wsr."
+                "span_overflow_hint_analysis."
+                "_search_bmm_k_tile_plan"
+            ) as k_search,
+        ):
+            plan = plan_span_overflow_tile(
+                op,
+                max_cores=1,
+            )
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(len(plan.levels), 1)
+
+        level = plan.levels[0]
+
+        self.assertEqual(
+            level.selected_host_dim,
+            1,  # ranges[1] = M
+        )
+        self.assertEqual(level.split_count, 2)
+        self.assertFalse(level.is_reduction)
+
+        # A valid M output tile must be selected before considering K.
+        k_search.assert_not_called()
+
     def test_bmm_input_span_controlled_by_n_dim_plans_output_tile(self):
         op = _reduction_op(
             (1, 16, 4_194_304), reduction_ranges=(64,), reduction_type=BATCH_MATMUL_OP
@@ -1255,6 +1408,100 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertEqual(plan.levels[0].selected_host_dim, 2)
         self.assertEqual(plan.levels[0].split_count, 2)
         self.assertFalse(plan.levels[0].is_reduction)
+
+    def test_bmm_input_span_controlled_by_k_dim_plans_reduction_tile(self):
+        op = _reduction_op(
+            (1, 1, 64), reduction_ranges=(65536,), reduction_type=BATCH_MATMUL_OP
+        )
+        b, m, n, k = sympy.symbols("b m n k")
+        rhs_dep = MemoryDep("rhs", k * 64 + n, (k, n), (65536, 64))
+        rhs_layout = _fixed_tiled_layout((65536, 64))
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+                5 * 1024 * 1024,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._output_span_candidates_from_op",
+                return_value=[],
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._input_read_deps",
+                return_value=[(rhs_dep, rhs_layout)],
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._output_symbol_to_dim",
+                return_value={b: 0, m: 1, n: 2},
+            ),
+        ):
+            plan = plan_span_overflow_tile(op, max_cores=1)
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(
+            plan.levels,
+            (
+                SpanOverflowTileLevel(
+                    selected_host_dim=0,
+                    split_count=2,
+                    is_reduction=True,
+                ),
+            ),
+        )
+        self.assertIn("BMM K input span overflow", plan.reason)
+
+    def test_bmm_k_fallback_does_not_hide_output_overflow(self):
+        op = _reduction_op(
+            (1, 1, 64), reduction_ranges=(65536,), reduction_type=BATCH_MATMUL_OP
+        )
+        output_candidate = SimpleNamespace(
+            chunking_info=SimpleNamespace(selected_host_dim=2), source="output"
+        )
+        failure = Unsupported("output still overflows")
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._output_span_candidates_from_op",
+                return_value=[output_candidate],
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._input_span_candidates",
+                return_value=[],
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._search_min_cost_tile_plan",
+                side_effect=failure,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._search_bmm_k_tile_plan"
+            ) as k_search,
+        ):
+            with self.assertRaisesRegex(Unsupported, "output still overflows"):
+                plan_span_overflow_tile(op, max_cores=1)
+
+        k_search.assert_not_called()
+
+    def test_bmm_k_plan_adapts_to_reduction_loop_variable(self):
+        op = _reduction_op(
+            (1, 1, 64), reduction_ranges=(65536,), reduction_type=BATCH_MATMUL_OP
+        )
+        k = sympy.Symbol("k")
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
+                return_value=[sympy.Symbol("b"), sympy.Symbol("m"), sympy.Symbol("n")],
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow._bmm_k_symbol",
+                return_value=k,
+            ),
+        ):
+            hints = _dims_to_hints(op, ((0, 4, True),), [_SPAN_OVERFLOW_HINT_ID])
+
+        self.assertEqual(len(hints), 1)
+        self.assertEqual(hints[0].loop_var, k)
+        self.assertEqual(hints[0].split_count, 4)
+        self.assertTrue(hints[0].is_reduction)
 
     def test_bmm_input_span_controlled_by_k_dim_skips(self):
         op = _reduction_op(
