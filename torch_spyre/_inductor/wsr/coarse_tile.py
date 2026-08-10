@@ -2393,22 +2393,23 @@ def _insert_read_copy_ops(
             # full_layout.size squeezed out, undoing the same squeeze
             # applied to tiled_op's own ranges elsewhere in this function
             # (see squeeze_pos above).
-            tile_size_ints = []
-            it_idx = 0
-            for s in full_size_ints:
-                if s == 1:
-                    tile_size_ints.append(1)
-                else:
-                    tile_size_ints.append(int(tile_ranges[it_idx]))
-                    it_idx += 1
-            if it_idx != len(tile_ranges):
+            # Count the non-unit dims and check the pairing *before* walking,
+            # not after.  The walk consumes one tile_ranges entry per non-unit
+            # dim, so a check placed after it only catches the direction where
+            # entries are left over.  The opposite direction -- more non-unit
+            # buffer dims than iteration extents -- would run off the end of
+            # tile_ranges inside the loop and raise IndexError, which is the
+            # same "error from deep inside a pass" this guard exists to
+            # replace, just wearing a different exception type.
+            non_unit_dims = sum(1 for s in full_size_ints if s != 1)
+            if non_unit_dims != len(tile_ranges):
                 # TODO(span-overflow-read-copy): support tiled ops whose
                 # iteration space does not map one-to-one onto an input's
                 # dimensions.  Replace this marker with the tracking issue
                 # number once filed; the three xfailed tests named at the
                 # bottom of this comment are the ones it unblocks.
                 #
-                # The walk above pairs each of full_buf's non-unit dims with
+                # The walk below pairs each of full_buf's non-unit dims with
                 # the next entry of tile_ranges (== dep.size, the op's
                 # iteration extents), assuming the two have the same number of
                 # non-unit entries.  That holds only when every input has the
@@ -2476,6 +2477,18 @@ def _insert_read_copy_ops(
                     "that does not use every loop variable such as a "
                     "batch-tiled bmm operand."
                 )
+            # Reinsert a 1 at each raw position full_layout.size squeezed out.
+            # The guard above has established that the non-unit dims and
+            # tile_ranges are the same length, so this walk cannot run off the
+            # end.
+            tile_size_ints = []
+            it_idx = 0
+            for s in full_size_ints:
+                if s == 1:
+                    tile_size_ints.append(1)
+                else:
+                    tile_size_ints.append(int(tile_ranges[it_idx]))
+                    it_idx += 1
             # Authoritative stick host dim from coordinate identity (issue
             # #3116); None falls back to size-based inference inside
             # _resize_device_layout.
