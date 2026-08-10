@@ -304,7 +304,8 @@ def _dims_to_hints(
 #              |                                |                            |
 #              |  Reduction that reads the run, equal split counts, and       |
 #              |  _consumer_shares_group_tiled_dim: append, then FLUSH        |
-#              |  (a Reduction is always its group's last member) ------------|
+#              |  (a *joining* Reduction always ends its group; the Reduction |
+#              |  that ROOTED the run is its first member, not its last) -----|
 #              |                                |                            |
 #              |  op reads the run but fits no branch above: FLUSH, then      |
 #              |  raise Unsupported (two unsynchronized loop nests) ----------|
@@ -360,8 +361,12 @@ def span_overflow_groups(
     The join is reduction-type-agnostic: what makes it safe is that the tiled
     dim is an output range, not the reduction range (tile ``t`` is
     self-contained either way).  On joining, the group is flushed immediately,
-    so a Reduction is always the last member of its group and each auto-tiled
-    producer feeds at most one reduction consumer.
+    so a *joining* Reduction is always the last member of its group and each
+    auto-tiled producer feeds at most one reduction consumer.  Note this says
+    nothing about a Reduction that **roots** a run (below): that one is its
+    group's first member, and the group may well end on a Pointwise op -- e.g.
+    ``[bmm, pointwise]``, as in
+    ``test_bmm_producer_groups_with_pointwise_consumer``.
 
     A Reduction that cannot join instead **opens its own run**
     (``current_root_is_reduction``), so a directly-connected consumer can fuse

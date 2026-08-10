@@ -781,9 +781,12 @@ synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
    loop variable actually indexes the producer's tiled dim through the read,
    for *every* dep it reads that producer through (matching split counts alone
    do not qualify). Only output-range tiles may join (never a reduction
-   range). On joining, the group is flushed immediately, so a Reduction is
-   always the last member of its group and each auto-tiled producer feeds at
-   most one reduction consumer.  A Reduction that joins nothing instead
+   range). On joining, the group is flushed immediately, so a *joining*
+   Reduction is always the last member of its group and each auto-tiled
+   producer feeds at most one reduction consumer.  This says nothing about a
+   Reduction that *roots* a run: that one is its group's first member, and the
+   group can end on a Pointwise op (`[bmm, pointwise]`).  A Reduction that
+   joins nothing instead
    **opens a Reduction-rooted run** (`current_root_is_reduction`) rather than
    being emitted as a closed singleton, so a directly-connected consumer can
    fuse into its loop — Pointwise (BMM → PW) or another Reduction (BMM → BMM,
@@ -913,7 +916,9 @@ violates the hardware span limit or silently creates unsynchronized tile loops.
   Reduction (matmul/BMM, `sum`, `mean`, `max`, ...) may **join** an open run's
   group as its terminal member when it tiles the same shared output dim at the
   same split count (see step 5 above); the group is flushed immediately on
-  joining, so a Reduction is always the last member of its group. A Reduction
+  joining, so a *joining* Reduction is always the last member of its group — a
+  Reduction that *roots* a run is its first member instead, and that group can
+  end on a Pointwise op. A Reduction
   that joins nothing instead opens its own run, so a consumer reading it can
   fuse into its loop — Pointwise (BMM → PW) or another Reduction (BMM → BMM,
   BMM → `sum`). What's still unsupported:
