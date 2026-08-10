@@ -251,6 +251,16 @@ same tiled buffer through several deps at different indices (`x @ x.T`), and
 verifying only one access pattern would let a partial-result read through
 whenever it was paired with a safe one.
 
+The correspondence is checked **per tile level**, pairing producer level `i`
+with consumer level `i`.  A plan can carry several levels (one per output dim
+it must tile), and levels are paired by position everywhere else in the pass —
+split counts are compared positionally and `_dims_to_hints` zips levels to
+hint IDs in the same order.  Matching a producer level against the union of the
+consumer's tiled symbols would therefore accept a *crosswise* match, where
+every level corresponds to some consumer level but never the one it will share
+a loop with.  The two forms are equivalent for single-level plans; per-level is
+the fail-closed one once a plan has more than one level.
+
 Code flow:
 
 ```text
@@ -1071,7 +1081,10 @@ Rejection behaviour is covered too: a consumer whose tiled loop var does not
 index the producer's tiled dim, a producer whose tiled dim is the consumer's
 reduction (`k`) range (the partial-sum case, as in `bmm(bmm(q, k), v)`), a
 consumer reading the producer through several deps where only one corresponds,
-and a Reduction consumer still terminating its group.
+a two-level plan whose levels correspond only crosswise (paired with a
+same-shape test where they correspond level for level, so the per-level check
+is shown to accept as well as reject), and a Reduction consumer still
+terminating its group.
 
 ## Key Files
 

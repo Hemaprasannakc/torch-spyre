@@ -80,7 +80,10 @@ def _consumer_shares_group_tiled_dim(
     counts is necessary but not sufficient (two unrelated dims could split into
     the same count), so verify the loop-variable correspondence explicitly: the
     symbol tiling the consumer's output dim must appear in the producer's tiled
-    coordinate as seen through the read.
+    coordinate as seen through the read.  A plan may carry several tile levels;
+    the check is made **per level**, pairing producer level ``i`` with consumer
+    level ``i`` the way the rest of the pass does, so a multi-level plan whose
+    levels correspond only crosswise is rejected rather than accepted.
 
     Conservative: any failure to establish the correspondence returns False, so
     an unverifiable pair is left to the normal (Unsupported) conflict path
@@ -149,12 +152,28 @@ def _consumer_shares_group_tiled_dim(
         # get_read_writes()/indirect_sizes_from_op attribute access).
         return False
 
-    consumer_tiled_syms: set = set()
+    # Collect the tiling symbols *per level*, not unioned across levels.  Levels
+    # are paired by position everywhere else in the pass -- the join branch
+    # compares split counts positionally and ``_dims_to_hints`` zips levels to
+    # hint_ids in the same order -- so producer level ``i`` shares its loop with
+    # consumer level ``i`` and each pair must correspond on its own.  A union
+    # would let a producer's level-0 dim satisfy the check by matching the
+    # consumer's level-1 dim: a cross-level match that passes while the per-level
+    # loop nests do not correspond.  The two are equivalent for single-level
+    # plans, but the auto planner emits one level per output dim it must tile
+    # (see ``plan_span_overflow_tile``), so multi-level plans are reachable and
+    # the per-level form is the fail-closed one.
+    consumer_level_syms: list[set] = []
     for host_dim, _split, _is_reduction in signature:
         if host_dim >= len(consumer_coords):
             return False
-        consumer_tiled_syms |= consumer_coords[host_dim].free_symbols
-    if not consumer_tiled_syms:
+        level_syms = consumer_coords[host_dim].free_symbols
+        if not level_syms:
+            # A tiled dim with no loop var of its own cannot be shown to
+            # correspond to anything -- fail closed rather than skip the level.
+            return False
+        consumer_level_syms.append(level_syms)
+    if not consumer_level_syms:
         return False
 
     group_by_name = {gop.get_name(): (gop, dims) for gop, dims in current_group}
@@ -163,18 +182,30 @@ def _consumer_shares_group_tiled_dim(
         if name not in group_by_name:
             continue
         producer, producer_dims = group_by_name[name]
+        if len(producer_dims) != len(consumer_level_syms):
+            # Levels are paired by position; different level counts mean there is
+            # no such pairing to verify.  (The callers only group ops with equal
+            # split-count lists, so this is a guard against a future caller
+            # rather than a case reachable today.)
+            return False
         for dep in deps:
             try:
                 producer_coords = host_coordinates(producer.get_layout(), dep, indirect)
             except (TypeError, ValueError, RuntimeError, KeyError, IndexError):
                 return False
-            for host_dim_p, _split, _is_reduction in producer_dims:
+            for level, (host_dim_p, _split, _is_reduction) in enumerate(producer_dims):
                 if host_dim_p >= len(producer_coords):
                     return False
-                if not (producer_coords[host_dim_p].free_symbols & consumer_tiled_syms):
-                    # Consumer's tiled loop var does not index this producer's
-                    # tiled dim -> not the same logical dim -> unsafe to share
-                    # a loop.  For a Reduction consumer this is also what
+                if not (
+                    producer_coords[host_dim_p].free_symbols
+                    & consumer_level_syms[level]
+                ):
+                    # The consumer's loop var *at this level* does not index the
+                    # producer's tiled dim at the same level -> not the same
+                    # logical dim -> unsafe to share a loop.  Checking level by
+                    # level is what makes a multi-level plan whose levels match
+                    # only crosswise fail here rather than slip through.
+                    # For a Reduction consumer this is also what
                     # rejects a producer whose tiled dim lands on the consumer's
                     # reduction (K) range: K never appears in the consumer's
                     # output coordinates, so the intersection is empty and tile
@@ -243,37 +274,6 @@ def _dims_to_hints(
     return hints
 
 
-def span_overflow_groups(
-    graph: GraphLowering,
-) -> tuple[list[tuple], list[tuple[Operation, list[DimHint]]]]:
-    """Build coarse_tile() groups from automatic span-overflow plans.
-
-    This adapter converts SpanOverflowTilePlans into the same group shape as
-    user spyre_hint annotations: ``[(ops, [(hint_id, count)])]``.  Ops that
-    already carry user dim hints are left for the user-hint grouping path.
-    ``is_reduction`` is not carried in the group-level ``levels`` list; it
-    lives on each op's own ``DimHint`` and is consulted directly by
-    ``plan_coarse_tile_groups`` (via ``_op_hint_dim_positions``).
-
-    Returns a ``(groups, dim_hint_assignments)`` pair.  ``dim_hint_assignments``
-    is a list of ``(op, dim_hints)`` pairs this function decided on but did
-    NOT apply — applying them (setting ``op.dim_hints``) is the caller's
-    responsibility, and must happen before ``coarse_tile()``/
-    ``validate_coarse_tile_groups`` run, since ``dim_hints`` is an input those
-    consume, not something they produce.  Keeping the assignment out of this
-    function's own decision logic keeps ``span_overflow_groups`` a pure
-    planning step: nothing here mutates ``op`` state.
-
-    A contiguous run of Pointwise ops shares one group/loop when either:
-      - each op's own independently-searched plan
-        (``plan_span_overflow_tile``) produces the exact same
-        ``(host_dim, split_count, is_reduction)`` signature as the run so
-        far; or
-      - an op's own plan disagrees, but the run reads into it (a real
-        producer-consumer edge) and the run's existing split is *also* a
-        legal, sufficient plan for that op on its own
-        (``can_conform_pointwise_tile``) — the op then adopts the run's split
-        instead of its own.
 # State machine walked by ``span_overflow_groups`` below.  It scans the ops in
 # graph order carrying at most one *open run* -- a set of ops that will share one
 # loop nest -- held in three variables: ``current_group`` (the members),
@@ -318,6 +318,37 @@ def span_overflow_groups(
 # because a Reduction producer's output dim numbering need not match its
 # consumer's.  The reduction-join branch is identical for both -- it always runs
 # the correspondence check -- which is what makes BMM -> BMM and BMM -> sum work.
+def span_overflow_groups(
+    graph: GraphLowering,
+) -> tuple[list[tuple], list[tuple[Operation, list[DimHint]]]]:
+    """Build coarse_tile() groups from automatic span-overflow plans.
+
+    This adapter converts SpanOverflowTilePlans into the same group shape as
+    user spyre_hint annotations: ``[(ops, [(hint_id, count)])]``.  Ops that
+    already carry user dim hints are left for the user-hint grouping path.
+    ``is_reduction`` is not carried in the group-level ``levels`` list; it
+    lives on each op's own ``DimHint`` and is consulted directly by
+    ``plan_coarse_tile_groups`` (via ``_op_hint_dim_positions``).
+
+    Returns a ``(groups, dim_hint_assignments)`` pair.  ``dim_hint_assignments``
+    is a list of ``(op, dim_hints)`` pairs this function decided on but did
+    NOT apply — applying them (setting ``op.dim_hints``) is the caller's
+    responsibility, and must happen before ``coarse_tile()``/
+    ``validate_coarse_tile_groups`` run, since ``dim_hints`` is an input those
+    consume, not something they produce.  Keeping the assignment out of this
+    function's own decision logic keeps ``span_overflow_groups`` a pure
+    planning step: nothing here mutates ``op`` state.
+
+    A contiguous run of Pointwise ops shares one group/loop when either:
+      - each op's own independently-searched plan
+        (``plan_span_overflow_tile``) produces the exact same
+        ``(host_dim, split_count, is_reduction)`` signature as the run so
+        far; or
+      - an op's own plan disagrees, but the run reads into it (a real
+        producer-consumer edge) and the run's existing split is *also* a
+        legal, sufficient plan for that op on its own
+        (``can_conform_pointwise_tile``) — the op then adopts the run's split
+        instead of its own.
 
     A Reduction op does not extend a Pointwise run.  Any Reduction
     (matmul/BMM, sum, mean, ...) may **join** an open run's group when it

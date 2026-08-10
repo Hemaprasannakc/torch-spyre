@@ -426,6 +426,156 @@ class TestSpanOverflowGroups(InductorTestCase):
             reason="output span overflow",
         )
 
+    @staticmethod
+    def _fake_multi_level_plan(*levels):
+        """A plan with several tile levels, as ``(host_dim, split_count)`` pairs.
+
+        The real planner emits one level per output dim it must tile, ordered
+        by host dim (see ``plan_span_overflow_tile``).  Levels are paired by
+        position downstream -- split counts are compared positionally and
+        ``_dims_to_hints`` zips levels to hint_ids in the same order -- which
+        is what the per-level correspondence tests below exercise.
+        """
+        return SpanOverflowTilePlan(
+            levels=tuple(
+                SpanOverflowTileLevel(
+                    selected_host_dim=host_dim, split_count=split_count
+                )
+                for host_dim, split_count in levels
+            ),
+            chunking_infos=tuple(
+                ChunkingInfo(
+                    total_bytes=1,
+                    per_core_span=1,
+                    core_split_estimate=1,
+                    selected_device_dim_size=split_count,
+                    selected_device_span_stride_elems=1,
+                    selected_host_dim=host_dim,
+                    stick_elems=64,
+                    reason="output span overflow",
+                )
+                for host_dim, split_count in levels
+            ),
+            reason="output span overflow",
+        )
+
+    def _multi_level_producer_and_reduction(self):
+        """A Pointwise 'buf0' read by a Reduction 'buf1', both two-level tiled.
+
+        Both sides plan levels ``[(host_dim=1, split=5), (host_dim=2, split=7)]``
+        so the split-count lists match positionally and the join hinges purely
+        on the loop-var correspondence the callers then check.
+        """
+        producer = _pointwise_op(_E2E_SHAPE, name="buf0")
+        reduction = _reduction_op(
+            _E2E_SHAPE, name="buf1", reduction_type=BATCH_MATMUL_OP
+        )
+        reduction.get_read_writes = MagicMock(
+            return_value=SimpleNamespace(
+                reads={
+                    MemoryDep(
+                        "buf0",
+                        sympy.Symbol("h"),
+                        (sympy.Symbol("h"),),
+                        (8195,),
+                    )
+                },
+                writes=_default_read_writes_for_output(
+                    "buf1", _E2E_SHAPE, reduction.layout
+                ).writes,
+            )
+        )
+        return producer, reduction
+
+    def _run_multi_level_join(self, producer_coords):
+        """Plan both ops two-level and run the pass with ``producer_coords``.
+
+        ``producer_coords`` is what the producer's tiled dims look like *through
+        the consumer's read*; the consumer's own coordinates stay ``[b, h, l, d]``,
+        so its level 0 (host_dim=1) tiles ``h`` and its level 1 (host_dim=2)
+        tiles ``l``.
+        """
+        producer, reduction = self._multi_level_producer_and_reduction()
+
+        def fake_plan(_op, _max_cores):
+            return self._fake_multi_level_plan((1, 5), (2, 7))
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+                fake_plan,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
+                _out_coords_for_symbolic_bhld,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.host_coordinates",
+                lambda layout, dep, indirect: list(producer_coords),
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.indirect_sizes_from_op",
+                lambda op: {},
+            ),
+            config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
+        ):
+            return _apply_span_overflow(_graph([producer, reduction])), (
+                producer,
+                reduction,
+            )
+
+    def test_multi_level_join_rejected_when_levels_correspond_crosswise(self):
+        """A cross-level symbol match must not license a multi-level join.
+
+        The consumer tiles ``h`` at level 0 and ``l`` at level 1.  Here the
+        producer's level-0 dim (host_dim=1) is indexed by ``l`` and its level-1
+        dim (host_dim=2) by ``h`` -- every producer level matches *some*
+        consumer level, but never the level it will actually share a loop with.
+        Unioning the consumer's tiled symbols across levels would accept this;
+        the per-level check in ``_consumer_shares_group_tiled_dim`` rejects it,
+        which is the point: level 0 of the shared loop nest would step ``h`` on
+        one side and ``l`` on the other.
+        """
+        with self.assertRaisesRegex(
+            Unsupported,
+            "reads auto-tiled producer.*cannot join them.*same shared "
+            "output dimension at the same split count",
+        ):
+            self._run_multi_level_join(
+                [
+                    sympy.Symbol("b"),
+                    sympy.Symbol("l"),
+                    sympy.Symbol("h"),
+                    sympy.Symbol("d"),
+                ]
+            )
+
+    def test_multi_level_join_accepted_when_levels_correspond_per_level(self):
+        """The per-level check still accepts a genuinely corresponding join.
+
+        Same two-level shape as the crosswise test, but the producer's level-0
+        dim is indexed by ``h`` and its level-1 dim by ``l`` -- matching the
+        consumer level for level.  Load-bearing as the counterpart to that
+        test: without it, a per-level check that rejected *every* multi-level
+        pair would look correct.
+        """
+        groups, (producer, reduction) = self._run_multi_level_join(
+            [
+                sympy.Symbol("b"),
+                sympy.Symbol("h"),
+                sympy.Symbol("l"),
+                sympy.Symbol("d"),
+            ]
+        )
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(groups[0][0], [producer, reduction])
+        self.assertEqual([hint.split_count for hint in producer.dim_hints], [5, 7])
+        self.assertEqual(
+            [hint.hint_id for hint in producer.dim_hints],
+            [hint.hint_id for hint in reduction.dim_hints],
+        )
+
     def test_chained_pointwise_ops_conform_to_producer_split(self):
         """op1's own search disagrees with op0's, but op0's split is also
         legal and sufficient for op1 (identical shape/layout) -- op1 should
@@ -2963,6 +3113,10 @@ def _forced_span_plan_on_dim1(split_count, expect_size):
     ``test_pointwise_to_non_matmul_reduction_join_numeric``, whose earlier
     organic-plan version failed on hardware for exactly that reason), so
     without this the join under test would never form.
+
+    Divisibility is checked here rather than left to ``coarse_tile``, so a bad
+    ``split_count`` fails as a plain assertion in the test setup instead of as
+    an ``Unsupported`` from deep in the pass.
     """
     real_plan = plan_span_overflow_tile
     assert expect_size % split_count == 0
@@ -3113,10 +3267,6 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         """Pointwise -> Reduction (#3270), at codegen depth.
 
         Its on-device counterpart
-
-    Divisibility is checked here rather than left to ``coarse_tile``, so a bad
-    ``split_count`` fails as a plain assertion in the test setup instead of as
-    an ``Unsupported`` from deep in the pass.
         (``test_pointwise_to_non_matmul_reduction_join_numeric``) already
         passes; this pins the same direction one layer earlier so a codegen
         regression is distinguishable from an execution one.
