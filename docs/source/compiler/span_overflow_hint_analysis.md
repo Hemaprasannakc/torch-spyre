@@ -773,7 +773,11 @@ synthetic `DimHint` per level.  `coarse_tile` then stamps a multi-level
    by the open run and the run's split is *also* legal and sufficient for
    that op on its own (`can_conform_pointwise_tile`) — the op then adopts the
    run's split instead of its own. A Reduction op does not extend a
-   Pointwise run and is never a conform target, but any Reduction
+   Pointwise run and never conforms itself — `can_conform_pointwise_tile`
+   refuses any non-Pointwise op — though a Reduction-rooted run *can* be
+   conformed **to**, by a Pointwise consumer that reads it and passes
+   `_consumer_shares_group_tiled_dim`
+   (`test_pointwise_consumer_conforms_to_bmm_producer_split`). Any Reduction
    (matmul/BMM, `sum`, `mean`, `max`, ...) may **join** an open run's group
    when it reads a producer in that run and tiles the same shared output dim
    at the same split count(s) — verified by
