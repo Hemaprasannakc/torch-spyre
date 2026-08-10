@@ -274,6 +274,50 @@ def span_overflow_groups(
         legal, sufficient plan for that op on its own
         (``can_conform_pointwise_tile``) — the op then adopts the run's split
         instead of its own.
+# State machine walked by ``span_overflow_groups`` below.  It scans the ops in
+# graph order carrying at most one *open run* -- a set of ops that will share one
+# loop nest -- held in three variables: ``current_group`` (the members),
+# ``current_signature`` (the shared tiling), and ``current_root_is_reduction``
+# (which of the two run kinds it is).  ``flush_current_group()`` emits the open
+# run as a group and returns to CLOSED.
+#
+#                          .---------------------------------.
+#                          |             CLOSED              |<--------------.
+#                          |   current_group == []           |               |
+#                          |   current_signature is None     |               |
+#                          '---------------------------------'               |
+#                             |                         |                    |
+#          Pointwise w/ plan  |                         |  Reduction w/ plan |
+#                             |                         |  joining nothing   |
+#                             v                         v                    |
+#     .------------------------------.   .------------------------------.    |
+#     |        PW-ROOTED RUN         |   |       RED-ROOTED RUN         |    |
+#     |   root_is_reduction = False  |   |   root_is_reduction = True   |    |
+#     '------------------------------'   '------------------------------'    |
+#        ^      |                            ^      |                        |
+#        |      |  PW, same signature        |      |  PW, same signature    |
+#        '------'  -- or -- PW that reads    '------'  AND reads the run     |
+#          stay    the run and conforms        stay    AND correspondence    |
+#                  to its split (can_                   -- or -- PW that     |
+#                  conform_pointwise_tile)               conforms AND        |
+#                                                        correspondence      |
+#              |                                |                            |
+#              |  Reduction that reads the run, equal split counts, and       |
+#              |  _consumer_shares_group_tiled_dim: append, then FLUSH        |
+#              |  (a Reduction is always its group's last member) ------------|
+#              |                                |                            |
+#              |  op reads the run but fits no branch above: FLUSH, then      |
+#              |  raise Unsupported (two unsynchronized loop nests) ----------|
+#              |                                |                            |
+#              |  anything else (no plan, hinted, non-tileable, end of        |
+#              |  graph): FLUSH -- the run may re-open on the next op --------'
+#
+# The two run kinds differ in exactly one way: a PW-rooted run lets the two
+# Pointwise fast paths in on matching signatures alone, while a RED-rooted run
+# additionally demands a real read edge plus the loop-var correspondence check,
+# because a Reduction producer's output dim numbering need not match its
+# consumer's.  The reduction-join branch is identical for both -- it always runs
+# the correspondence check -- which is what makes BMM -> BMM and BMM -> sum work.
 
     A Reduction op does not extend a Pointwise run.  Any Reduction
     (matmul/BMM, sum, mean, ...) may **join** an open run's group when it
@@ -348,11 +392,16 @@ def span_overflow_groups(
     current_group: list[tuple[ComputedBuffer, _PwDims]] = []
     current_signature: _PwDims | None = None
     # True when the open run was opened by a Reduction rather than a Pointwise
-    # op (BMM -> PW).  Consumers joining such a run face a producer whose output
-    # dim numbering need not match their own, so they must clear the extra
-    # ``_consumer_shares_group_tiled_dim`` correspondence check; and the
-    # reduction-join branch is disabled for these runs to keep Reduction ->
-    # Reduction chaining out of scope.
+    # op (BMM -> PW, BMM -> BMM, BMM -> sum).  A consumer of such a run faces a
+    # producer whose output dim numbering need not match its own, so the
+    # positional reuse of the run's ``host_dim`` that the two **Pointwise** fast
+    # paths rely on (matching-signature join and ``can_conform_pointwise_tile``)
+    # is no longer self-justifying: this flag is what makes those two paths
+    # additionally require a real read edge and
+    # ``_consumer_shares_group_tiled_dim``.  A **Reduction** consumer needs no
+    # such gate here because the reduction-join branch already runs that check
+    # unconditionally -- Reduction -> Reduction chaining is supported, and the
+    # join branch is deliberately *not* keyed on this flag.
     current_root_is_reduction = False
 
     def flush_current_group() -> None:
