@@ -3113,6 +3113,10 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         """Pointwise -> Reduction (#3270), at codegen depth.
 
         Its on-device counterpart
+
+    Divisibility is checked here rather than left to ``coarse_tile``, so a bad
+    ``split_count`` fails as a plain assertion in the test setup instead of as
+    an ``Unsupported`` from deep in the pass.
         (``test_pointwise_to_non_matmul_reduction_join_numeric``) already
         passes; this pins the same direction one layer earlier so a codegen
         regression is distinguishable from an execution one.
@@ -3823,55 +3827,6 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
             fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
-    @staticmethod
-    def _forced_plan_on_host_dim1(split_count, expect_size):
-        """Force every op whose output dim 1 is ``expect_size`` onto one plan.
-
-        The sibling pointwise test scopes its forced plan by buffer *name*
-        ('buf0'/'buf1'), which it could only do because a real hardware run
-        surfaced those names in an ``Unsupported`` message first.  A matmul
-        graph lowers to more buffers than that (a restickified operand among
-        them) and their names are not knowable without running it, so these
-        tests key on the output shape instead: any op carrying the shared
-        tiled dim gets the shared plan, and anything else falls back to the
-        real planner rather than being handed a nonsensical tile.
-
-        Divisibility is checked here rather than left to ``coarse_tile``, so a
-        bad ``split_count`` fails as a plain assertion in the test setup
-        instead of as an ``Unsupported`` from deep in the pass.
-        """
-        real_plan = plan_span_overflow_tile
-        assert expect_size % split_count == 0
-
-        def forced(op, max_cores):
-            ranges = list(getattr(op.data, "ranges", None) or [])
-            try:
-                shares_tiled_dim = len(ranges) >= 2 and int(ranges[1]) == expect_size
-            except (TypeError, ValueError):
-                shares_tiled_dim = False
-            if not shares_tiled_dim:
-                return real_plan(op, max_cores)
-            return SpanOverflowTilePlan(
-                levels=(
-                    SpanOverflowTileLevel(selected_host_dim=1, split_count=split_count),
-                ),
-                chunking_infos=(
-                    ChunkingInfo(
-                        total_bytes=1,
-                        per_core_span=1,
-                        core_split_estimate=1,
-                        selected_device_dim_size=split_count,
-                        selected_device_span_stride_elems=1,
-                        selected_host_dim=1,
-                        stick_elems=64,
-                        reason="forced for numeric join validation",
-                    ),
-                ),
-                reason="forced for numeric join validation",
-            )
-
-        return forced
-
     def _assert_single_loop_spec(self, *expected_ops):
         """Return a source_check asserting one shared LoopSpec over the ops.
 
@@ -3958,7 +3913,7 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
 
         with patch(
             "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
-            self._forced_plan_on_host_dim1(5, H),
+            _forced_span_plan_on_dim1(5, H),
         ):
             compare_with_cpu(
                 fn,
@@ -4029,7 +3984,7 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
 
         with patch(
             "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
-            self._forced_plan_on_host_dim1(5, H),
+            _forced_span_plan_on_dim1(5, H),
         ):
             compare_with_cpu(
                 fn,
