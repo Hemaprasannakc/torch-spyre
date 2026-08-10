@@ -124,9 +124,15 @@ def _consumer_shares_group_tiled_dim(
     ``SpanOverflowTileLevel``: ``is_reduction`` is always False on the auto
     path, because reduction-range tiling would require partial-result
     accumulation), so every signature reaching here should already be
-    output-only.  We assert that invariant explicitly below and fail closed if
-    a future planner change ever emits a reduction-range tile — such a tile
-    would break the loop-carried accumulation this join assumes away.
+    output-only.  We assert that invariant explicitly below — on **both** the
+    consumer's signature and each producer's dims — and fail closed if a future
+    planner change ever emits a reduction-range tile, since such a tile would
+    break the loop-carried accumulation this join assumes away.
+
+    Checking the producer side matters only because a Reduction can now root a
+    run (see ``span_overflow_groups``).  Before that, an unjoined Reduction
+    became a closed singleton and could never be an open group's producer, so
+    the consumer-side check alone covered every reachable case.
     """
     # Guard: only output-range tiles may join.  A reduction (K) range tile
     # would need cross-tile accumulation and cannot share a per-tile loop nest.
@@ -182,6 +188,11 @@ def _consumer_shares_group_tiled_dim(
         if name not in group_by_name:
             continue
         producer, producer_dims = group_by_name[name]
+        if any(is_reduction for _host_dim, _split, is_reduction in producer_dims):
+            # Same rule as the consumer-side guard at the top, applied to the
+            # producer: tile t of a reduction-range tile is a partial
+            # accumulation, so it cannot be paired with tile t of anything.
+            return False
         if len(producer_dims) != len(consumer_level_syms):
             # Levels are paired by position; different level counts mean there is
             # no such pairing to verify.  (The callers only group ops with equal
