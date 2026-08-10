@@ -919,7 +919,11 @@ violates the hardware span limit or silently creates unsynchronized tile loops.
     counterpart to the Pointwise conform path, and adding one is not
     mechanical: Reduction auto-tiling has rules Pointwise does not, such as
     rejecting splits that shrink the selected output dim's per-tile extent
-    to `1`;
+    to `1`. Tracked in
+    [#3625](https://github.com/torch-spyre/torch-spyre/issues/3625) and tagged
+    `TODO(span-overflow-reduction-conform)`, so this limitation and the
+    `matmul -> matmul` "n/a" row in the coverage matrix below can be found and
+    retired together;
   - a producer whose tiled dim lands on a Reduction consumer's reduction
     (`k`) range — tile `t` would be a partial-result slice
     (`_consumer_shares_group_tiled_dim` rejects it);
@@ -1058,7 +1062,10 @@ matches loop counters to input dimensions one-to-one, and a matmul operand
 always has one fewer.  A tiled **reduction** reading a full-size buffer reaches
 codegen but is rejected by the backend.  `matmul -> matmul` is marked n/a rather
 than xfail because it is refused by design -- a Reduction consumer has no
-conform path, so both plans must independently agree.
+conform path, so both plans must independently agree
+(`TODO(span-overflow-reduction-conform)`,
+[#3625](https://github.com/torch-spyre/torch-spyre/issues/3625) — the same tag
+as the `can_conform_reduction_tile` limitation above; retire both together).
 
 Rejection behaviour is covered too: a consumer whose tiled loop var does not
 index the producer's tiled dim, a producer whose tiled dim is the consumer's
