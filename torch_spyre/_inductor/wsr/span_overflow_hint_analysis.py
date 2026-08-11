@@ -733,6 +733,8 @@ def _bmm_k_span_infos(
     op: ComputedBuffer,
     max_cores: int,
     k_split: int = 1,
+    *,
+    split_by_host_dim: dict[int, int] | None = None,
 ) -> list[BMMKSpanInfo]:
     """Return BMM input overflows that shrink when K is split."""
     del max_cores  # Conservatively assume no work-division help.
@@ -740,6 +742,11 @@ def _bmm_k_span_infos(
     k_symbol = _bmm_k_symbol(op, input_deps)
     if k_symbol is None:
         return []
+    if split_by_host_dim is None:
+        split_by_host_dim = {}
+    output_symbol_to_dim = _output_symbol_to_dim(op)
+    span_symbol_to_dim = {**output_symbol_to_dim, k_symbol: -1}
+    span_split_by_host_dim = {**split_by_host_dim, -1: k_split}
 
     infos: list[BMMKSpanInfo] = []
     for dep, layout in input_deps:
@@ -755,7 +762,13 @@ def _bmm_k_span_infos(
         for device_dim, coord in enumerate(device_coords[:-1]):
             if k_symbol not in coord.free_symbols:
                 continue
-            coord_span_elems = _coordinate_span_elems(coord, dep, {k_symbol: k_split})
+            split_by_symbol = _split_by_symbol_for_coord(
+                coord,
+                output_symbol_to_dim,
+                split_by_host_dim,
+            )
+            split_by_symbol[k_symbol] = k_split
+            coord_span_elems = _coordinate_span_elems(coord, dep, split_by_symbol)
             if coord_span_elems is None:
                 continue
             inner_stride_elems = _tile_aware_inner_stride_elems(
@@ -763,8 +776,8 @@ def _bmm_k_span_infos(
                 device_size,
                 dep,
                 device_dim + 1,
-                {k_symbol: 0},
-                {0: k_split},
+                span_symbol_to_dim,
+                span_split_by_host_dim,
             )
             if inner_stride_elems is None:
                 continue
@@ -1438,21 +1451,35 @@ def _remaining_span_candidates_after_tile(
         op_name=f"{op.get_name()}:post_tile",
     )
     if isinstance(op.data, Reduction):
-        remaining += [
-            SpanOverflowCandidate(info.chunking_info, source=f"input:{info.dep_name}")
-            for info in _input_span_infos_controlled_by_output_dims(
+        if k_split is None:
+            remaining += _input_span_candidates(
                 op,
                 max_cores,
                 split_by_host_dim=split_by_host_dim,
-                k_split=k_split,
             )
-        ]
+        else:
+            remaining += [
+                SpanOverflowCandidate(
+                    info.chunking_info, source=f"input:{info.dep_name}"
+                )
+                for info in _input_span_infos_controlled_by_output_dims(
+                    op,
+                    max_cores,
+                    split_by_host_dim=split_by_host_dim,
+                    k_split=k_split,
+                )
+            ]
         if k_split is not None and _is_batch_matmul_reduction(op):
             remaining += [
                 SpanOverflowCandidate(
                     info.chunking_info, source=f"input:{info.dep_name}"
                 )
-                for info in _bmm_k_span_infos(op, max_cores, k_split=k_split)
+                for info in _bmm_k_span_infos(
+                    op,
+                    max_cores,
+                    k_split=k_split,
+                    split_by_host_dim=split_by_host_dim,
+                )
             ]
     return remaining
 
@@ -1662,19 +1689,16 @@ def _search_bmm_k_tile_plan(
             ),
         )
 
-    logger.debug(
-        "Cannot auto-tile %s on BMM K: no legal exact divisor at or above "
-        "required split %d makes every input span fit within %.3f MB.%s",
-        op.get_name(),
-        required_split,
-        MAX_SPAN_BYTES / (1024**2),
-        (
-            f" First alignment error: {first_alignment_error}."
-            if first_alignment_error is not None
-            else ""
-        ),
+    detail = (
+        f" First alignment error: {first_alignment_error}."
+        if first_alignment_error is not None
+        else ""
     )
-    return None
+    raise Unsupported(
+        f"Cannot auto-tile {op.get_name()} on BMM K: no legal exact divisor "
+        f"at or above required split {required_split} makes every input span "
+        f"fit within {MAX_SPAN_BYTES / (1024**2):.3f} MB.{detail}"
+    )
 
 
 def _has_indirect_reads(op: ComputedBuffer) -> bool:
@@ -1865,7 +1889,16 @@ def plan_span_overflow_tile(
             output_failure = exc
             output_plan = None
         if output_plan is not None:
-            remaining_k_infos = _bmm_k_span_infos(op, max_cores)
+            split_by_host_dim = {
+                level.selected_host_dim: level.split_count
+                for level in output_plan.levels
+                if not level.is_reduction
+            }
+            remaining_k_infos = _bmm_k_span_infos(
+                op,
+                max_cores,
+                split_by_host_dim=split_by_host_dim,
+            )
             if remaining_k_infos:
                 raise Unsupported(
                     f"Cannot auto-tile {op.get_name()}: the selected B/M/N plan "

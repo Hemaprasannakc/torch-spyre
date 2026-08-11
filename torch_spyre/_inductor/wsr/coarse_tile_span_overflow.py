@@ -558,29 +558,31 @@ def span_overflow_groups(
         completed_conflicts = sorted(
             read_deps & (auto_tiled_producers | manually_hinted_producers)
         )
+        joined_conflicts = sorted(set(completed_conflicts) & reduction_joined_producers)
+        manual_conflicts = sorted(set(completed_conflicts) & manually_hinted_producers)
+        if joined_conflicts:
+            # A producer already synchronized with one reduction consumer
+            # cannot safely feed a second independently tiled reduction.
+            raise Unsupported(
+                f"Cannot auto-tile {op.get_name()}: it reads producer(s) "
+                f"{joined_conflicts} that were already auto-tiled and joined "
+                "by another reduction consumer. A single auto-tiled producer "
+                "can currently feed only one reduction consumer in one "
+                "synchronized group; multiple consumers sharing one "
+                "auto-tiled producer is not yet supported (#3217)."
+            )
+        if manual_conflicts and reduction_only_plan:
+            raise Unsupported(
+                f"Cannot auto-tile {op.get_name()}: it reads manually tiled "
+                f"producer(s) {manual_conflicts}; an independent K-only loop "
+                "cannot bypass user-hint synchronization."
+            )
         if completed_conflicts and not reduction_only_plan:
             logger.warning(
                 "[span-overflow groups] op=%s rejected_conflicting_auto_producers=%s",
                 op.get_name(),
                 completed_conflicts,
             )
-            joined_conflicts = sorted(
-                set(completed_conflicts) & reduction_joined_producers
-            )
-            if joined_conflicts:
-                # The producer was already auto-tiled *and* joined into a
-                # synchronized loop by an earlier reduction consumer.  A single
-                # auto-tiled producer can currently feed only one reduction
-                # consumer; a second consumer would need its own tile loop over
-                # the same producer, which is not yet supported.
-                raise Unsupported(
-                    f"Cannot auto-tile {op.get_name()}: it reads producer(s) "
-                    f"{joined_conflicts} that were already auto-tiled and joined "
-                    "by another reduction consumer. A single auto-tiled producer "
-                    "can currently feed only one reduction consumer in one "
-                    "synchronized group; multiple consumers sharing one "
-                    "auto-tiled producer is not yet supported (#3217)."
-                )
             raise Unsupported(
                 f"Cannot auto-tile {op.get_name()}: it reads already-tiled "
                 f"producer(s) {completed_conflicts} that are not in an open "
