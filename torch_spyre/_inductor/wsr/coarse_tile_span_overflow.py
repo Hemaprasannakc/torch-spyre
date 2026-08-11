@@ -559,7 +559,6 @@ def span_overflow_groups(
             read_deps & (auto_tiled_producers | manually_hinted_producers)
         )
         joined_conflicts = sorted(set(completed_conflicts) & reduction_joined_producers)
-        manual_conflicts = sorted(set(completed_conflicts) & manually_hinted_producers)
         if joined_conflicts:
             # A producer already synchronized with one reduction consumer
             # cannot safely feed a second independently tiled reduction.
@@ -570,12 +569,6 @@ def span_overflow_groups(
                 "can currently feed only one reduction consumer in one "
                 "synchronized group; multiple consumers sharing one "
                 "auto-tiled producer is not yet supported (#3217)."
-            )
-        if manual_conflicts and reduction_only_plan:
-            raise Unsupported(
-                f"Cannot auto-tile {op.get_name()}: it reads manually tiled "
-                f"producer(s) {manual_conflicts}; an independent K-only loop "
-                "cannot bypass user-hint synchronization."
             )
         if completed_conflicts and not reduction_only_plan:
             logger.warning(

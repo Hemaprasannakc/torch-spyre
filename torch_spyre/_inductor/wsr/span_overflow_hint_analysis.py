@@ -71,9 +71,9 @@ class InputSpanInfo:
 
     This is used for Reduction/BMM ops where the output tensor can be small but
     a direct input read still spans too much memory.  ``controlling_symbol`` is
-    the output-loop symbol, such as BMM ``M`` or ``N``; reduction-only symbols
-    such as ``K`` are not represented here because this pass cannot tile
-    reduction ranges yet.
+    the output-loop symbol, such as BMM ``M`` or ``N``.  Pure reduction-only
+    spans are handled separately, while mixed output+K BMM spans stay visible
+    here so an output split can be considered before falling back to K tiling.
     """
 
     chunking_info: ChunkingInfo
@@ -309,11 +309,11 @@ def _post_tile_stick_alignment_error(
 
 
 def _is_batch_matmul_reduction(op: ComputedBuffer) -> bool:
-    """Return True for matmul/BMM reductions with output-dim tiling policy.
+    """Return True for matmul/BMM reductions with span-overflow tiling policy.
 
     ``F.linear`` lowers to a Reduction with ``reduction_type=batchmatmul`` even
-    though the user did not call ``torch.bmm``.  For these ops, output dims
-    such as M/N/vocab can be tiled; K remains a reduction-only dim.
+    though the user did not call ``torch.bmm``.  For these ops, output dims such as M/N/vocab can be tiled, and K can
+    be tiled as a reduction range when K-controlled input spans overflow.
     """
     return (
         isinstance(op.data, Reduction)
@@ -390,7 +390,9 @@ def _bmm_k_symbol(
         return None
     if input_deps is None:
         input_deps = _input_read_deps(op)
-    output_symbols = set(_output_symbol_to_dim(op))
+    output_symbols = set(_bmm_output_symbol_to_dim(op, input_deps))
+    if not output_symbols:
+        return None
     reduction_symbols = {
         sym
         for dep, _layout in input_deps
@@ -608,10 +610,12 @@ def _input_span_infos_controlled_by_output_dims(
 ) -> list[InputSpanInfo]:
     """Return overflowing input spans controlled by output dimensions.
 
-    Input spans controlled only by reduction symbols are skipped during output-range
-    planning. When ``k_split`` is supplied, the BMM K symbol is included so
-    post-tile validation can account for a proposed reduction-range tile.
-    ``split_by_host_dim`` models hypothetical output coarse tiles.
+    Input spans controlled only by reduction symbols are skipped during
+    output-range planning. Mixed BMM output+K spans are kept so B/M/N search can
+    choose an output split that fixes them. When ``k_split`` is supplied, the
+    BMM K symbol is split too so post-tile validation can account for a proposed
+    reduction-range tile. ``split_by_host_dim`` models hypothetical output
+    coarse tiles.
     """
     if split_by_host_dim is None:
         split_by_host_dim = (
@@ -619,7 +623,7 @@ def _input_span_infos_controlled_by_output_dims(
         )
 
     input_deps = _input_read_deps(op)
-    k_symbol = _bmm_k_symbol(op, input_deps) if k_split is not None else None
+    k_symbol = _bmm_k_symbol(op, input_deps) if _is_batch_matmul_reduction(op) else None
     symbol_to_dim = (
         _bmm_output_symbol_to_dim(op, input_deps)
         if _is_batch_matmul_reduction(op)
@@ -660,6 +664,8 @@ def _input_span_infos_controlled_by_output_dims(
                     coord,
                     reduction_syms,
                 )
+                continue
+            if reduction_syms and not output_syms and k_split is None:
                 continue
 
             # A coordinate can be jointly controlled by more than one output
@@ -744,7 +750,7 @@ def _bmm_k_span_infos(
         return []
     if split_by_host_dim is None:
         split_by_host_dim = {}
-    output_symbol_to_dim = _output_symbol_to_dim(op)
+    output_symbol_to_dim = _bmm_output_symbol_to_dim(op, input_deps)
     span_symbol_to_dim = {**output_symbol_to_dim, k_symbol: -1}
     span_split_by_host_dim = {**split_by_host_dim, -1: k_split}
 
@@ -859,9 +865,7 @@ def _bmm_k_split_candidates(op: ComputedBuffer, required_split: int) -> list[int
     legal = [
         split
         for split in divisors
-        if split >= max(2, required_split)
-        and split < k_size
-        and split <= _MAX_AUTO_TILE_SPLIT_COUNT
+        if split >= 2 and split < k_size and split <= _MAX_AUTO_TILE_SPLIT_COUNT
     ]
     return _cap_split_candidates(legal, required_split)
 
@@ -1695,8 +1699,7 @@ def _search_bmm_k_tile_plan(
         else ""
     )
     raise Unsupported(
-        f"Cannot auto-tile {op.get_name()} on BMM K: no legal exact divisor "
-        f"at or above required split {required_split} makes every input span "
+        f"Cannot auto-tile {op.get_name()} on BMM K: no legal exact divisor makes every input span "
         f"fit within {MAX_SPAN_BYTES / (1024**2):.3f} MB.{detail}"
     )
 
@@ -1859,8 +1862,8 @@ def plan_span_overflow_tile(
     if isinstance(op.data, Reduction):
         # Scalar/full reductions have no output range to coarse-tile.
         # Non-scalar reductions combine output-span candidates with input spans
-        # controlled by output symbols; reduction-only input spans are
-        # intentionally skipped until reduction-range tiling exists.
+        # controlled by output symbols; BMM K-only input spans are handled
+        # by the reduction-range fallback.
         if not list(op.data.ranges):
             logger.debug(
                 "[span-overflow planner] skip op=%s reason=scalar_reduction",

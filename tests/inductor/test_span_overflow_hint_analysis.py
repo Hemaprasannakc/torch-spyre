@@ -1830,7 +1830,7 @@ class TestSpanOverflowGroups(InductorTestCase):
             ):
                 _apply_span_overflow(_graph([producer, matmul1, matmul2]))
 
-    def test_k_only_plan_cannot_bypass_manually_tiled_producer(self):
+    def test_k_only_plan_can_read_manually_tiled_producer_independently(self):
         producer = _pointwise_op(_E2E_SHAPE, name="buf0")
         _manual_h_hint_group(producer)
         bmm = _reduction_op(
@@ -1869,10 +1869,18 @@ class TestSpanOverflowGroups(InductorTestCase):
                 "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
                 return_value=k_plan,
             ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow._bmm_k_symbol",
+                return_value=sympy.Symbol("k"),
+            ),
             config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
         ):
-            with self.assertRaisesRegex(Unsupported, "manually tiled producer"):
-                span_overflow_groups(_graph([producer, bmm]))
+            groups = _apply_span_overflow(_graph([producer, bmm]))
+
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(bmm.dim_hints[0].loop_var, sympy.Symbol("k"))
+        self.assertTrue(bmm.dim_hints[0].is_reduction)
+        self.assertEqual(bmm.dim_hints[0].split_count, 5)
 
     def test_chained_pointwise_ops_conform_failure_still_raises(self):
         """op1's own search disagrees with op0's, and op0's split (5) does not
@@ -2683,6 +2691,108 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         filtered.assert_called_once_with(op, 1, split_by_host_dim={1: 2})
         raw_infos.assert_not_called()
 
+    def test_bmm_k_symbol_uses_bmm_output_map_for_broadcast_dim(self):
+        op = _reduction_op(
+            (1, 16, 64), reduction_ranges=(64,), reduction_type=BATCH_MATMUL_OP
+        )
+        b, m, n, k = sympy.symbols("b m n k")
+        lhs = MemoryDep("lhs", b * 1024 + k * 16 + m, (b, k, m), (1, 64, 16))
+        rhs = MemoryDep("rhs", b * 4096 + k * 64 + n, (b, k, n), (1, 64, 64))
+        input_deps = [
+            (lhs, _fixed_tiled_layout((1, 64, 16))),
+            (rhs, _fixed_tiled_layout((1, 64, 64))),
+        ]
+
+        with (
+            patch.object(
+                soha, "_bmm_output_symbol_to_dim", return_value={b: 0, m: 1, n: 2}
+            ),
+            patch.object(soha, "_output_symbol_to_dim", return_value={m: 1, n: 2}),
+        ):
+            self.assertEqual(soha._bmm_k_symbol(op, input_deps), k)
+
+    def test_bmm_mixed_output_and_k_input_span_becomes_output_candidate(self):
+        op = _reduction_op(
+            (1, 4_194_304, 64),
+            reduction_ranges=(64,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+        b, m, n, k = sympy.symbols("b m n k")
+        lhs = MemoryDep("lhs", k * 4_194_304 + m, (k, m), (64, 4_194_304))
+        layout = _fixed_tiled_layout((64, 4_194_304, 64))
+
+        with (
+            patch.object(soha, "MAX_SPAN_BYTES", MAX_SPAN_BYTES),
+            patch.object(soha, "_input_read_deps", return_value=[(lhs, layout)]),
+            patch.object(
+                soha, "_output_symbol_to_dim", return_value={b: 0, m: 1, n: 2}
+            ),
+            patch.object(
+                soha,
+                "_device_coordinates_for_span",
+                return_value=[k + m, sympy.Integer(0)],
+            ),
+            patch.object(soha, "_coordinate_span_elems", return_value=4_194_304),
+            patch.object(soha, "_tile_aware_inner_stride_elems", return_value=64),
+        ):
+            infos = soha._input_span_infos_controlled_by_output_dims(op, max_cores=1)
+
+        self.assertEqual(len(infos), 1)
+        self.assertEqual(infos[0].chunking_info.selected_host_dim, 1)
+        self.assertEqual(infos[0].dep_name, "lhs")
+
+    def test_bmm_output_search_retries_larger_split_when_k_validation_remains(self):
+        op = _reduction_op(
+            (1, 64, 64), reduction_ranges=(64,), reduction_type=BATCH_MATMUL_OP
+        )
+        candidate = SimpleNamespace(
+            chunking_info=ChunkingInfo(
+                total_bytes=1,
+                per_core_span=2 * MAX_SPAN_BYTES,
+                core_split_estimate=1,
+                selected_device_dim_size=64,
+                selected_device_span_stride_elems=64,
+                selected_host_dim=1,
+                stick_elems=64,
+                reason="mixed M+K input span overflow",
+            ),
+            source="input:lhs",
+        )
+
+        def remaining_after_tile(_op, _max_cores, split_by_host_dim, *, k_split=None):
+            self.assertIsNone(k_split)
+            if split_by_host_dim == {1: 2}:
+                return [SimpleNamespace(source="input:lhs")]
+            return []
+
+        with (
+            patch.object(soha, "_split_candidates_for_host_dim", return_value=[2, 4]),
+            patch.object(
+                soha, "_combined_tile_stick_alignment_error", return_value=None
+            ),
+            patch.object(
+                soha,
+                "_remaining_span_candidates_after_tile",
+                side_effect=remaining_after_tile,
+            ),
+        ):
+            plan = soha._search_min_cost_tile_plan(op, 1, [candidate])
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.levels[0].selected_host_dim, 1)
+        self.assertEqual(plan.levels[0].split_count, 4)
+
+    def test_bmm_k_split_candidates_try_small_divisors_below_linear_estimate(self):
+        op = _reduction_op(
+            (1, 1, 64),
+            reduction_ranges=(64,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+        candidates = soha._bmm_k_split_candidates(op, required_split=16)
+
+        self.assertIn(2, candidates)
+        self.assertNotIn(64, candidates)
+
     def test_bmm_k_split_candidates_keep_reduction_extent_above_one(self):
         op = _reduction_op(
             (1, 1, 64),
@@ -2690,7 +2800,11 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             reduction_type=BATCH_MATMUL_OP,
         )
 
-        self.assertEqual(soha._bmm_k_split_candidates(op, required_split=8), [])
+        candidates = soha._bmm_k_split_candidates(op, required_split=8)
+
+        self.assertIn(2, candidates)
+        self.assertIn(4, candidates)
+        self.assertNotIn(8, candidates)
 
     def test_bmm_without_any_overflow_returns_none(self):
         op = _reduction_op(
