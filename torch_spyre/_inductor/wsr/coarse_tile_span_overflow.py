@@ -35,6 +35,7 @@ from ..logging_utils import get_inductor_logger
 from ..propagate_hints import DimHint
 from ..pass_utils import op_out_coords, host_coordinates, indirect_sizes_from_op
 from ..ir import FixedTiledLayout
+from .coarse_tile import _loop_var_to_reduction_ranges_pos
 from .span_overflow_hint_analysis import (
     SpanOverflowTilePlan,
     _bmm_k_symbol,
@@ -258,6 +259,16 @@ def _dims_to_hints(
                 raise Unsupported(
                     f"Cannot adapt span-overflow reduction plan for {op.get_name()}: "
                     "could not identify the BMM K loop variable."
+                )
+            try:
+                reduction_pos = _loop_var_to_reduction_ranges_pos(op, loop_var)
+            except (StopIteration, AttributeError, TypeError, ValueError):
+                reduction_pos = None
+            if reduction_pos != host_dim:
+                raise Unsupported(
+                    f"Cannot adapt span-overflow reduction plan for {op.get_name()}: "
+                    f"BMM K loop variable {loop_var} maps to reduction range "
+                    f"position {reduction_pos}, expected {host_dim}."
                 )
             coord = loop_var
         else:

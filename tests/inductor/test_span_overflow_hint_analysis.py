@@ -789,6 +789,10 @@ class TestSpanOverflowGroups(InductorTestCase):
                 "torch_spyre._inductor.wsr.coarse_tile_span_overflow._bmm_k_symbol",
                 return_value=sympy.Symbol("k"),
             ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow._loop_var_to_reduction_ranges_pos",
+                return_value=0,
+            ),
             config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
         ):
             groups = _apply_span_overflow(_graph([producer, reduction]))
@@ -1673,6 +1677,10 @@ class TestSpanOverflowGroups(InductorTestCase):
                 "torch_spyre._inductor.wsr.coarse_tile_span_overflow._bmm_k_symbol",
                 return_value=sympy.Symbol("k"),
             ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow._loop_var_to_reduction_ranges_pos",
+                return_value=0,
+            ),
             config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
         ):
             groups = _apply_span_overflow(_graph([producer, reduction]))
@@ -1744,6 +1752,10 @@ class TestSpanOverflowGroups(InductorTestCase):
             patch(
                 "torch_spyre._inductor.wsr.coarse_tile_span_overflow._bmm_k_symbol",
                 return_value=k,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow._loop_var_to_reduction_ranges_pos",
+                return_value=0,
             ),
             config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
         ):
@@ -1872,6 +1884,10 @@ class TestSpanOverflowGroups(InductorTestCase):
             patch(
                 "torch_spyre._inductor.wsr.coarse_tile_span_overflow._bmm_k_symbol",
                 return_value=sympy.Symbol("k"),
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow._loop_var_to_reduction_ranges_pos",
+                return_value=0,
             ),
             config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
         ):
@@ -2691,25 +2707,22 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         filtered.assert_called_once_with(op, 1, split_by_host_dim={1: 2})
         raw_infos.assert_not_called()
 
-    def test_bmm_k_symbol_uses_bmm_output_map_for_broadcast_dim(self):
+    def test_bmm_k_hint_rejects_broadcast_output_symbol_mismatch(self):
         op = _reduction_op(
             (1, 16, 64), reduction_ranges=(64,), reduction_type=BATCH_MATMUL_OP
         )
         b, m, n, k = sympy.symbols("b m n k")
+        layout = _fixed_tiled_layout((1, 16, 64))
+        out_dep = MemoryDep("buf0", m * 64 + n, (b, m, n), (1, 16, 64))
         lhs = MemoryDep("lhs", b * 1024 + k * 16 + m, (b, k, m), (1, 64, 16))
         rhs = MemoryDep("rhs", b * 4096 + k * 64 + n, (b, k, n), (1, 64, 64))
-        input_deps = [
-            (lhs, _fixed_tiled_layout((1, 64, 16))),
-            (rhs, _fixed_tiled_layout((1, 64, 64))),
-        ]
+        op.get_read_writes = MagicMock(
+            return_value=SimpleNamespace(reads={lhs, rhs}, writes={out_dep})
+        )
+        op.layout = layout
 
-        with (
-            patch.object(
-                soha, "_bmm_output_symbol_to_dim", return_value={b: 0, m: 1, n: 2}
-            ),
-            patch.object(soha, "_output_symbol_to_dim", return_value={m: 1, n: 2}),
-        ):
-            self.assertEqual(soha._bmm_k_symbol(op, input_deps), k)
+        with self.assertRaisesRegex(Unsupported, "maps to reduction range position 1"):
+            _dims_to_hints(op, ((0, 4, True),), [_SPAN_OVERFLOW_HINT_ID])
 
     def test_bmm_mixed_output_and_k_input_span_becomes_output_candidate(self):
         op = _reduction_op(
@@ -2833,6 +2846,10 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             patch(
                 "torch_spyre._inductor.wsr.coarse_tile_span_overflow._bmm_k_symbol",
                 return_value=k,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow._loop_var_to_reduction_ranges_pos",
+                return_value=0,
             ),
         ):
             hints = _dims_to_hints(op, ((0, 4, True),), [_SPAN_OVERFLOW_HINT_ID])

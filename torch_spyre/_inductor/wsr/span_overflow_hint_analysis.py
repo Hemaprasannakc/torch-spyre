@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import itertools
 import math
+from collections.abc import Sequence
 
 from dataclasses import dataclass
 
@@ -353,7 +354,7 @@ def _output_symbol_to_dim(op: ComputedBuffer) -> dict[sympy.Symbol, int]:
 
 def _bmm_output_symbol_to_dim(
     op: ComputedBuffer,
-    input_deps: list[tuple[MemoryDep, FixedTiledLayout]],
+    input_deps: Sequence[tuple[MemoryDep, FixedTiledLayout | None]],
 ) -> dict[sympy.Symbol, int]:
     """Map BMM output symbols while excluding the single K symbol.
 
@@ -381,7 +382,7 @@ def _bmm_output_symbol_to_dim(
 
 def _bmm_k_symbol(
     op: ComputedBuffer,
-    input_deps: list[tuple[MemoryDep, FixedTiledLayout]] | None = None,
+    input_deps: Sequence[tuple[MemoryDep, FixedTiledLayout | None]] | None = None,
 ) -> sympy.Symbol | None:
     """Return BMM's unique reduction-only input symbol, or ``None``."""
     if not _is_batch_matmul_reduction(op):
@@ -389,13 +390,28 @@ def _bmm_k_symbol(
     if len(list(getattr(op.data, "reduction_ranges", []))) != 1:
         return None
     if input_deps is None:
-        input_deps = _input_read_deps(op)
-    output_symbols = set(_bmm_output_symbol_to_dim(op, input_deps))
+        layout_input_deps = _input_read_deps(op)
+        if layout_input_deps:
+            resolved_input_deps: Sequence[tuple[MemoryDep, FixedTiledLayout | None]] = (
+                layout_input_deps
+            )
+        else:
+            try:
+                resolved_input_deps = tuple(
+                    (dep, None)
+                    for dep in op.get_read_writes().reads
+                    if isinstance(dep, MemoryDep)
+                )
+            except (AttributeError, TypeError):
+                resolved_input_deps = ()
+    else:
+        resolved_input_deps = input_deps
+    output_symbols = set(_bmm_output_symbol_to_dim(op, resolved_input_deps))
     if not output_symbols:
         return None
     reduction_symbols = {
         sym
-        for dep, _layout in input_deps
+        for dep, _layout in resolved_input_deps
         for sym in dep.ranges
         if sym not in output_symbols
     }
