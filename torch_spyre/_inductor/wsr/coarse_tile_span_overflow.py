@@ -37,6 +37,7 @@ from ..pass_utils import op_out_coords, host_coordinates, indirect_sizes_from_op
 from ..ir import FixedTiledLayout
 from .span_overflow_hint_analysis import (
     SpanOverflowTilePlan,
+    _bmm_k_symbol,
     can_conform_pointwise_tile,
     plan_span_overflow_tile,
 )
@@ -125,10 +126,11 @@ def _consumer_shares_group_tiled_dim(
     ``SpanOverflowTileLevel``: ``is_reduction`` is always False on the auto
     path, because reduction-range tiling would require partial-result
     accumulation), so every signature reaching here should already be
-    output-only.  We assert that invariant explicitly below — on **both** the
-    consumer's signature and each producer's dims — and fail closed if a future
-    planner change ever emits a reduction-range tile, since such a tile would
-    break the loop-carried accumulation this join assumes away.
+    output-only.  We assert that invariant explicitly below -- on both the
+    consumer's signature and each producer's dims -- and fail closed if a
+    reduction-range tile reaches this check, since such a tile would break the
+    loop-carried accumulation this join assumes away. The BMM K fallback emits
+    reduction-range signatures, so those plans must remain independent groups.
 
     Checking the producer side matters only because a Reduction can now root a
     run (see ``span_overflow_groups``).  Before that, an unjoined Reduction
@@ -246,23 +248,37 @@ def _dims_to_hints(
     out_coords = op_out_coords(op)
     hints: list[DimHint] = []
     for (host_dim, split_count, is_reduction), hint_id in zip(dims, hint_ids):
-        if host_dim >= len(out_coords):
-            raise Unsupported(
-                f"Cannot adapt span-overflow plan for {op.get_name()}: "
-                f"host_dim={host_dim} is out of bounds for "
-                f"{len(out_coords)} output coordinates."
-            )
-
-        coord = out_coords[host_dim]
-        free_symbols = coord.free_symbols
-        if len(free_symbols) != 1:
-            raise Unsupported(
-                f"Cannot adapt span-overflow plan for {op.get_name()}: "
-                f"host_dim={host_dim} output coordinate {coord} has "
-                f"{len(free_symbols)} free symbols; expected exactly one loop var."
-            )
-
-        loop_var = next(iter(free_symbols))
+        if is_reduction:
+            reduction_ranges = list(getattr(op.data, "reduction_ranges", []))
+            if host_dim >= len(reduction_ranges):
+                raise Unsupported(
+                    f"Cannot adapt span-overflow reduction plan for {op.get_name()}: "
+                    f"host_dim={host_dim} is out of bounds for reduction ranges "
+                    f"{reduction_ranges}."
+                )
+            loop_var = _bmm_k_symbol(op)
+            if loop_var is None:
+                raise Unsupported(
+                    f"Cannot adapt span-overflow reduction plan for {op.get_name()}: "
+                    "could not identify the BMM K loop variable."
+                )
+            coord = loop_var
+        else:
+            if host_dim >= len(out_coords):
+                raise Unsupported(
+                    f"Cannot adapt span-overflow plan for {op.get_name()}: "
+                    f"host_dim={host_dim} is out of bounds for "
+                    f"{len(out_coords)} output coordinates."
+                )
+            coord = out_coords[host_dim]
+            free_symbols = coord.free_symbols
+            if len(free_symbols) != 1:
+                raise Unsupported(
+                    f"Cannot adapt span-overflow plan for {op.get_name()}: "
+                    f"host_dim={host_dim} output coordinate {coord} has "
+                    f"{len(free_symbols)} free symbols; expected exactly one loop var."
+                )
+            loop_var = next(iter(free_symbols))
         logger.debug(
             "[span-overflow groups] op=%s host_dim=%d coord=%s "
             "loop_var=%s split_count=%s hint_id=%d is_reduction=%s",
