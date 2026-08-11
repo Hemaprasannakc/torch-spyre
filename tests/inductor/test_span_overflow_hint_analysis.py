@@ -2372,13 +2372,111 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
                 side_effect=failure,
             ),
             patch(
-                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._search_bmm_k_tile_plan"
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._search_bmm_k_tile_plan",
+                return_value=None,
             ) as k_search,
         ):
             with self.assertRaisesRegex(Unsupported, "output still overflows"):
                 plan_span_overflow_tile(op, max_cores=1)
 
-        k_search.assert_not_called()
+        k_search.assert_called_once_with(op, 1)
+
+    def test_bmm_input_failure_is_not_swallowed_when_k_has_no_plan(self):
+        op = _reduction_op(
+            (1, 4_194_304, 16),
+            reduction_ranges=(64,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+        input_candidate = SimpleNamespace(
+            chunking_info=SimpleNamespace(selected_host_dim=1),
+            source="input:lhs",
+        )
+        failure = Unsupported("M-controlled input still overflows")
+
+        with (
+            patch.object(soha, "_output_span_candidates_from_op", return_value=[]),
+            patch.object(
+                soha, "_input_span_candidates", return_value=[input_candidate]
+            ),
+            patch.object(soha, "_search_min_cost_tile_plan", side_effect=failure),
+            patch.object(soha, "_search_bmm_k_tile_plan", return_value=None),
+        ):
+            with self.assertRaisesRegex(
+                Unsupported, "M-controlled input still overflows"
+            ):
+                plan_span_overflow_tile(op, max_cores=1)
+
+    def test_bmm_k_plan_rejected_when_m_span_remains(self):
+        op = _reduction_op(
+            (1, 4_194_304, 64),
+            reduction_ranges=(65536,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+        initial_info = SimpleNamespace(
+            chunking_info=SimpleNamespace(
+                per_core_span=2 * MAX_SPAN_BYTES,
+                reason="BMM K input span overflow for rhs",
+            ),
+            dep_name="rhs",
+        )
+        remaining_m = SimpleNamespace(source="input:lhs")
+
+        with (
+            patch.object(soha, "_bmm_k_span_infos", return_value=[initial_info]),
+            patch.object(soha, "_bmm_k_split_candidates", return_value=[2]),
+            patch.object(soha, "_bmm_k_alignment_error", return_value=None),
+            patch.object(
+                soha,
+                "_remaining_span_candidates_after_tile",
+                return_value=[remaining_m],
+            ) as validate,
+        ):
+            with self.assertRaisesRegex(Unsupported, "no legal exact divisor"):
+                soha._search_bmm_k_tile_plan(op, max_cores=1)
+
+        validate.assert_called_once_with(op, 1, {}, k_split=2)
+
+    def test_bmm_k_alignment_failure_reports_first_error(self):
+        op = _reduction_op(
+            (1, 1, 64),
+            reduction_ranges=(65536,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+        initial_info = SimpleNamespace(
+            chunking_info=SimpleNamespace(
+                per_core_span=2 * MAX_SPAN_BYTES,
+                reason="BMM K input span overflow for rhs",
+            ),
+            dep_name="rhs",
+        )
+
+        with (
+            patch.object(soha, "_bmm_k_span_infos", return_value=[initial_info]),
+            patch.object(soha, "_bmm_k_split_candidates", return_value=[2]),
+            patch.object(
+                soha,
+                "_bmm_k_alignment_error",
+                return_value="input dependency rhs host dim 0 cuts a stick",
+            ),
+        ):
+            with self.assertRaisesRegex(
+                Unsupported, "First alignment error: input dependency rhs"
+            ):
+                soha._search_bmm_k_tile_plan(op, max_cores=1)
+
+    def test_bmm_without_any_overflow_returns_none(self):
+        op = _reduction_op(
+            (1, 1, 64),
+            reduction_ranges=(64,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+
+        with (
+            patch.object(soha, "_output_span_candidates_from_op", return_value=[]),
+            patch.object(soha, "_input_span_candidates", return_value=[]),
+            patch.object(soha, "_search_bmm_k_tile_plan", return_value=None),
+        ):
+            self.assertIsNone(plan_span_overflow_tile(op, max_cores=1))
 
     def test_bmm_k_plan_adapts_to_reduction_loop_variable(self):
         op = _reduction_op(

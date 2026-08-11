@@ -604,6 +604,7 @@ def _input_span_infos_controlled_by_output_dims(
     selected_host_dim: int | None = None,
     split_count: int = 1,
     split_by_host_dim: dict[int, int] | None = None,
+    k_split: int | None = None,
 ) -> list[InputSpanInfo]:
     """Return overflowing input spans controlled by output dimensions.
 
@@ -618,6 +619,7 @@ def _input_span_infos_controlled_by_output_dims(
         )
 
     input_deps = _input_read_deps(op)
+    k_symbol = _bmm_k_symbol(op, input_deps) if k_split is not None else None
     symbol_to_dim = (
         _bmm_output_symbol_to_dim(op, input_deps)
         if _is_batch_matmul_reduction(op)
@@ -647,7 +649,9 @@ def _input_span_infos_controlled_by_output_dims(
             reduction_syms = [
                 sym for sym in coord.free_symbols if sym not in symbol_to_dim
             ]
-            if reduction_syms:
+            if reduction_syms and not (
+                k_symbol is not None and set(reduction_syms) == {k_symbol}
+            ):
                 logger.debug(
                     "span_overflow_input: op=%s dep=%s skipped coord=%s "
                     "controlled by reduction symbols %s",
@@ -669,17 +673,28 @@ def _input_span_infos_controlled_by_output_dims(
                 symbol_to_dim,
                 split_by_host_dim,
             )
+            if (
+                k_symbol is not None
+                and k_split is not None
+                and k_symbol in coord.free_symbols
+            ):
+                split_by_symbol[k_symbol] = k_split
             coord_span_elems = _coordinate_span_elems(coord, dep, split_by_symbol)
             if coord_span_elems is None:
                 continue
 
+            span_symbol_to_dim = symbol_to_dim
+            span_split_by_host_dim = split_by_host_dim
+            if k_symbol is not None and k_split is not None:
+                span_symbol_to_dim = {**symbol_to_dim, k_symbol: -1}
+                span_split_by_host_dim = {**split_by_host_dim, -1: k_split}
             inner_stride_elems = _tile_aware_inner_stride_elems(
                 device_coords,
                 device_size,
                 dep,
                 device_dim + 1,
-                symbol_to_dim,
-                split_by_host_dim,
+                span_symbol_to_dim,
+                span_split_by_host_dim,
             )
             if inner_stride_elems is None:
                 continue
@@ -806,7 +821,11 @@ def _bmm_k_alignment_error(op: ComputedBuffer, split_count: int) -> str | None:
 
 
 def _bmm_k_split_candidates(op: ComputedBuffer, required_split: int) -> list[int]:
-    """Return bounded exact divisors of static BMM K."""
+    """Return bounded exact divisors of static BMM K.
+
+    Alignment is checked by the search so it can retain the first rejection
+    reason for the final Unsupported diagnostic.
+    """
     reduction_ranges = list(getattr(op.data, "reduction_ranges", []))
     if len(reduction_ranges) != 1:
         return []
@@ -827,9 +846,7 @@ def _bmm_k_split_candidates(op: ComputedBuffer, required_split: int) -> list[int
     legal = [
         split
         for split in divisors
-        if split >= max(2, required_split)
-        and split <= _MAX_AUTO_TILE_SPLIT_COUNT
-        and _bmm_k_alignment_error(op, split) is None
+        if split >= max(2, required_split) and split <= _MAX_AUTO_TILE_SPLIT_COUNT
     ]
     return _cap_split_candidates(legal, required_split)
 
@@ -1037,6 +1054,7 @@ def _input_span_candidates(
     max_cores: int,
     *,
     split_by_host_dim: dict[int, int] | None = None,
+    k_split: int | None = None,
 ) -> list[SpanOverflowCandidate]:
     """Collect Reduction/BMM input spans controlled by output dimensions.
 
@@ -1048,6 +1066,7 @@ def _input_span_candidates(
         op,
         max_cores,
         split_by_host_dim=split_by_host_dim,
+        k_split=k_split,
     ):
         host_dim = info.chunking_info.selected_host_dim
         if not _host_dim_has_legal_nontrivial_split(op, host_dim):
@@ -1394,6 +1413,8 @@ def _remaining_span_candidates_after_tile(
     op: ComputedBuffer,
     max_cores: int,
     split_by_host_dim: dict[int, int],
+    *,
+    k_split: int | None = None,
 ) -> list[SpanOverflowCandidate]:
     """Return spans that still overflow after a hypothetical combined tile.
 
@@ -1419,7 +1440,15 @@ def _remaining_span_candidates_after_tile(
             op,
             max_cores,
             split_by_host_dim=split_by_host_dim,
+            k_split=k_split,
         )
+        if k_split is not None and _is_batch_matmul_reduction(op):
+            remaining += [
+                SpanOverflowCandidate(
+                    info.chunking_info, source=f"input:{info.dep_name}"
+                )
+                for info in _bmm_k_span_infos(op, max_cores, k_split=k_split)
+            ]
     return remaining
 
 
@@ -1586,7 +1615,22 @@ def _search_bmm_k_tile_plan(
         if alignment_error is not None:
             first_alignment_error = first_alignment_error or alignment_error
             continue
-        if _bmm_k_span_infos(op, max_cores, k_split=split_count):
+        try:
+            remaining = _remaining_span_candidates_after_tile(
+                op,
+                max_cores,
+                {},
+                k_split=split_count,
+            )
+        except Unsupported as exc:
+            logger.debug(
+                "span_overflow_bmm_k_search: op=%s split=%d rejected: %s",
+                op.get_name(),
+                split_count,
+                exc,
+            )
+            continue
+        if remaining:
             continue
         level = SpanOverflowTileLevel(
             selected_host_dim=0,
@@ -1815,9 +1859,16 @@ def plan_span_overflow_tile(
             output_plan = None
         if output_plan is not None:
             return output_plan
-        if output_candidates:
-            assert output_failure is not None
+        try:
+            k_plan = _search_bmm_k_tile_plan(op, max_cores)
+        except Unsupported:
+            if output_failure is not None:
+                raise output_failure
+            raise
+        if k_plan is not None:
+            return k_plan
+        if output_failure is not None:
             raise output_failure
-        return _search_bmm_k_tile_plan(op, max_cores)
+        return None
 
     return None
