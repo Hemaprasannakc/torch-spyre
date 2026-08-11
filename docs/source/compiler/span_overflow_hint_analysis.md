@@ -1066,20 +1066,41 @@ Producer/consumer grouping is covered at three depths -- the grouping decision
 |---|---|---|---|
 | pointwise -> pointwise | pass | pass | pass |
 | pointwise -> reduction | pass | pass | pass |
-| reduction -> pointwise | pass | pass | xfail |
+| reduction -> pointwise | pass | pass | pass |
 | reduction -> reduction | pass | pass | xfail |
-| reduction -> matmul | pass | pass | xfail |
-| pointwise -> matmul | pass | xfail | xfail |
-| matmul -> pointwise | pass | xfail | xfail |
-| matmul -> reduction | pass | xfail | xfail |
+| reduction -> matmul | pass | pass | pass |
+| pointwise -> matmul | pass | pass | xfail (wrong numbers) |
+| matmul -> pointwise | pass | pass | xfail (wrong numbers) |
+| matmul -> reduction | pass | pass | xfail (wrong numbers) |
 | matmul -> matmul | pass | n/a | n/a |
 | matmul -> pointwise -> matmul | pass | not tested | not tested |
 
-Two causes account for every xfail, and each test carries a `TODO` naming its
-own.  A tiled **matmul** cannot read a full-size buffer: `_insert_read_copy_ops`
-matches loop counters to input dimensions one-to-one, and a matmul operand
-always has one fewer.  A tiled **reduction** reading a full-size buffer reaches
-codegen but is rejected by the backend.  `matmul -> matmul` is marked n/a rather
+Each remaining xfail carries a `TODO` naming its own cause.  **#3612 ("coarse
+tiling: optional read copy") changed this picture materially and the table
+above reflects the post-#3612 state.**  Five directions that previously xfailed
+now pass: all three matmul codegen cells, and execution for
+`reduction -> pointwise` and `reduction -> matmul`.
+
+What survives is a *different* failure, and a worse-shaped one.  The three
+matmul execution cells no longer fail to compile — they compile, run, and
+return wrong numbers.  `test_lm_head_matmul_join_numeric` reports tiled
+mismatches of 48727/49152 (99.14%) against 781/49152 (1.59%) untiled on the
+same reference, which is far outside fp16 accumulation noise.  The prime
+suspect is the positional walk in the read-copy path, which pairs the buffer's
+non-unit dims against iteration extents by position: instrumenting
+`_resize_device_layout` on the `reduction -> matmul` shape shows it building
+`tile_size=[1,4,32,64]` for a buffer of `[1,20,64,32]`, i.e. with the trailing
+dims transposed.  That walk predates this branch (it comes from #3381) and is
+unchanged by it, but it should be ruled out before any of these are blamed on
+the backend again.
+
+Only one backend-attributed xfail remains, `reduction -> reduction`.  Given
+that two of the three cases originally filed under the same
+`DtException: Could not find any suitable dimension mapping` diagnosis turned
+out to be unblocked by a read-copy change rather than a backend fix, that
+attribution has not been re-established and should not be assumed.
+
+`matmul -> matmul` is marked n/a rather
 than xfail because it is refused by design -- a Reduction consumer has no
 conform path, so both plans must independently agree
 (`TODO(span-overflow-reduction-conform)`,

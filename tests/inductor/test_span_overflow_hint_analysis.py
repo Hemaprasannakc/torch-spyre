@@ -3317,7 +3317,6 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
     # not a direction this branch adds: test_lm_head_matmul_join_numeric passed
     # when #3270 added it and was xfailed by #3293. So the blocker predates and
     # outlives this change.
-    @unittest.expectedFailure
     @config.patch(
         {
             "sencores": 4,
@@ -3327,18 +3326,22 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         }
     )
     def test_pointwise_producer_to_bmm_codegen_shares_one_loop_spec(self):
-        """Pointwise -> matmul (#3218's shipped direction). Blocked.
+        """Pointwise -> matmul (#3218's shipped direction).
 
-        TODO(span-overflow-read-copy): un-xfail once a tiled matmul can read a
-        full-size buffer.  This direction is a REGRESSION, not a missing
-        feature: its on-device counterpart test_lm_head_matmul_join_numeric
+        Was xfailed as TODO(span-overflow-read-copy): a tiled matmul could not
+        read a full-size buffer, because the iteration space was walked onto
+        the input's dimensions positionally and a matmul operand does not use
+        every loop variable (A has no N).  #3612 ("coarse tiling: optional read
+        copy") reworked that path and the direction now reaches codegen, so the
+        xfail is removed rather than re-explained.
+
+        Kept for the history it records: this was a REGRESSION, not a missing
+        feature.  Its on-device counterpart test_lm_head_matmul_join_numeric
         passed when #3270 added it (21 Jul) and was marked expectedFailure by
-        #3293 (28 Jul) with no stated cause.  #3293's note on a sibling test it
-        xfailed in the same commit says the xfails were "a deliberate decision
-        to unblock the merge, not a claim about a specific bisected root
-        cause".  Which part of that refactor caused it is still unknown -- the
-        obvious theory (auto moved after stickification) is wrong, since the
-        auto path always ran there.
+        #3293 (28 Jul) with no stated cause -- #3293's own note called the
+        xfails "a deliberate decision to unblock the merge, not a claim about a
+        specific bisected root cause".  If this starts failing again, that is
+        the history to read first.
         """
         a = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
         b = torch.randn(1, 20, 64, 32, dtype=torch.float16).to("spyre")
@@ -3349,7 +3352,6 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
             expect_ops=("mul", BATCH_MATMUL_OP),
         )
 
-    @unittest.expectedFailure
     @config.patch(
         {
             "sencores": 4,
@@ -3359,12 +3361,10 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         }
     )
     def test_bmm_producer_to_pointwise_codegen_shares_one_loop_spec(self):
-        """matmul -> Pointwise, added by this branch. Blocked.
+        """matmul -> Pointwise, added by this branch.
 
-        TODO(span-overflow-read-copy): un-xfail with the direction above -- the
-        same rank assert, reached the same way.  A matmul operand does not use
-        every loop variable (A has no N), so the iteration space cannot be
-        walked onto its dimensions.
+        Was xfailed as TODO(span-overflow-read-copy) for the same reason as the
+        direction above, and unblocked by the same change (#3612).
         """
         a = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
         b = torch.randn(1, 20, 64, 32, dtype=torch.float16).to("spyre")
@@ -3375,7 +3375,6 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
             expect_ops=(BATCH_MATMUL_OP, "mul"),
         )
 
-    @unittest.expectedFailure
     @config.patch(
         {
             "sencores": 4,
@@ -3385,10 +3384,10 @@ class TestSpanOverflowPointwiseCodegen(InductorTestCase):
         }
     )
     def test_bmm_producer_to_reduction_codegen_shares_one_loop_spec(self):
-        """matmul -> Reduction, added by this branch. Blocked.
+        """matmul -> Reduction, added by this branch.
 
-        TODO(span-overflow-read-copy): un-xfail with the two directions above.
-        Same rank assert, same cause.
+        Was xfailed as TODO(span-overflow-read-copy) with the two directions
+        above -- same cause, and unblocked by the same change (#3612).
         """
         a = torch.randn(1, 20, 16, 64, dtype=torch.float16).to("spyre")
         b = torch.randn(1, 20, 64, 32, dtype=torch.float16).to("spyre")
@@ -3794,8 +3793,18 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
 
     # The three Reduction-producer directions below execute a group whose
     # PRODUCER is a tiled reduction reading a full-size buffer (a graph input).
-    # All three die in dxp_standalone.  Isolated to the read-copy path, not to
-    # grouping:
+    #
+    # All three used to die in dxp_standalone.  After #3612 ("coarse tiling:
+    # optional read copy") reworked the read-copy path, Reduction -> Pointwise
+    # and Reduction -> matmul both execute correctly and are no longer xfailed;
+    # only Reduction -> Reduction still aborts.  That is worth noting rather
+    # than quietly deleting: the diagnosis recorded below blamed the backend's
+    # DDL conversion, and two thirds of it turned out to be reachable from the
+    # read-copy path instead.  Whether the surviving case has the same cause or
+    # a genuinely different one has not been re-established.
+    #
+    # The evidence below is kept as originally captured, and describes the
+    # pre-#3612 state.  Isolated to the read-copy path, not to grouping:
     #
     #   lone sum, NO tiling                PASS
     #   lone sum, TILED (no group at all)  dxp_standalone SIGABRT
@@ -3827,7 +3836,6 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
     #
     # Codegen depth for all three passes -- see
     # TestSpanOverflowPointwiseCodegen -- so these isolate execution alone.
-    @unittest.expectedFailure
     @config.patch(
         {
             "sencores": 4,
@@ -3837,15 +3845,15 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
         }
     )
     def test_reduction_to_pointwise_join_numeric(self):
-        """Reduction -> Pointwise executed for real. Blocked in dxp_standalone.
+        """Reduction -> Pointwise executed for real, against a CPU reference.
 
-        TODO(deeptools-ddl-dim-mapping): un-xfail once a coarse-tiled reduction
-        reading a full-size buffer can be lowered.  Codegen succeeds; deeptools
-        then throws DtException "Could not find any suitable dimension mapping"
-        (ddl_conversion.cpp:2497) and nothing catches it, so it aborts.  Not
-        filed yet, and NOT #3414 -- that fails elsewhere with "Immediate value
-        out of boundary ... L3_ADDEARIMM".  Reproduces with a lone tiled sum,
-        no grouping involved.
+        Was xfailed as TODO(deeptools-ddl-dim-mapping): codegen succeeded and
+        deeptools then threw DtException "Could not find any suitable dimension
+        mapping" (ddl_conversion.cpp:2497), uncaught, so the process aborted.
+        #3612 reworked the read-copy path and this now executes and matches CPU
+        -- so the abort was reachable from read-copy construction rather than
+        being purely a backend limitation, whatever remains true of the
+        Reduction -> Reduction case below.
         """
         torch.manual_seed(0xAFFE)
         x = torch.randn(1, 20, 16, 64, dtype=torch.float16)
@@ -3892,7 +3900,6 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
                 rtol=0.05,
             )
 
-    @unittest.expectedFailure
     @config.patch(
         {
             "sencores": 4,
@@ -3902,15 +3909,18 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
         }
     )
     def test_reduction_to_bmm_join_numeric(self):
-        """Reduction -> matmul executed for real. Blocked in dxp_standalone.
+        """Reduction -> matmul executed for real, against a CPU reference.
 
-        This is the one matmul direction that reaches codegen (keepdim=True
-        leaves M=1, which squeezes out and realigns the ranks -- see
+        Was xfailed as TODO(deeptools-ddl-dim-mapping) with the same
+        DtException as the other Reduction-producer directions; #3612 unblocked
+        it.
+
+        Note this shape reached codegen even before #3612 (keepdim=True leaves
+        M=1, which squeezes out and realigns the ranks -- see
         ``test_reduction_producer_to_bmm_codegen_shares_one_loop_spec``), so it
-        is the only matmul cell where execution is even reachable to fail.
-
-        TODO(deeptools-ddl-dim-mapping): un-xfail with the other two Reduction
-        producer directions -- same DtException from ddl_conversion.cpp.
+        was the only matmul cell where execution was reachable at all.  It now
+        matches CPU, so the realignment produces correct numbers and not merely
+        a kernel.
         """
         torch.manual_seed(0xAFFE)
         x = torch.randn(1, 20, 16, 64, dtype=torch.float16) * 0.1
@@ -4004,8 +4014,20 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
 
         return check
 
-    # TODO(span-overflow-read-copy): un-xfail together with the codegen xfails
-    # in TestSpanOverflowPointwiseCodegen -- one fix covers all of them.
+    # TODO(span-overflow-read-copy): the FAILURE MODE CHANGED with #3612
+    # ("coarse tiling: optional read copy").  The codegen half of this
+    # direction, in TestSpanOverflowPointwiseCodegen, now passes and is no
+    # longer xfailed -- the read copy gets built.  What remains is worse than
+    # the old loud failure: the kernel compiles, executes, and returns WRONG
+    # NUMBERS (compiled-spyre vs CPU mismatch), so this xfail is now masking a
+    # silent wrong-answer path rather than a refusal to compile.
+    #
+    # Most likely cause is the positional walk described below, which is still
+    # present: it pairs each of the buffer's non-unit dims with the next
+    # iteration extent by position.  Instrumenting _resize_device_layout on
+    # this shape shows it handed tile_size=[1,4,32,64] for a buffer of
+    # [1,20,64,32] -- the trailing dims transposed -- so the layout it builds
+    # does not describe the data.  Verify that before assuming a backend bug.
     #
     # Blocked by a pre-existing coarse_tile.py defect, not by the grouping this
     # branch adds: _insert_read_copy_ops cannot build a copy-buffer layout for a
@@ -4076,8 +4098,20 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
                 rtol=0.05,
             )
 
-    # TODO(span-overflow-read-copy): un-xfail together with the codegen xfails
-    # in TestSpanOverflowPointwiseCodegen -- one fix covers all of them.
+    # TODO(span-overflow-read-copy): the FAILURE MODE CHANGED with #3612
+    # ("coarse tiling: optional read copy").  The codegen half of this
+    # direction, in TestSpanOverflowPointwiseCodegen, now passes and is no
+    # longer xfailed -- the read copy gets built.  What remains is worse than
+    # the old loud failure: the kernel compiles, executes, and returns WRONG
+    # NUMBERS (compiled-spyre vs CPU mismatch), so this xfail is now masking a
+    # silent wrong-answer path rather than a refusal to compile.
+    #
+    # Most likely cause is the positional walk described below, which is still
+    # present: it pairs each of the buffer's non-unit dims with the next
+    # iteration extent by position.  Instrumenting _resize_device_layout on
+    # this shape shows it handed tile_size=[1,4,32,64] for a buffer of
+    # [1,20,64,32] -- the trailing dims transposed -- so the layout it builds
+    # does not describe the data.  Verify that before assuming a backend bug.
     #
     # Blocked by a pre-existing coarse_tile.py defect, not by the grouping this
     # branch adds: _insert_read_copy_ops cannot build a copy-buffer layout for a
@@ -4147,12 +4181,18 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
                 rtol=0.05,
             )
 
-    # TODO(span-overflow-read-copy): un-xfail together with
-    # test_pointwise_producer_to_bmm_codegen_shares_one_loop_spec -- this is
-    # the on-device half of the same direction.  Added PASSING by #3270 on
-    # 21 Jul; marked expectedFailure by #3293 on 28 Jul with no stated cause.
-    # It now fails in _insert_read_copy_ops before codegen, so it is the same
-    # rank assert as the codegen xfails, not a numeric problem.
+    # TODO(span-overflow-read-copy): the on-device half of
+    # test_pointwise_producer_to_bmm_codegen_shares_one_loop_spec, whose
+    # codegen half now passes after #3612 and is no longer xfailed.
+    #
+    # Added PASSING by #3270 on 21 Jul; marked expectedFailure by #3293 on
+    # 28 Jul with no stated cause.  Before #3612 it failed in the read-copy
+    # path before codegen -- the same rank assert as the codegen xfails, and
+    # explicitly "not a numeric problem".  That is no longer true: it now
+    # compiles, runs, and is numerically wrong, at
+    # tiled mismatches=48727/49152 (99.14%) against untiled 781/49152 (1.59%)
+    # on the same reference.  A ~99% mismatch is not accumulation noise; the
+    # transposed tile layout described above is the first thing to rule out.
     @unittest.expectedFailure
     def test_lm_head_matmul_join_numeric(self):
         """F.linear with an oversized vocab-dim weight: the restickified
