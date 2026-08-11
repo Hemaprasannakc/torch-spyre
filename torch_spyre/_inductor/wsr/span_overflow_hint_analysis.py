@@ -608,10 +608,10 @@ def _input_span_infos_controlled_by_output_dims(
 ) -> list[InputSpanInfo]:
     """Return overflowing input spans controlled by output dimensions.
 
-    Input spans controlled by reduction-only symbols are intentionally skipped
-    because output-range coarse tiling cannot split reduction ranges without
-    partial-result accumulation.  ``split_by_host_dim`` models hypothetical
-    output coarse tiles during combined post-tile validation.
+    Input spans controlled only by reduction symbols are skipped during output-range
+    planning. When ``k_split`` is supplied, the BMM K symbol is included so
+    post-tile validation can account for a proposed reduction-range tile.
+    ``split_by_host_dim`` models hypothetical output coarse tiles.
     """
     if split_by_host_dim is None:
         split_by_host_dim = (
@@ -846,7 +846,9 @@ def _bmm_k_split_candidates(op: ComputedBuffer, required_split: int) -> list[int
     legal = [
         split
         for split in divisors
-        if split >= max(2, required_split) and split <= _MAX_AUTO_TILE_SPLIT_COUNT
+        if split >= max(2, required_split)
+        and split < k_size
+        and split <= _MAX_AUTO_TILE_SPLIT_COUNT
     ]
     return _cap_split_candidates(legal, required_split)
 
@@ -1436,12 +1438,15 @@ def _remaining_span_candidates_after_tile(
         op_name=f"{op.get_name()}:post_tile",
     )
     if isinstance(op.data, Reduction):
-        remaining += _input_span_candidates(
-            op,
-            max_cores,
-            split_by_host_dim=split_by_host_dim,
-            k_split=k_split,
-        )
+        remaining += [
+            SpanOverflowCandidate(info.chunking_info, source=f"input:{info.dep_name}")
+            for info in _input_span_infos_controlled_by_output_dims(
+                op,
+                max_cores,
+                split_by_host_dim=split_by_host_dim,
+                k_split=k_split,
+            )
+        ]
         if k_split is not None and _is_batch_matmul_reduction(op):
             remaining += [
                 SpanOverflowCandidate(
@@ -1657,17 +1662,19 @@ def _search_bmm_k_tile_plan(
             ),
         )
 
-    detail = (
-        f" First alignment error: {first_alignment_error}."
-        if first_alignment_error is not None
-        else ""
+    logger.debug(
+        "Cannot auto-tile %s on BMM K: no legal exact divisor at or above "
+        "required split %d makes every input span fit within %.3f MB.%s",
+        op.get_name(),
+        required_split,
+        MAX_SPAN_BYTES / (1024**2),
+        (
+            f" First alignment error: {first_alignment_error}."
+            if first_alignment_error is not None
+            else ""
+        ),
     )
-    raise Unsupported(
-        f"Cannot auto-tile {op.get_name()} on BMM K: no legal exact divisor "
-        f"at or above required split {required_split} makes all K-controlled "
-        f"input spans fit within {MAX_SPAN_BYTES / (1024**2):.3f} MB."
-        f"{detail}"
-    )
+    return None
 
 
 def _has_indirect_reads(op: ComputedBuffer) -> bool:
@@ -1858,6 +1865,14 @@ def plan_span_overflow_tile(
             output_failure = exc
             output_plan = None
         if output_plan is not None:
+            remaining_k_infos = _bmm_k_span_infos(op, max_cores)
+            if remaining_k_infos:
+                raise Unsupported(
+                    f"Cannot auto-tile {op.get_name()}: the selected B/M/N plan "
+                    "leaves a K-controlled input span over the hardware limit; "
+                    "combined output-range and reduction-range tiling is not yet "
+                    "supported."
+                )
             return output_plan
         try:
             k_plan = _search_bmm_k_tile_plan(op, max_cores)

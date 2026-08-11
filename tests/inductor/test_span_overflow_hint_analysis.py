@@ -785,6 +785,10 @@ class TestSpanOverflowGroups(InductorTestCase):
                 "torch_spyre._inductor.wsr.coarse_tile_span_overflow.indirect_sizes_from_op",
                 lambda op: {},
             ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow._bmm_k_symbol",
+                return_value=sympy.Symbol("k"),
+            ),
             config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
         ):
             groups = _apply_span_overflow(_graph([producer, reduction]))
@@ -1591,9 +1595,9 @@ class TestSpanOverflowGroups(InductorTestCase):
         (so it passes the matmul gate) identical to the passing matmul-join
         case except its plan is flagged ``is_reduction=True`` -- the
         ``is_reduction`` guard in ``_consumer_shares_group_tiled_dim`` alone
-        must flip join -> reject (#3217).  The auto planner never emits such a
-        plan today (``SpanOverflowTileLevel.is_reduction`` is always False), so
-        this guard is belt-and-suspenders against a future planner change."""
+        must flip join -> independent group (#3217).  This plan is emitted by
+        the BMM K fallback and must remain independent while reading the
+        producer through its materialized output."""
         producer = _pointwise_op(_E2E_SHAPE, name="buf0")
         reduction = _reduction_op(_E2E_SHAPE, name="buf1", reduction_type="batchmatmul")
         reduction.get_read_writes = MagicMock(
@@ -1641,7 +1645,7 @@ class TestSpanOverflowGroups(InductorTestCase):
                 return self._fake_plan(1, 5)
             # Same split (5) and a correspondence that WOULD pass the loop-var
             # check -- only the is_reduction flag differs from the passing case.
-            return reduction_range_plan(2, 5)
+            return reduction_range_plan(0, 5)
 
         with (
             patch(
@@ -1665,21 +1669,91 @@ class TestSpanOverflowGroups(InductorTestCase):
                 "torch_spyre._inductor.wsr.coarse_tile_span_overflow.indirect_sizes_from_op",
                 lambda op: {},
             ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow._bmm_k_symbol",
+                return_value=sympy.Symbol("k"),
+            ),
             config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
         ):
-            with self.assertRaisesRegex(
-                Unsupported,
-                "reads auto-tiled producer.*cannot join them.*same shared "
-                "output dimension at the same split count",
-            ):
-                _apply_span_overflow(_graph([producer, reduction]))
+            groups = _apply_span_overflow(_graph([producer, reduction]))
 
-    def test_second_reduction_consumer_of_joined_producer_rejected(self):
-        """One auto-tiled producer feeds at most one reduction consumer: the
-        group is flushed as soon as the first matmul joins, so a *second* matmul
-        reading the same weight is rejected -- with a distinct 'multi-consumer
-        not yet supported' message rather than the generic pointwise-only one
-        (#3217)."""
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(groups[0][0], [producer])
+        self.assertEqual(groups[1][0], [reduction])
+        self.assertTrue(reduction.dim_hints[0].is_reduction)
+
+    def test_k_tiled_bmm_output_is_not_tracked_as_auto_tiled_producer(self):
+        producer = _pointwise_op(_E2E_SHAPE, name="buf0")
+        bmm = _reduction_op(
+            _E2E_SHAPE,
+            name="buf1",
+            reduction_type=BATCH_MATMUL_OP,
+        )
+        consumer = _pointwise_op(_E2E_SHAPE, name="buf2")
+        h = sympy.Symbol("h")
+        k = sympy.Symbol("k")
+
+        bmm.get_read_writes = MagicMock(
+            return_value=SimpleNamespace(
+                reads={MemoryDep("buf0", h, (h,), (8195,))},
+                writes=_default_read_writes_for_output(
+                    "buf1", _E2E_SHAPE, bmm.layout
+                ).writes,
+            )
+        )
+        consumer.get_read_writes = MagicMock(
+            return_value=SimpleNamespace(
+                reads={MemoryDep("buf1", h, (h,), (8195,))},
+                writes=_default_read_writes_for_output(
+                    "buf2", _E2E_SHAPE, consumer.layout
+                ).writes,
+            )
+        )
+
+        k_plan = SpanOverflowTilePlan(
+            levels=(SpanOverflowTileLevel(0, 5, is_reduction=True),),
+            chunking_infos=(
+                ChunkingInfo(
+                    total_bytes=1,
+                    per_core_span=1,
+                    core_split_estimate=1,
+                    selected_device_dim_size=5,
+                    selected_device_span_stride_elems=1,
+                    selected_host_dim=0,
+                    stick_elems=64,
+                    reason="K span overflow",
+                ),
+            ),
+            reason="K span overflow",
+        )
+
+        def fake_plan(op, _max_cores):
+            if op.get_name() == "buf1":
+                return k_plan
+            return self._fake_plan(1, 5)
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.plan_span_overflow_tile",
+                fake_plan,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
+                _out_coords_for_bhld,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow._bmm_k_symbol",
+                return_value=k,
+            ),
+            config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
+        ):
+            groups = _apply_span_overflow(_graph([producer, bmm, consumer]))
+
+        self.assertEqual(
+            [group[0] for group in groups], [[producer], [bmm], [consumer]]
+        )
+        self.assertTrue(bmm.dim_hints[0].is_reduction)
+        self.assertFalse(consumer.dim_hints[0].is_reduction)
         producer = _pointwise_op(_E2E_SHAPE, name="buf0")
         matmul1 = _reduction_op(_E2E_SHAPE, name="buf1", reduction_type="batchmatmul")
         matmul2 = _reduction_op(_E2E_SHAPE, name="buf2", reduction_type="batchmatmul")
@@ -2431,9 +2505,9 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
                 return_value=[remaining_m],
             ) as validate,
         ):
-            with self.assertRaisesRegex(Unsupported, "no legal exact divisor"):
-                soha._search_bmm_k_tile_plan(op, max_cores=1)
+            plan = soha._search_bmm_k_tile_plan(op, max_cores=1)
 
+        self.assertIsNone(plan)
         validate.assert_called_once_with(op, 1, {}, k_split=2)
 
     def test_bmm_k_alignment_failure_reports_first_error(self):
@@ -2459,10 +2533,72 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
                 return_value="input dependency rhs host dim 0 cuts a stick",
             ),
         ):
+            plan = soha._search_bmm_k_tile_plan(op, max_cores=1)
+
+        self.assertIsNone(plan)
+
+    def test_bmm_output_plan_rejected_when_k_span_remains(self):
+        op = _reduction_op(
+            (1, 4_194_304, 64),
+            reduction_ranges=(65536,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+        output_plan = SpanOverflowTilePlan(
+            levels=(SpanOverflowTileLevel(1, 2),),
+            chunking_infos=(),
+            reason="M input span overflow",
+        )
+        remaining_k = SimpleNamespace(dep_name="rhs")
+
+        with (
+            patch.object(soha, "_output_span_candidates_from_op", return_value=[]),
+            patch.object(soha, "_input_span_candidates", return_value=[]),
+            patch.object(soha, "_search_min_cost_tile_plan", return_value=output_plan),
+            patch.object(soha, "_bmm_k_span_infos", return_value=[remaining_k]),
+        ):
             with self.assertRaisesRegex(
-                Unsupported, "First alignment error: input dependency rhs"
+                Unsupported, "combined output-range and reduction-range"
             ):
-                soha._search_bmm_k_tile_plan(op, max_cores=1)
+                plan_span_overflow_tile(op, max_cores=1)
+
+    def test_k_validation_keeps_unsplittable_output_controlled_span(self):
+        op = _reduction_op(
+            (1, 4_194_304, 64),
+            reduction_ranges=(65536,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+        remaining_info = SimpleNamespace(
+            chunking_info=SimpleNamespace(selected_host_dim=1),
+            dep_name="lhs",
+        )
+
+        with (
+            patch.object(soha, "_post_tile_layout_for_splits", return_value=op.layout),
+            patch.object(soha, "_output_span_candidates_from_op", return_value=[]),
+            patch.object(
+                soha,
+                "_input_span_infos_controlled_by_output_dims",
+                return_value=[remaining_info],
+            ),
+            patch.object(soha, "_bmm_k_span_infos", return_value=[]),
+            patch.object(
+                soha, "_host_dim_has_legal_nontrivial_split", return_value=False
+            ) as legal_split,
+        ):
+            remaining = soha._remaining_span_candidates_after_tile(op, 1, {}, k_split=2)
+
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0].source, "input:lhs")
+        legal_split.assert_not_called()
+
+    def test_bmm_k_split_candidates_keep_reduction_extent_above_one(self):
+        op = _reduction_op(
+            (1, 1, 64),
+            reduction_ranges=(8,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+
+        self.assertEqual(soha._bmm_k_split_candidates(op, required_split=8), [])
 
     def test_bmm_without_any_overflow_returns_none(self):
         op = _reduction_op(
