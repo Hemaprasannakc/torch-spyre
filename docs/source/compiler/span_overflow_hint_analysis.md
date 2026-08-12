@@ -1067,7 +1067,7 @@ Producer/consumer grouping is covered at three depths -- the grouping decision
 | pointwise -> pointwise | pass | pass | pass |
 | pointwise -> reduction | pass | pass | pass |
 | reduction -> pointwise | pass | pass | pass |
-| reduction -> reduction | pass | pass | xfail |
+| reduction -> reduction | pass | xfail (wrong write) | xfail |
 | reduction -> matmul | pass | pass | pass |
 | pointwise -> matmul | pass | pass | xfail (wrong numbers) |
 | matmul -> pointwise | pass | pass | xfail (wrong numbers) |
@@ -1094,7 +1094,19 @@ dims transposed.  That walk predates this branch (it comes from #3381) and is
 unchanged by it, but it should be ruled out before any of these are blamed on
 the backend again.
 
-Only one backend-attributed xfail remains, `reduction -> reduction`.  Given
+`reduction -> reduction` codegen is also xfailed, on a *known wrong write*
+rather than an unexplained failure.  `validate_writer_tile_advance` (#3678)
+rejects the group because the synthesized copy-out writer never advances:
+`_insert_copy_op` keys its per-level extents by raw dim index, while
+`_tiled_dims_for_dep` matches those keys against the squeezed `dN` symbols of
+`dep.index`.  For a terminal reduction whose output is `[1, 20]` the leading
+unit dim squeezes away, the raw key matches nothing, and every tile is written
+on top of tile 0.  It is not gated in the pass because the same code path
+serves `reduction -> matmul`, which works; what separates them is output shape,
+not direction.  Tagged `TODO(copy-out-writer-advance)`.
+
+Only one backend-attributed xfail remains, `reduction -> reduction` execution.
+Given
 that two of the three cases originally filed under the same
 `DtException: Could not find any suitable dimension mapping` diagnosis turned
 out to be unblocked by a read-copy change rather than a backend fix, that
