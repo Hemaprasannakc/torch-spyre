@@ -419,13 +419,17 @@ def span_overflow_groups(
     consumer already goes through that check on the join branch, which is also
     what rejects a producer whose tiled dim lands on the consumer's reduction
     (K) range.  If nothing joins, the run flushes to exactly the singleton
-    reads a buffer from an already-closed group, or from the open run without
-    being fusable into it, still raises ``Unsupported``: two independent loop
-    nests over the same span-overflow-sized data can desynchronize, and for ops
-    tiled specifically because their *full* buffer violates the hardware span
-    limit, falling back to materializing that full buffer for an "outside
-    consumer" would silently reintroduce the exact span violation tiling was
-    meant to prevent.
+    group an unjoined Reduction used to produce eagerly.
+
+    A non-K plan that reads a buffer from an already-closed group, or from the
+    open run without being fusable into it, still raises ``Unsupported``: two
+    independent loop nests over the same span-overflow-sized data can
+    desynchronize, and for ops tiled specifically because their *full* buffer
+    violates the hardware span limit, falling back to materializing that full
+    buffer for an outside consumer would silently reintroduce the exact span
+    violation tiling was meant to prevent.  K-only plans are the deliberate
+    exception because they tile the reduction range and leave their output fully
+    materialized.
     """
     from .. import config
 

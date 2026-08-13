@@ -681,9 +681,6 @@ def _input_span_infos_controlled_by_output_dims(
                     reduction_syms,
                 )
                 continue
-            if reduction_syms and not output_syms and k_split is None:
-                continue
-
             # A coordinate can be jointly controlled by more than one output
             # symbol, for example two interleaved dims sharing one physical
             # stride.  Compute its span using every contributing dim's
@@ -1662,6 +1659,7 @@ def _search_bmm_k_tile_plan(
         split_candidates,
     )
     first_alignment_error: str | None = None
+    first_remaining: tuple[int, list[str]] | None = None
     for split_count in split_candidates:
         alignment_error = _bmm_k_alignment_error(op, split_count)
         if alignment_error is not None:
@@ -1683,6 +1681,10 @@ def _search_bmm_k_tile_plan(
             )
             continue
         if remaining:
+            first_remaining = first_remaining or (
+                split_count,
+                [candidate.source for candidate in remaining],
+            )
             continue
         level = SpanOverflowTileLevel(
             selected_host_dim=0,
@@ -1707,6 +1709,14 @@ def _search_bmm_k_tile_plan(
                     }
                 )
             ),
+        )
+
+    if first_remaining is not None:
+        split_count, remaining_sources = first_remaining
+        raise Unsupported(
+            f"Cannot auto-tile {op.get_name()} on BMM K: K split {split_count} "
+            "still leaves non-K span-overflow candidate(s) "
+            f"{remaining_sources}; K-only tiling cannot resolve those spans."
         )
 
     detail = (

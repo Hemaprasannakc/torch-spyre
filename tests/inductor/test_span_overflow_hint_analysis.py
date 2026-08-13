@@ -1766,6 +1766,14 @@ class TestSpanOverflowGroups(InductorTestCase):
         )
         self.assertTrue(bmm.dim_hints[0].is_reduction)
         self.assertFalse(consumer.dim_hints[0].is_reduction)
+
+    def test_second_reduction_consumer_of_joined_producer_rejected(self):
+        """One auto-tiled producer feeds at most one reduction consumer.
+
+        The group is flushed as soon as the first matmul joins, so a second
+        matmul reading the same producer is rejected with the distinct
+        multi-consumer message rather than the generic pointwise-only one.
+        """
         producer = _pointwise_op(_E2E_SHAPE, name="buf0")
         matmul1 = _reduction_op(_E2E_SHAPE, name="buf1", reduction_type="batchmatmul")
         matmul2 = _reduction_op(_E2E_SHAPE, name="buf2", reduction_type="batchmatmul")
@@ -2594,7 +2602,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
                 return_value=[remaining_m],
             ) as validate,
         ):
-            with self.assertRaisesRegex(Unsupported, "no legal exact divisor"):
+            with self.assertRaisesRegex(Unsupported, "K-only tiling cannot resolve"):
                 soha._search_bmm_k_tile_plan(op, max_cores=1)
 
         validate.assert_called_once_with(op, 1, {}, k_split=2)
