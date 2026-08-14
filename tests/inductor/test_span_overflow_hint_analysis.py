@@ -2577,7 +2577,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ):
                 plan_span_overflow_tile(op, max_cores=1)
 
-    def test_bmm_k_plan_rejected_when_m_span_remains(self):
+    def test_bmm_k_plan_rejected_reports_latest_remaining_and_alignment(self):
         op = _reduction_op(
             (1, 4_194_304, 64),
             reduction_ranges=(65536,),
@@ -2590,22 +2590,56 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ),
             dep_name="rhs",
         )
-        remaining_m = SimpleNamespace(source="input:lhs")
+        remaining_at_2 = SimpleNamespace(source="input:rhs@2")
+        remaining_at_4 = SimpleNamespace(source="input:lhs@4")
+
+        def alignment_error(_op, split_count):
+            if split_count == 8:
+                return "input dependency rhs host dim 0 cuts a stick"
+            return None
+
+        def validate(_op, _max_cores, split_by_host_dim, *, k_split=None):
+            self.assertEqual(split_by_host_dim, {})
+            if k_split == 2:
+                return [remaining_at_2]
+            if k_split == 4:
+                return [remaining_at_4]
+            raise AssertionError(f"unexpected k_split={k_split}")
 
         with (
             patch.object(soha, "_bmm_k_span_infos", return_value=[initial_info]),
-            patch.object(soha, "_bmm_k_split_candidates", return_value=[2]),
-            patch.object(soha, "_bmm_k_alignment_error", return_value=None),
+            patch.object(soha, "_bmm_k_split_candidates", return_value=[2, 4, 8]),
+            patch.object(soha, "_bmm_k_alignment_error", side_effect=alignment_error),
             patch.object(
                 soha,
                 "_remaining_span_candidates_after_tile",
-                return_value=[remaining_m],
-            ) as validate,
+                side_effect=validate,
+            ),
         ):
-            with self.assertRaisesRegex(Unsupported, "K-only tiling cannot resolve"):
+            with self.assertRaisesRegex(
+                Unsupported,
+                "K split 4.*input:lhs@4.*First alignment error: input dependency rhs",
+            ) as cm:
                 soha._search_bmm_k_tile_plan(op, max_cores=1)
 
-        validate.assert_called_once_with(op, 1, {}, k_split=2)
+        self.assertNotIn("input:rhs@2", str(cm.exception))
+        self.assertNotIn("non-K", str(cm.exception))
+
+    def test_bmm_k_fallback_respects_reduction_tiling_kill_switch(self):
+        op = _reduction_op(
+            (1, 1, 64),
+            reduction_ranges=(65536,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+
+        with (
+            patch.object(config, "enable_reduction_tiling", False),
+            patch.object(soha, "_bmm_k_span_infos") as k_infos,
+        ):
+            plan = soha._search_bmm_k_tile_plan(op, max_cores=1)
+
+        self.assertIsNone(plan)
+        k_infos.assert_not_called()
 
     def test_bmm_k_alignment_failure_reports_first_error(self):
         op = _reduction_op(
@@ -2635,7 +2669,42 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ):
                 soha._search_bmm_k_tile_plan(op, max_cores=1)
 
-    def test_bmm_output_plan_rejected_when_k_span_remains(self):
+    def test_bmm_k_fallback_tried_when_output_plan_leaves_k_span(self):
+        op = _reduction_op(
+            (1, 4_194_304, 64),
+            reduction_ranges=(65536,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+        output_plan = SpanOverflowTilePlan(
+            levels=(SpanOverflowTileLevel(1, 2),),
+            chunking_infos=(),
+            reason="M input span overflow",
+        )
+        k_plan = SpanOverflowTilePlan(
+            levels=(SpanOverflowTileLevel(0, 4, is_reduction=True),),
+            chunking_infos=(),
+            reason="BMM K input span overflow",
+        )
+        remaining_k = SimpleNamespace(dep_name="rhs")
+
+        with (
+            patch.object(soha, "_output_span_candidates_from_op", return_value=[]),
+            patch.object(soha, "_input_span_candidates", return_value=[]),
+            patch.object(soha, "_search_min_cost_tile_plan", return_value=output_plan),
+            patch.object(
+                soha, "_bmm_k_span_infos", return_value=[remaining_k]
+            ) as k_infos,
+            patch.object(
+                soha, "_search_bmm_k_tile_plan", return_value=k_plan
+            ) as k_search,
+        ):
+            plan = plan_span_overflow_tile(op, max_cores=1)
+
+        self.assertIs(plan, k_plan)
+        k_infos.assert_called_once_with(op, 1, split_by_host_dim={1: 2})
+        k_search.assert_called_once_with(op, 1)
+
+    def test_bmm_output_plan_rejected_when_k_span_remains_and_k_fails(self):
         op = _reduction_op(
             (1, 4_194_304, 64),
             reduction_ranges=(65536,),
@@ -2655,6 +2724,11 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             patch.object(
                 soha, "_bmm_k_span_infos", return_value=[remaining_k]
             ) as k_infos,
+            patch.object(
+                soha,
+                "_search_bmm_k_tile_plan",
+                side_effect=Unsupported("K-only candidates did not clear every span"),
+            ) as k_search,
         ):
             with self.assertRaisesRegex(
                 Unsupported, "combined output-range and reduction-range"
@@ -2662,6 +2736,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
                 plan_span_overflow_tile(op, max_cores=1)
 
         k_infos.assert_called_once_with(op, 1, split_by_host_dim={1: 2})
+        k_search.assert_called_once_with(op, 1)
 
     def test_k_validation_keeps_unsplittable_output_controlled_span(self):
         op = _reduction_op(

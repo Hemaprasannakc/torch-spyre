@@ -27,6 +27,7 @@ from torch._inductor.dependencies import MemoryDep
 from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
 from torch._inductor.virtualized import V
 
+from .. import config
 from ..constants import BATCH_MATMUL_OP
 from ..errors import Unsupported
 from ..ir import FixedTiledLayout, _resize_device_layout
@@ -1644,6 +1645,9 @@ def _search_bmm_k_tile_plan(
     max_cores: int,
 ) -> SpanOverflowTilePlan | None:
     """Find a BMM-only reduction-range plan after B/M/N planning fails."""
+    if not config.enable_reduction_tiling:
+        return None
+
     initial_infos = _bmm_k_span_infos(op, max_cores)
     if not initial_infos:
         return None
@@ -1659,7 +1663,7 @@ def _search_bmm_k_tile_plan(
         split_candidates,
     )
     first_alignment_error: str | None = None
-    first_remaining: tuple[int, list[str]] | None = None
+    latest_remaining: tuple[int, list[str]] | None = None
     for split_count in split_candidates:
         alignment_error = _bmm_k_alignment_error(op, split_count)
         if alignment_error is not None:
@@ -1681,7 +1685,7 @@ def _search_bmm_k_tile_plan(
             )
             continue
         if remaining:
-            first_remaining = first_remaining or (
+            latest_remaining = (
                 split_count,
                 [candidate.source for candidate in remaining],
             )
@@ -1711,19 +1715,19 @@ def _search_bmm_k_tile_plan(
             ),
         )
 
-    if first_remaining is not None:
-        split_count, remaining_sources = first_remaining
-        raise Unsupported(
-            f"Cannot auto-tile {op.get_name()} on BMM K: K split {split_count} "
-            "still leaves non-K span-overflow candidate(s) "
-            f"{remaining_sources}; K-only tiling cannot resolve those spans."
-        )
-
     detail = (
         f" First alignment error: {first_alignment_error}."
         if first_alignment_error is not None
         else ""
     )
+    if latest_remaining is not None:
+        split_count, remaining_sources = latest_remaining
+        raise Unsupported(
+            f"Cannot auto-tile {op.get_name()} on BMM K: K split {split_count} "
+            "still leaves span-overflow candidate(s) "
+            f"{remaining_sources}; K-only candidates did not clear every span.{detail}"
+        )
+
     raise Unsupported(
         f"Cannot auto-tile {op.get_name()} on BMM K: no legal exact divisor makes every input span "
         f"fit within {MAX_SPAN_BYTES / (1024**2):.3f} MB.{detail}"
@@ -1929,11 +1933,23 @@ def plan_span_overflow_tile(
                 split_by_host_dim=split_by_host_dim,
             )
             if remaining_k_infos:
+                try:
+                    k_plan = _search_bmm_k_tile_plan(op, max_cores)
+                except Unsupported as exc:
+                    raise Unsupported(
+                        f"Cannot auto-tile {op.get_name()}: the selected B/M/N plan "
+                        "leaves a K-controlled input span over the hardware limit, "
+                        "and no K-only fallback plan can fully resolve the op; "
+                        "combined output-range and reduction-range tiling is not yet "
+                        f"supported. K-only failure: {exc}"
+                    ) from exc
+                if k_plan is not None:
+                    return k_plan
                 raise Unsupported(
                     f"Cannot auto-tile {op.get_name()}: the selected B/M/N plan "
-                    "leaves a K-controlled input span over the hardware limit; "
-                    "combined output-range and reduction-range tiling is not yet "
-                    "supported."
+                    "leaves a K-controlled input span over the hardware limit, "
+                    "and no K-only fallback plan is available; combined "
+                    "output-range and reduction-range tiling is not yet supported."
                 )
             return output_plan
         try:
