@@ -421,15 +421,15 @@ def span_overflow_groups(
     (K) range.  If nothing joins, the run flushes to exactly the singleton
     group an unjoined Reduction used to produce eagerly.
 
-    A non-K plan that reads a buffer from an already-closed group, or from the
+    Any plan that reads a buffer from an already-closed group, or from the
     open run without being fusable into it, still raises ``Unsupported``: two
     independent loop nests over the same span-overflow-sized data can
     desynchronize, and for ops tiled specifically because their *full* buffer
     violates the hardware span limit, falling back to materializing that full
     buffer for an outside consumer would silently reintroduce the exact span
-    violation tiling was meant to prevent.  K-only plans are the deliberate
-    exception because they tile the reduction range and leave their output fully
-    materialized.
+    violation tiling was meant to prevent. K-only plans also fail this guard:
+    their reduction-range loop cannot be synchronized with an output-tiled
+    producer, so independently nesting the two plans is unsafe.
     """
     from .. import config
 
@@ -585,7 +585,7 @@ def span_overflow_groups(
                 "synchronized group; multiple consumers sharing one "
                 "auto-tiled producer is not yet supported (#3217)."
             )
-        if completed_conflicts and not reduction_only_plan:
+        if completed_conflicts:
             logger.warning(
                 "[span-overflow groups] op=%s rejected_conflicting_auto_producers=%s",
                 op.get_name(),
@@ -739,7 +739,7 @@ def span_overflow_groups(
 
         pending_conflicts = sorted(read_deps & current_group_names)
         flush_current_group()
-        if pending_conflicts and not reduction_only_plan:
+        if pending_conflicts:
             logger.warning(
                 "[span-overflow groups] op=%s rejected_conflicting_auto_producers=%s",
                 op.get_name(),

@@ -1590,7 +1590,7 @@ class TestSpanOverflowGroups(InductorTestCase):
         self.assertEqual(groups[0][1][0][0], _SPAN_OVERFLOW_HINT_ID)
         self.assertEqual(groups[1][1][0][0], _SPAN_OVERFLOW_HINT_ID + 1)
 
-    def test_reduction_range_tile_never_joins(self):
+    def test_reduction_range_tile_rejects_tiled_producer_conflict(self):
         """A reduction that tiles its *reduction* range (``is_reduction=True``)
         must never join, even if split counts match and the read correspondence
         would otherwise hold: tile ``t`` of a reduction range is not
@@ -1600,8 +1600,8 @@ class TestSpanOverflowGroups(InductorTestCase):
         case except its plan is flagged ``is_reduction=True`` -- the
         ``is_reduction`` guard in ``_consumer_shares_group_tiled_dim`` alone
         must flip join -> independent group (#3217).  This plan is emitted by
-        the BMM K fallback and must remain independent while reading the
-        producer through its materialized output."""
+        the BMM K fallback and cannot safely form an independent loop while
+        reading a producer whose coarse-tile group is still open."""
         producer = _pointwise_op(_E2E_SHAPE, name="buf0")
         reduction = _reduction_op(_E2E_SHAPE, name="buf1", reduction_type="batchmatmul")
         reduction.get_read_writes = MagicMock(
@@ -1683,15 +1683,12 @@ class TestSpanOverflowGroups(InductorTestCase):
             ),
             config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
         ):
-            groups = _apply_span_overflow(_graph([producer, reduction]))
-
-        self.assertEqual(len(groups), 2)
-        self.assertEqual(groups[0][0], [producer])
-        self.assertEqual(groups[1][0], [reduction])
-        self.assertTrue(reduction.dim_hints[0].is_reduction)
+            with self.assertRaisesRegex(
+                Unsupported, "reads auto-tiled producer.*cannot join them"
+            ):
+                _apply_span_overflow(_graph([producer, reduction]))
 
     def test_k_tiled_bmm_output_is_not_tracked_as_auto_tiled_producer(self):
-        producer = _pointwise_op(_E2E_SHAPE, name="buf0")
         bmm = _reduction_op(
             _E2E_SHAPE,
             name="buf1",
@@ -1759,11 +1756,9 @@ class TestSpanOverflowGroups(InductorTestCase):
             ),
             config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
         ):
-            groups = _apply_span_overflow(_graph([producer, bmm, consumer]))
+            groups = _apply_span_overflow(_graph([bmm, consumer]))
 
-        self.assertEqual(
-            [group[0] for group in groups], [[producer], [bmm], [consumer]]
-        )
+        self.assertEqual([group[0] for group in groups], [[bmm], [consumer]])
         self.assertTrue(bmm.dim_hints[0].is_reduction)
         self.assertFalse(consumer.dim_hints[0].is_reduction)
 
@@ -1850,7 +1845,7 @@ class TestSpanOverflowGroups(InductorTestCase):
             ):
                 _apply_span_overflow(_graph([producer, matmul1, matmul2]))
 
-    def test_k_only_plan_can_read_manually_tiled_producer_independently(self):
+    def test_k_only_plan_rejects_manually_tiled_producer(self):
         producer = _pointwise_op(_E2E_SHAPE, name="buf0")
         _manual_h_hint_group(producer)
         bmm = _reduction_op(
@@ -1899,12 +1894,11 @@ class TestSpanOverflowGroups(InductorTestCase):
             ),
             config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
         ):
-            groups = _apply_span_overflow(_graph([producer, bmm]))
-
-        self.assertEqual(len(groups), 1)
-        self.assertEqual(bmm.dim_hints[0].loop_var, sympy.Symbol("k"))
-        self.assertTrue(bmm.dim_hints[0].is_reduction)
-        self.assertEqual(bmm.dim_hints[0].split_count, 5)
+            with self.assertRaisesRegex(
+                Unsupported,
+                "already-tiled producer.*not in an open group this op can join",
+            ):
+                _apply_span_overflow(_graph([producer, bmm]))
 
     def test_chained_pointwise_ops_conform_failure_still_raises(self):
         """op1's own search disagrees with op0's, and op0's split (5) does not
@@ -2520,6 +2514,37 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         )
         self.assertIn("BMM K input span overflow", plan.reason)
 
+    def test_bmm_k_split_rejects_unmeasurable_coordinate_span(self):
+        op = _reduction_op(
+            (1, 1, 64), reduction_ranges=(65536,), reduction_type=BATCH_MATMUL_OP
+        )
+        b, m, n, k = sympy.symbols("b m n k")
+        rhs_dep = MemoryDep("rhs", k * 64 + n, (k, n), (65536, 64))
+        rhs_layout = _fixed_tiled_layout((65536, 64))
+
+        with (
+            patch.object(
+                soha, "_input_read_deps", return_value=[(rhs_dep, rhs_layout)]
+            ),
+            patch.object(soha, "_bmm_k_symbol", return_value=k),
+            patch.object(
+                soha,
+                "_bmm_output_symbol_to_dim",
+                return_value={b: 0, m: 1, n: 2},
+            ),
+            patch.object(
+                soha,
+                "_device_coordinates_for_span",
+                return_value=[k + n, sympy.Integer(0)],
+            ),
+            patch.object(soha, "_coordinate_span_elems", return_value=None),
+        ):
+            with self.assertRaisesRegex(
+                Unsupported,
+                "Cannot validate BMM K split 2.*unsupported coordinate span",
+            ):
+                soha._bmm_k_span_infos(op, max_cores=1, k_split=2)
+
     def test_bmm_k_fallback_does_not_hide_output_overflow(self):
         op = _reduction_op(
             (1, 1, 64), reduction_ranges=(65536,), reduction_type=BATCH_MATMUL_OP
@@ -2577,7 +2602,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ):
                 plan_span_overflow_tile(op, max_cores=1)
 
-    def test_bmm_k_plan_rejected_reports_latest_remaining_and_alignment(self):
+    def test_bmm_k_plan_rejected_returns_none(self):
         op = _reduction_op(
             (1, 4_194_304, 64),
             reduction_ranges=(65536,),
@@ -2616,14 +2641,9 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
                 side_effect=validate,
             ),
         ):
-            with self.assertRaisesRegex(
-                Unsupported,
-                "K split 4.*input:lhs@4.*First alignment error: input dependency rhs",
-            ) as cm:
-                soha._search_bmm_k_tile_plan(op, max_cores=1)
+            plan = soha._search_bmm_k_tile_plan(op, max_cores=1)
 
-        self.assertNotIn("input:rhs@2", str(cm.exception))
-        self.assertNotIn("non-K", str(cm.exception))
+        self.assertIsNone(plan)
 
     def test_bmm_k_fallback_respects_reduction_tiling_kill_switch(self):
         op = _reduction_op(
@@ -2641,7 +2661,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertIsNone(plan)
         k_infos.assert_not_called()
 
-    def test_bmm_k_alignment_failure_reports_first_error(self):
+    def test_bmm_k_alignment_failure_returns_none(self):
         op = _reduction_op(
             (1, 1, 64),
             reduction_ranges=(65536,),
@@ -2664,10 +2684,9 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
                 return_value="input dependency rhs host dim 0 cuts a stick",
             ),
         ):
-            with self.assertRaisesRegex(
-                Unsupported, "First alignment error: input dependency rhs"
-            ):
-                soha._search_bmm_k_tile_plan(op, max_cores=1)
+            plan = soha._search_bmm_k_tile_plan(op, max_cores=1)
+
+        self.assertIsNone(plan)
 
     def test_bmm_k_fallback_tried_when_output_plan_leaves_k_span(self):
         op = _reduction_op(

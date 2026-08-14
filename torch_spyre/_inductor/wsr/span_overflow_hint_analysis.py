@@ -790,7 +790,11 @@ def _bmm_k_span_infos(
             split_by_symbol[k_symbol] = k_split
             coord_span_elems = _coordinate_span_elems(coord, dep, split_by_symbol)
             if coord_span_elems is None:
-                continue
+                raise Unsupported(
+                    f"Cannot validate BMM K split {k_split} for {op.get_name()}: "
+                    f"input dependency {dep.name} has an unsupported coordinate "
+                    f"span expression {coord}."
+                )
             inner_stride_elems = _tile_aware_inner_stride_elems(
                 device_coords,
                 device_size,
@@ -800,7 +804,10 @@ def _bmm_k_span_infos(
                 span_split_by_host_dim,
             )
             if inner_stride_elems is None:
-                continue
+                raise Unsupported(
+                    f"Cannot validate BMM K split {k_split} for {op.get_name()}: "
+                    f"input dependency {dep.name} has an unsupported inner span."
+                )
             per_core_span = coord_span_elems * inner_stride_elems * itemsize
             if per_core_span <= MAX_SPAN_BYTES:
                 continue
@@ -1715,23 +1722,24 @@ def _search_bmm_k_tile_plan(
             ),
         )
 
-    detail = (
-        f" First alignment error: {first_alignment_error}."
-        if first_alignment_error is not None
-        else ""
-    )
     if latest_remaining is not None:
         split_count, remaining_sources = latest_remaining
-        raise Unsupported(
-            f"Cannot auto-tile {op.get_name()} on BMM K: K split {split_count} "
-            "still leaves span-overflow candidate(s) "
-            f"{remaining_sources}; K-only candidates did not clear every span.{detail}"
+        logger.debug(
+            "[span-overflow BMM K search] op=%s no plan; K split %d still "
+            "leaves candidates=%s first_alignment_error=%s",
+            op.get_name(),
+            split_count,
+            remaining_sources,
+            first_alignment_error,
         )
-
-    raise Unsupported(
-        f"Cannot auto-tile {op.get_name()} on BMM K: no legal exact divisor makes every input span "
-        f"fit within {MAX_SPAN_BYTES / (1024**2):.3f} MB.{detail}"
-    )
+    else:
+        logger.debug(
+            "[span-overflow BMM K search] op=%s no legal exact divisor; "
+            "first_alignment_error=%s",
+            op.get_name(),
+            first_alignment_error,
+        )
+    return None
 
 
 def _has_indirect_reads(op: ComputedBuffer) -> bool:
