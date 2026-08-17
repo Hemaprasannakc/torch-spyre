@@ -353,20 +353,18 @@ def _output_symbol_to_dim(op: ComputedBuffer) -> dict[sympy.Symbol, int]:
     return symbol_to_dim
 
 
-def _bmm_output_symbol_to_dim(
+def _bmm_symbol_partition(
     op: ComputedBuffer,
     input_deps: Sequence[tuple[MemoryDep, FixedTiledLayout | None]],
-) -> dict[sympy.Symbol, int]:
-    """Map BMM output symbols while excluding the single K symbol.
+) -> tuple[dict[sympy.Symbol, int], sympy.Symbol] | None:
+    """Return the BMM output-symbol map and its unique reduction-only symbol.
 
-    The generic output map says which symbols are output-controlled.  This BMM
-    helper additionally checks input deps to make sure there is exactly one
-    non-output symbol, the matmul reduction K.  Ambiguous cases return an empty
-    map so the planner skips rather than guessing.
+    Ambiguous symbol partitions return ``None`` so callers skip rather than
+    guessing which input symbol represents the matmul reduction K.
     """
     symbol_to_dim = _output_symbol_to_dim(op)
     if not symbol_to_dim:
-        return {}
+        return None
 
     reduction_symbols = {
         sym for dep, _ in input_deps for sym in dep.ranges if sym not in symbol_to_dim
@@ -377,8 +375,17 @@ def _bmm_output_symbol_to_dim(
             op.get_name(),
             sorted(reduction_symbols, key=str),
         )
-        return {}
-    return symbol_to_dim
+        return None
+    return symbol_to_dim, next(iter(reduction_symbols))
+
+
+def _bmm_output_symbol_to_dim(
+    op: ComputedBuffer,
+    input_deps: Sequence[tuple[MemoryDep, FixedTiledLayout | None]],
+) -> dict[sympy.Symbol, int]:
+    """Map BMM output symbols when the input deps identify exactly one K."""
+    partition = _bmm_symbol_partition(op, input_deps)
+    return partition[0] if partition is not None else {}
 
 
 def _bmm_k_symbol(
@@ -407,23 +414,8 @@ def _bmm_k_symbol(
                 resolved_input_deps = ()
     else:
         resolved_input_deps = input_deps
-    output_symbols = set(_bmm_output_symbol_to_dim(op, resolved_input_deps))
-    if not output_symbols:
-        return None
-    reduction_symbols = {
-        sym
-        for dep, _layout in resolved_input_deps
-        for sym in dep.ranges
-        if sym not in output_symbols
-    }
-    if len(reduction_symbols) != 1:
-        logger.debug(
-            "span_overflow_bmm_k: op=%s skipped; expected one K symbol, got %s",
-            op.get_name(),
-            sorted(reduction_symbols, key=str),
-        )
-        return None
-    return next(iter(reduction_symbols))
+    partition = _bmm_symbol_partition(op, resolved_input_deps)
+    return partition[1] if partition is not None else None
 
 
 def _input_read_deps(op: ComputedBuffer) -> list[tuple[MemoryDep, FixedTiledLayout]]:

@@ -3295,15 +3295,18 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             "torch_spyre._inductor.wsr.span_overflow_hint_analysis._output_symbol_to_dim",
             return_value={b: 0, m: 1, n: 2},
         ):
+            input_deps = [
+                (dep0, _fixed_tiled_layout((64, 16))),
+                (dep1, _fixed_tiled_layout((64, 64))),
+            ]
             symbol_to_dim = _bmm_output_symbol_to_dim(
                 op,
-                [
-                    (dep0, _fixed_tiled_layout((64, 16))),
-                    (dep1, _fixed_tiled_layout((64, 64))),
-                ],
+                input_deps,
             )
+            k_symbol = soha._bmm_k_symbol(op, input_deps)
 
         self.assertEqual(symbol_to_dim, {})
+        self.assertIsNone(k_symbol)
 
     def test_input_stick_alignment_rejects_split_legal_on_output_layout(self):
         op = _reduction_op((8190, 64), reduction_ranges=(64,))
