@@ -782,6 +782,8 @@ def _bmm_k_span_infos(
             split_by_symbol[k_symbol] = k_split
             coord_span_elems = _coordinate_span_elems(coord, dep, split_by_symbol)
             if coord_span_elems is None:
+                if k_split == 1:
+                    continue
                 raise Unsupported(
                     f"Cannot validate BMM K split {k_split} for {op.get_name()}: "
                     f"input dependency {dep.name} has an unsupported coordinate "
@@ -796,6 +798,8 @@ def _bmm_k_span_infos(
                 span_split_by_host_dim,
             )
             if inner_stride_elems is None:
+                if k_split == 1:
+                    continue
                 raise Unsupported(
                     f"Cannot validate BMM K split {k_split} for {op.get_name()}: "
                     f"input dependency {dep.name} has an unsupported inner span."

@@ -2514,6 +2514,37 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         )
         self.assertIn("BMM K input span overflow", plan.reason)
 
+    def test_bmm_k_discovery_skips_unmeasurable_coordinate_span(self):
+        op = _reduction_op(
+            (1, 1, 64), reduction_ranges=(65536,), reduction_type=BATCH_MATMUL_OP
+        )
+        b, m, n, k = sympy.symbols("b m n k")
+        rhs_dep = MemoryDep("rhs", k * 64 + n, (k, n), (65536, 64))
+        rhs_layout = _fixed_tiled_layout((65536, 64))
+
+        with (
+            patch.object(soha, "_output_span_candidates_from_op", return_value=[]),
+            patch.object(soha, "_input_span_candidates", return_value=[]),
+            patch.object(
+                soha, "_input_read_deps", return_value=[(rhs_dep, rhs_layout)]
+            ),
+            patch.object(soha, "_bmm_k_symbol", return_value=k),
+            patch.object(
+                soha,
+                "_bmm_output_symbol_to_dim",
+                return_value={b: 0, m: 1, n: 2},
+            ),
+            patch.object(
+                soha,
+                "_device_coordinates_for_span",
+                return_value=[k + n, sympy.Integer(0)],
+            ),
+            patch.object(soha, "_coordinate_span_elems", return_value=None),
+        ):
+            plan = plan_span_overflow_tile(op, max_cores=1)
+
+        self.assertIsNone(plan)
+
     def test_bmm_k_split_rejects_unmeasurable_coordinate_span(self):
         op = _reduction_op(
             (1, 1, 64), reduction_ranges=(65536,), reduction_type=BATCH_MATMUL_OP
