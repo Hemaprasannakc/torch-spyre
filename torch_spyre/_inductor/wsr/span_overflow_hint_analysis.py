@@ -855,7 +855,7 @@ def _bmm_k_alignment_error(op: ComputedBuffer, split_count: int) -> str | None:
         return "could not identify the BMM K symbol"
     for dep, layout in input_deps:
         if not _layout_has_static_span_metadata(layout):
-            return f"input dependency {dep.name} has a non-static layout"
+            continue
         for host_dim, coord in enumerate(host_coordinates(layout, dep, None)):
             if k_symbol not in coord.free_symbols:
                 continue
@@ -1944,6 +1944,8 @@ def plan_span_overflow_tile(
                 split_by_host_dim=split_by_host_dim,
             )
             if remaining_k_infos:
+                if not config.enable_reduction_tiling:
+                    return output_plan
                 try:
                     k_plan = _search_bmm_k_tile_plan(op, max_cores)
                 except Unsupported as exc:

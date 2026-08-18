@@ -2719,6 +2719,30 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         self.assertIsNone(plan)
 
+    def test_bmm_k_alignment_skips_unrelated_nonstatic_input(self):
+        op = _reduction_op(
+            (1, 1, 64), reduction_ranges=(128,), reduction_type=BATCH_MATMUL_OP
+        )
+        k = sympy.Symbol("k")
+        unrelated = MemoryDep("activation", sympy.Symbol("m"), (), ())
+        unrelated_layout = _fixed_tiled_layout((128,))
+        unrelated_layout.size[0] = sympy.Symbol("s0")
+        rhs = MemoryDep("rhs", k, (k,), (128,))
+        rhs_layout = _fixed_tiled_layout((128,))
+
+        with (
+            patch.object(
+                soha,
+                "_input_read_deps",
+                return_value=[(unrelated, unrelated_layout), (rhs, rhs_layout)],
+            ),
+            patch.object(soha, "_bmm_k_symbol", return_value=k),
+            patch.object(soha, "host_coordinates", return_value=[k]),
+        ):
+            error = soha._bmm_k_alignment_error(op, split_count=2)
+
+        self.assertIsNone(error)
+
     def test_bmm_k_fallback_tried_when_output_plan_leaves_k_span(self):
         op = _reduction_op(
             (1, 4_194_304, 64),
@@ -2753,6 +2777,32 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertIs(plan, k_plan)
         k_infos.assert_called_once_with(op, 1, split_by_host_dim={1: 2})
         k_search.assert_called_once_with(op, 1)
+
+    def test_bmm_k_kill_switch_preserves_output_plan(self):
+        op = _reduction_op(
+            (1, 4_194_304, 64),
+            reduction_ranges=(65536,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+        output_plan = SpanOverflowTilePlan(
+            levels=(SpanOverflowTileLevel(1, 2),),
+            chunking_infos=(),
+            reason="M input span overflow",
+        )
+        remaining_k = SimpleNamespace(dep_name="rhs")
+
+        with (
+            patch.object(config, "enable_reduction_tiling", False),
+            patch.object(soha, "_output_span_candidates_from_op", return_value=[]),
+            patch.object(soha, "_input_span_candidates", return_value=[]),
+            patch.object(soha, "_search_min_cost_tile_plan", return_value=output_plan),
+            patch.object(soha, "_bmm_k_span_infos", return_value=[remaining_k]),
+            patch.object(soha, "_search_bmm_k_tile_plan") as k_search,
+        ):
+            plan = plan_span_overflow_tile(op, max_cores=1)
+
+        self.assertIs(plan, output_plan)
+        k_search.assert_not_called()
 
     def test_bmm_output_plan_rejected_when_k_span_remains_and_k_fails(self):
         op = _reduction_op(
