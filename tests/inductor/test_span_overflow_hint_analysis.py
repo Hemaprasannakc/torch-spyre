@@ -2887,6 +2887,51 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertEqual(infos[0].chunking_info.selected_host_dim, 1)
         self.assertEqual(infos[0].dep_name, "lhs")
 
+    def test_bmm_k_split_does_not_shrink_output_controlled_outer_span(self):
+        op = _reduction_op(
+            (1, 8192, 4096),
+            reduction_ranges=(65536,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+        b, m, n, k = sympy.symbols("b m n k")
+        lhs = MemoryDep("lhs", m * 65536 + k, (m, k), (8192, 65536))
+        layout = _fixed_tiled_layout((8192, 65536))
+
+        def inner_stride(
+            _device_coords,
+            _device_size,
+            _dep,
+            _inner_start_dim,
+            symbol_to_dim,
+            _split_by_host_dim,
+        ):
+            return MAX_SPAN_BYTES if k not in symbol_to_dim else 1
+
+        with (
+            patch.object(soha, "_input_read_deps", return_value=[(lhs, layout)]),
+            patch.object(soha, "_bmm_k_symbol", return_value=k),
+            patch.object(
+                soha,
+                "_bmm_output_symbol_to_dim",
+                return_value={b: 0, m: 1, n: 2},
+            ),
+            patch.object(
+                soha,
+                "_device_coordinates_for_span",
+                return_value=[m, k, sympy.Integer(0)],
+            ),
+            patch.object(soha, "_coordinate_span_elems", return_value=2),
+            patch.object(
+                soha, "_tile_aware_inner_stride_elems", side_effect=inner_stride
+            ),
+        ):
+            infos = soha._input_span_infos_controlled_by_output_dims(
+                op, max_cores=1, k_split=2
+            )
+
+        self.assertEqual(len(infos), 1)
+        self.assertEqual(infos[0].chunking_info.selected_host_dim, 1)
+
     def test_bmm_output_search_retries_larger_split_when_k_validation_remains(self):
         op = _reduction_op(
             (1, 64, 64), reduction_ranges=(64,), reduction_type=BATCH_MATMUL_OP
@@ -3197,6 +3242,27 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         )
 
         self.assertIsNotNone(error)
+
+    def test_bmm_k_alignment_rejects_nonexact_padded_layout_split(self):
+        op = _reduction_op(
+            (1, 1, 64), reduction_ranges=(128,), reduction_type=BATCH_MATMUL_OP
+        )
+        k = sympy.Symbol("k")
+        rhs_dep = MemoryDep("rhs", k, (k,), (128,))
+        padded_layout = _fixed_tiled_layout((129,))
+
+        with (
+            patch.object(
+                soha,
+                "_input_read_deps",
+                return_value=[(rhs_dep, padded_layout)],
+            ),
+            patch.object(soha, "_bmm_k_symbol", return_value=k),
+            patch.object(soha, "host_coordinates", return_value=[k]),
+        ):
+            error = soha._bmm_k_alignment_error(op, split_count=2)
+
+        self.assertIn("does not evenly divide", error)
 
     def test_planner_allows_full_size_exact_divisor_for_pointwise(self):
         op = _pointwise_op((1, 17, 16, 64))

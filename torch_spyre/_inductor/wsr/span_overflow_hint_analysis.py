@@ -298,6 +298,11 @@ def _post_tile_stick_alignment_error(
         return None
 
     full_size = int(original_layout.size[selected_host_dim])
+    if full_size % split_count != 0:
+        return (
+            f"split_count {split_count} does not evenly divide selected host dim "
+            f"{selected_host_dim} size {full_size}"
+        )
     tile_size = full_size // split_count
     stick_elems = original_layout.device_layout.elems_per_stick()
     if tile_size % stick_elems == 0:
@@ -697,7 +702,11 @@ def _input_span_infos_controlled_by_output_dims(
 
             span_symbol_to_dim = symbol_to_dim
             span_split_by_host_dim = split_by_host_dim
-            if k_symbol is not None and k_split is not None:
+            if (
+                k_symbol is not None
+                and k_split is not None
+                and k_symbol in coord.free_symbols
+            ):
                 span_symbol_to_dim = {**symbol_to_dim, k_symbol: -1}
                 span_split_by_host_dim = {**split_by_host_dim, -1: k_split}
             inner_stride_elems = _tile_aware_inner_stride_elems(
@@ -1090,7 +1099,6 @@ def _input_span_candidates(
     max_cores: int,
     *,
     split_by_host_dim: dict[int, int] | None = None,
-    k_split: int | None = None,
 ) -> list[SpanOverflowCandidate]:
     """Collect Reduction/BMM input spans controlled by output dimensions.
 
@@ -1102,7 +1110,6 @@ def _input_span_candidates(
         op,
         max_cores,
         split_by_host_dim=split_by_host_dim,
-        k_split=k_split,
     ):
         host_dim = info.chunking_info.selected_host_dim
         if not _host_dim_has_legal_nontrivial_split(op, host_dim):
