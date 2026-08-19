@@ -552,7 +552,7 @@ def span_overflow_groups(
             continue
 
         signature = _auto_span_plan_signature(plan)
-        reduction_only_plan = bool(signature) and all(
+        has_reduction_range = any(
             is_reduction for _host_dim, _split, is_reduction in signature
         )
         logger.debug(
@@ -768,11 +768,11 @@ def span_overflow_groups(
             continue
 
         # A Reduction/BMM op that did not join an open producer group (above)
-        # either opens a run of its own (for output-range tiles) or stays as an
-        # independent singleton (for reduction-range/K-only tiles).  K-only
-        # plans cannot join or root a producer-consumer run because each K tile
-        # is only a partial accumulation.
-        if reduction_only_plan:
+        # either opens a run of its own (for output-only tiles) or stays as an
+        # independent singleton (for any plan containing a reduction-range tile).
+        # A K level is a partial accumulation, so K-only and combined output+K
+        # plans cannot join or root a producer-consumer run.
+        if has_reduction_range:
             hint_ids = list(range(next_hint_id, next_hint_id + len(signature)))
             next_hint_id += len(signature)
             dim_hint_assignments.append((op, _dims_to_hints(op, signature, hint_ids)))

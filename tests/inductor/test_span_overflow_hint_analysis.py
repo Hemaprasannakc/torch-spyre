@@ -58,7 +58,10 @@ from torch_spyre._inductor import config
 from torch_spyre._inductor.constants import BATCH_MATMUL_OP, RESTICKIFY_OP
 from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.propagate_hints import DimHint
-from torch_spyre._inductor.wsr.coarse_tile import coarse_tile_post_stickify
+from torch_spyre._inductor.wsr.coarse_tile import (
+    coarse_tile_post_stickify,
+    plan_coarse_tile_groups,
+)
 from torch_spyre._inductor.wsr.coarse_tile_span_overflow import (
     _SPAN_OVERFLOW_HINT_ID,
     _dims_to_hints,
@@ -74,7 +77,6 @@ from torch_spyre._inductor.wsr.span_overflow_hint_analysis import (
     SpanOverflowTileLevel,
     SpanOverflowTilePlan,
     _bmm_output_symbol_to_dim,
-    _candidate_host_dims,
     _input_read_deps,
     _input_span_infos_controlled_by_output_dims,
     _input_stick_alignment_error,
@@ -1688,7 +1690,7 @@ class TestSpanOverflowGroups(InductorTestCase):
             ):
                 _apply_span_overflow(_graph([producer, reduction]))
 
-    def test_k_tiled_bmm_output_is_not_tracked_as_auto_tiled_producer(self):
+    def test_combined_tiled_bmm_is_an_independent_singleton(self):
         bmm = _reduction_op(
             _E2E_SHAPE,
             name="buf1",
@@ -1714,9 +1716,11 @@ class TestSpanOverflowGroups(InductorTestCase):
                 ).writes,
             )
         )
-
         k_plan = SpanOverflowTilePlan(
-            levels=(SpanOverflowTileLevel(0, 5, is_reduction=True),),
+            levels=(
+                SpanOverflowTileLevel(1, 5),
+                SpanOverflowTileLevel(0, 5, is_reduction=True),
+            ),
             chunking_infos=(
                 ChunkingInfo(
                     total_bytes=1,
@@ -1759,7 +1763,8 @@ class TestSpanOverflowGroups(InductorTestCase):
             groups = _apply_span_overflow(_graph([bmm, consumer]))
 
         self.assertEqual([group[0] for group in groups], [[bmm], [consumer]])
-        self.assertTrue(bmm.dim_hints[0].is_reduction)
+        self.assertFalse(bmm.dim_hints[0].is_reduction)
+        self.assertTrue(bmm.dim_hints[1].is_reduction)
         self.assertFalse(consumer.dim_hints[0].is_reduction)
 
     def test_second_reduction_consumer_of_joined_producer_rejected(self):
@@ -2329,11 +2334,6 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
                 "_remaining_span_candidates_after_tile",
                 return_value=[],
             ),
-            patch(
-                "torch_spyre._inductor.wsr."
-                "span_overflow_hint_analysis."
-                "_search_bmm_k_tile_plan"
-            ) as k_search,
         ):
             plan = plan_span_overflow_tile(
                 op,
@@ -2353,7 +2353,6 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertFalse(level.is_reduction)
 
         # A valid B output tile must be selected before considering K.
-        k_search.assert_not_called()
 
     def test_bmm_input_span_controlled_by_m_dim_plans_output_tile(self):
         op = _reduction_op(
@@ -2405,11 +2404,6 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
                 "_remaining_span_candidates_after_tile",
                 return_value=[],
             ),
-            patch(
-                "torch_spyre._inductor.wsr."
-                "span_overflow_hint_analysis."
-                "_search_bmm_k_tile_plan"
-            ) as k_search,
         ):
             plan = plan_span_overflow_tile(
                 op,
@@ -2429,7 +2423,6 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertFalse(level.is_reduction)
 
         # A valid M output tile must be selected before considering K.
-        k_search.assert_not_called()
 
     def test_bmm_input_span_controlled_by_n_dim_plans_output_tile(self):
         op = _reduction_op(
@@ -2576,38 +2569,6 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ):
                 soha._bmm_k_span_infos(op, max_cores=1, k_split=2)
 
-    def test_bmm_k_fallback_does_not_hide_output_overflow(self):
-        op = _reduction_op(
-            (1, 1, 64), reduction_ranges=(65536,), reduction_type=BATCH_MATMUL_OP
-        )
-        output_candidate = SimpleNamespace(
-            chunking_info=SimpleNamespace(selected_host_dim=2), source="output"
-        )
-        failure = Unsupported("output still overflows")
-
-        with (
-            patch(
-                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._output_span_candidates_from_op",
-                return_value=[output_candidate],
-            ),
-            patch(
-                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._input_span_candidates",
-                return_value=[],
-            ),
-            patch(
-                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._search_min_cost_tile_plan",
-                side_effect=failure,
-            ),
-            patch(
-                "torch_spyre._inductor.wsr.span_overflow_hint_analysis._search_bmm_k_tile_plan",
-                return_value=None,
-            ) as k_search,
-        ):
-            with self.assertRaisesRegex(Unsupported, "output still overflows"):
-                plan_span_overflow_tile(op, max_cores=1)
-
-        k_search.assert_called_once_with(op, 1)
-
     def test_bmm_input_failure_is_not_swallowed_when_k_has_no_plan(self):
         op = _reduction_op(
             (1, 4_194_304, 16),
@@ -2626,7 +2587,6 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
                 soha, "_input_span_candidates", return_value=[input_candidate]
             ),
             patch.object(soha, "_search_min_cost_tile_plan", side_effect=failure),
-            patch.object(soha, "_search_bmm_k_tile_plan", return_value=None),
         ):
             with self.assertRaisesRegex(
                 Unsupported, "M-controlled input still overflows"
@@ -2638,13 +2598,6 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             (1, 4_194_304, 64),
             reduction_ranges=(65536,),
             reduction_type=BATCH_MATMUL_OP,
-        )
-        initial_info = SimpleNamespace(
-            chunking_info=SimpleNamespace(
-                per_core_span=2 * MAX_SPAN_BYTES,
-                reason="BMM K input span overflow for rhs",
-            ),
-            dep_name="rhs",
         )
         remaining_at_2 = SimpleNamespace(source="input:rhs@2")
         remaining_at_4 = SimpleNamespace(source="input:lhs@4")
@@ -2663,7 +2616,6 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             raise AssertionError(f"unexpected k_split={k_split}")
 
         with (
-            patch.object(soha, "_bmm_k_span_infos", return_value=[initial_info]),
             patch.object(soha, "_bmm_k_split_candidates", return_value=[2, 4, 8]),
             patch.object(soha, "_bmm_k_alignment_error", side_effect=alignment_error),
             patch.object(
@@ -2672,11 +2624,25 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
                 side_effect=validate,
             ),
         ):
-            plan = soha._search_bmm_k_tile_plan(op, max_cores=1)
+            plan = soha._search_min_cost_tile_plan(
+                op,
+                1,
+                [
+                    soha.SpanOverflowCandidate(
+                        SimpleNamespace(
+                            selected_host_dim=0,
+                            per_core_span=2 * MAX_SPAN_BYTES,
+                            reason="BMM K input span overflow for rhs",
+                        ),
+                        source="input:rhs",
+                        is_reduction=True,
+                    )
+                ],
+            )
 
         self.assertIsNone(plan)
 
-    def test_bmm_k_fallback_respects_reduction_tiling_kill_switch(self):
+    def test_bmm_k_collection_respects_reduction_tiling_kill_switch(self):
         op = _reduction_op(
             (1, 1, 64),
             reduction_ranges=(65536,),
@@ -2685,12 +2651,15 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         with (
             patch.object(config, "enable_reduction_tiling", False),
+            patch.object(
+                soha, "_input_span_infos_controlled_by_output_dims", return_value=[]
+            ),
             patch.object(soha, "_bmm_k_span_infos") as k_infos,
         ):
-            plan = soha._search_bmm_k_tile_plan(op, max_cores=1)
+            candidates = soha._input_span_candidates(op, max_cores=1)
 
-        self.assertIsNone(plan)
         k_infos.assert_not_called()
+        self.assertEqual(candidates, [])
 
     def test_bmm_k_alignment_failure_returns_none(self):
         op = _reduction_op(
@@ -2698,16 +2667,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             reduction_ranges=(65536,),
             reduction_type=BATCH_MATMUL_OP,
         )
-        initial_info = SimpleNamespace(
-            chunking_info=SimpleNamespace(
-                per_core_span=2 * MAX_SPAN_BYTES,
-                reason="BMM K input span overflow for rhs",
-            ),
-            dep_name="rhs",
-        )
-
         with (
-            patch.object(soha, "_bmm_k_span_infos", return_value=[initial_info]),
             patch.object(soha, "_bmm_k_split_candidates", return_value=[2]),
             patch.object(
                 soha,
@@ -2715,7 +2675,21 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
                 return_value="input dependency rhs host dim 0 cuts a stick",
             ),
         ):
-            plan = soha._search_bmm_k_tile_plan(op, max_cores=1)
+            plan = soha._search_min_cost_tile_plan(
+                op,
+                1,
+                [
+                    soha.SpanOverflowCandidate(
+                        SimpleNamespace(
+                            selected_host_dim=0,
+                            per_core_span=2 * MAX_SPAN_BYTES,
+                            reason="BMM K input span overflow for rhs",
+                        ),
+                        source="input:rhs",
+                        is_reduction=True,
+                    )
+                ],
+            )
 
         self.assertIsNone(plan)
 
@@ -2743,7 +2717,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
         self.assertIsNone(error)
 
-    def test_bmm_k_fallback_tried_when_output_plan_leaves_k_span(self):
+    def test_bmm_uses_single_unified_search_result(self):
         op = _reduction_op(
             (1, 4_194_304, 64),
             reduction_ranges=(65536,),
@@ -2754,31 +2728,17 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             chunking_infos=(),
             reason="M input span overflow",
         )
-        k_plan = SpanOverflowTilePlan(
-            levels=(SpanOverflowTileLevel(0, 4, is_reduction=True),),
-            chunking_infos=(),
-            reason="BMM K input span overflow",
-        )
-        remaining_k = SimpleNamespace(dep_name="rhs")
 
         with (
             patch.object(soha, "_output_span_candidates_from_op", return_value=[]),
             patch.object(soha, "_input_span_candidates", return_value=[]),
             patch.object(soha, "_search_min_cost_tile_plan", return_value=output_plan),
-            patch.object(
-                soha, "_bmm_k_span_infos", return_value=[remaining_k]
-            ) as k_infos,
-            patch.object(
-                soha, "_search_bmm_k_tile_plan", return_value=k_plan
-            ) as k_search,
         ):
             plan = plan_span_overflow_tile(op, max_cores=1)
 
-        self.assertIs(plan, k_plan)
-        k_infos.assert_called_once_with(op, 1, split_by_host_dim={1: 2})
-        k_search.assert_called_once_with(op, 1)
+        self.assertIs(plan, output_plan)
 
-    def test_bmm_k_kill_switch_preserves_output_plan(self):
+    def test_bmm_kill_switch_preserves_output_plan(self):
         op = _reduction_op(
             (1, 4_194_304, 64),
             reduction_ranges=(65536,),
@@ -2789,54 +2749,15 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             chunking_infos=(),
             reason="M input span overflow",
         )
-        remaining_k = SimpleNamespace(dep_name="rhs")
-
         with (
             patch.object(config, "enable_reduction_tiling", False),
             patch.object(soha, "_output_span_candidates_from_op", return_value=[]),
             patch.object(soha, "_input_span_candidates", return_value=[]),
             patch.object(soha, "_search_min_cost_tile_plan", return_value=output_plan),
-            patch.object(soha, "_bmm_k_span_infos", return_value=[remaining_k]),
-            patch.object(soha, "_search_bmm_k_tile_plan") as k_search,
         ):
             plan = plan_span_overflow_tile(op, max_cores=1)
 
         self.assertIs(plan, output_plan)
-        k_search.assert_not_called()
-
-    def test_bmm_output_plan_rejected_when_k_span_remains_and_k_fails(self):
-        op = _reduction_op(
-            (1, 4_194_304, 64),
-            reduction_ranges=(65536,),
-            reduction_type=BATCH_MATMUL_OP,
-        )
-        output_plan = SpanOverflowTilePlan(
-            levels=(SpanOverflowTileLevel(1, 2),),
-            chunking_infos=(),
-            reason="M input span overflow",
-        )
-        remaining_k = SimpleNamespace(dep_name="rhs")
-
-        with (
-            patch.object(soha, "_output_span_candidates_from_op", return_value=[]),
-            patch.object(soha, "_input_span_candidates", return_value=[]),
-            patch.object(soha, "_search_min_cost_tile_plan", return_value=output_plan),
-            patch.object(
-                soha, "_bmm_k_span_infos", return_value=[remaining_k]
-            ) as k_infos,
-            patch.object(
-                soha,
-                "_search_bmm_k_tile_plan",
-                side_effect=Unsupported("K-only candidates did not clear every span"),
-            ) as k_search,
-        ):
-            with self.assertRaisesRegex(
-                Unsupported, "combined output-range and reduction-range"
-            ):
-                plan_span_overflow_tile(op, max_cores=1)
-
-        k_infos.assert_called_once_with(op, 1, split_by_host_dim={1: 2})
-        k_search.assert_called_once_with(op, 1)
 
     def test_k_validation_keeps_unsplittable_output_controlled_span(self):
         op = _reduction_op(
@@ -3023,6 +2944,66 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertEqual(plan.levels[0].selected_host_dim, 1)
         self.assertEqual(plan.levels[0].split_count, 4)
 
+    def test_bmm_combined_output_and_k_plan_uses_common_search(self):
+        op = _reduction_op(
+            (1, 64, 64), reduction_ranges=(64,), reduction_type=BATCH_MATMUL_OP
+        )
+        output = soha.SpanOverflowCandidate(
+            ChunkingInfo(
+                total_bytes=1,
+                per_core_span=2 * MAX_SPAN_BYTES,
+                core_split_estimate=1,
+                selected_device_dim_size=64,
+                selected_device_span_stride_elems=64,
+                selected_host_dim=1,
+                stick_elems=64,
+                reason="M span overflow",
+            ),
+            source="input:lhs",
+        )
+        reduction = soha.SpanOverflowCandidate(
+            ChunkingInfo(
+                total_bytes=1,
+                per_core_span=4 * MAX_SPAN_BYTES,
+                core_split_estimate=1,
+                selected_device_dim_size=64,
+                selected_device_span_stride_elems=64,
+                selected_host_dim=0,
+                stick_elems=64,
+                reason="K span overflow",
+            ),
+            source="input:rhs",
+            is_reduction=True,
+        )
+
+        def splits(_op, axis, _required):
+            return [1, 4] if axis[1] else [1, 2]
+
+        def remaining(_op, _max_cores, output_splits, *, k_split=None):
+            if output_splits == {1: 2} and k_split == 4:
+                return []
+            return [output]
+
+        with (
+            patch.object(soha, "_split_candidates_for_axis", side_effect=splits),
+            patch.object(
+                soha, "_combined_tile_stick_alignment_error", return_value=None
+            ),
+            patch.object(
+                soha, "_remaining_span_candidates_after_tile", side_effect=remaining
+            ),
+        ):
+            plan = soha._search_min_cost_tile_plan(op, 1, [output, reduction])
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(
+            plan.levels,
+            (
+                SpanOverflowTileLevel(1, 2),
+                SpanOverflowTileLevel(0, 4, is_reduction=True),
+            ),
+        )
+
     def test_bmm_k_split_candidates_try_small_divisors_below_linear_estimate(self):
         op = _reduction_op(
             (1, 1, 64),
@@ -3057,7 +3038,6 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         with (
             patch.object(soha, "_output_span_candidates_from_op", return_value=[]),
             patch.object(soha, "_input_span_candidates", return_value=[]),
-            patch.object(soha, "_search_bmm_k_tile_plan", return_value=None),
         ):
             self.assertIsNone(plan_span_overflow_tile(op, max_cores=1))
 
@@ -3521,7 +3501,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertIn("interleaved_rhs", error)
         self.assertIn("host dim 1", error)
 
-    def test_candidate_host_dims_orders_by_decreasing_span_pressure(self):
+    def test_candidate_axes_orders_by_decreasing_span_pressure(self):
         candidates = [
             SimpleNamespace(
                 chunking_info=SimpleNamespace(selected_host_dim=1, per_core_span=512)
@@ -3534,7 +3514,10 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             ),
         ]
 
-        self.assertEqual(_candidate_host_dims(candidates), [0, 2, 1])
+        self.assertEqual(
+            soha._candidate_axes(candidates),
+            [(0, False), (2, False), (1, False)],
+        )
 
     @patch(
         "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
@@ -3588,6 +3571,85 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertEqual(op.loop_info.loop_count, [sympy.Integer(_E2E_SPLIT_COUNT)])
         self.assertEqual(op.loop_info.loop_tiled_dims, [[1]])
         self.assertEqual(op.loop_info.loop_tiled_reduction_dims, [[]])
+
+    def test_combined_plan_reaches_coarse_tile_planner(self):
+        bmm = _reduction_op(
+            (1, 20, 16, 64),
+            reduction_ranges=(256,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+        combined_plan = SpanOverflowTilePlan(
+            levels=(
+                SpanOverflowTileLevel(1, 5),
+                SpanOverflowTileLevel(0, 4, is_reduction=True),
+            ),
+            chunking_infos=(
+                ChunkingInfo(
+                    total_bytes=2 * MAX_SPAN_BYTES,
+                    per_core_span=2 * MAX_SPAN_BYTES,
+                    core_split_estimate=1,
+                    selected_device_dim_size=20,
+                    selected_device_span_stride_elems=1024,
+                    selected_host_dim=1,
+                    stick_elems=64,
+                    reason="combined M and K span overflow",
+                ),
+            ),
+            reason="combined M and K span overflow",
+        )
+        graph = _graph([bmm])
+
+        with (
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow."
+                "plan_span_overflow_tile",
+                return_value=combined_plan,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow.op_out_coords",
+                _out_coords_for_bhld,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile.op_out_coords",
+                _out_coords_for_bhld,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow._bmm_k_symbol",
+                return_value=sympy.Symbol("k"),
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile_span_overflow."
+                "_loop_var_to_reduction_ranges_pos",
+                return_value=0,
+            ),
+            patch(
+                "torch_spyre._inductor.wsr.coarse_tile."
+                "_loop_var_to_reduction_ranges_pos",
+                return_value=0,
+            ),
+            config.patch(
+                {
+                    "sencores": 8,
+                    "ignore_span_overflow_hints": False,
+                    "enable_reduction_tiling": True,
+                }
+            ),
+        ):
+            groups = _apply_span_overflow(graph)
+            coarse_plan = plan_coarse_tile_groups(graph.operations, groups)
+
+        self.assertEqual(groups[0][0], [bmm])
+        self.assertEqual(
+            [count for _hint_id, count in groups[0][1]],
+            [sympy.Integer(5), sympy.Integer(4)],
+        )
+        self.assertEqual([hint.is_reduction for hint in bmm.dim_hints], [False, True])
+        info = coarse_plan[id(bmm)]
+        self.assertEqual(info.loop_count, [sympy.Integer(5), sympy.Integer(4)])
+        self.assertEqual(info.loop_tiled_dims, [[1], []])
+        self.assertEqual(info.loop_tiled_reduction_dims, [[], [0]])
+        self.assertEqual(list(bmm.data.ranges), [1, 20, 16, 64])
+        self.assertEqual(list(bmm.data.reduction_ranges), [256])
 
 
 class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
