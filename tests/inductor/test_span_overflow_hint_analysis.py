@@ -38,7 +38,7 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 from torch_spyre._inductor.work_division import MAX_SPAN_BYTES
 
 import sympy
@@ -2661,6 +2661,78 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         k_infos.assert_not_called()
         self.assertEqual(candidates, [])
 
+    def test_bmm_input_candidates_collect_output_and_k_axes(self):
+        op = _reduction_op(
+            (1, 64, 64), reduction_ranges=(512,), reduction_type=BATCH_MATMUL_OP
+        )
+        output_info = SimpleNamespace(
+            chunking_info=SimpleNamespace(
+                selected_host_dim=1,
+                per_core_span=2 * MAX_SPAN_BYTES,
+            ),
+            dep_name="lhs",
+        )
+        k_info = SimpleNamespace(
+            chunking_info=SimpleNamespace(
+                selected_host_dim=0,
+                per_core_span=4 * MAX_SPAN_BYTES,
+            ),
+            dep_name="rhs",
+        )
+
+        with (
+            patch.object(config, "enable_reduction_tiling", True),
+            patch.object(
+                soha,
+                "_input_span_infos_controlled_by_output_dims",
+                return_value=[output_info],
+            ),
+            patch.object(soha, "_bmm_k_span_infos", return_value=[k_info]),
+            patch.object(
+                soha, "_host_dim_has_legal_nontrivial_split", return_value=True
+            ),
+        ):
+            candidates = soha._input_span_candidates(op, max_cores=1)
+
+        self.assertEqual(
+            [candidate.source for candidate in candidates],
+            ["input:lhs", "input:rhs"],
+        )
+        self.assertEqual(
+            [candidate.is_reduction for candidate in candidates], [False, True]
+        )
+
+    def test_bmm_kill_switch_keeps_output_input_candidate(self):
+        op = _reduction_op(
+            (1, 64, 64), reduction_ranges=(512,), reduction_type=BATCH_MATMUL_OP
+        )
+        output_info = SimpleNamespace(
+            chunking_info=SimpleNamespace(
+                selected_host_dim=1,
+                per_core_span=2 * MAX_SPAN_BYTES,
+            ),
+            dep_name="lhs",
+        )
+
+        with (
+            patch.object(config, "enable_reduction_tiling", False),
+            patch.object(
+                soha,
+                "_input_span_infos_controlled_by_output_dims",
+                return_value=[output_info],
+            ),
+            patch.object(soha, "_bmm_k_span_infos") as k_infos,
+            patch.object(
+                soha, "_host_dim_has_legal_nontrivial_split", return_value=True
+            ),
+        ):
+            candidates = soha._input_span_candidates(op, max_cores=1)
+
+        k_infos.assert_not_called()
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].source, "input:lhs")
+        self.assertFalse(candidates[0].is_reduction)
+
     def test_bmm_k_alignment_failure_returns_none(self):
         op = _reduction_op(
             (1, 1, 64),
@@ -2692,6 +2764,85 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             )
 
         self.assertIsNone(plan)
+
+    def test_bmm_k_only_plan_uses_common_search(self):
+        op = _reduction_op(
+            (1, 64, 64), reduction_ranges=(512,), reduction_type=BATCH_MATMUL_OP
+        )
+        candidate = soha.SpanOverflowCandidate(
+            SimpleNamespace(
+                selected_host_dim=0,
+                per_core_span=4 * MAX_SPAN_BYTES,
+                reason="BMM K input span overflow for rhs",
+            ),
+            source="input:rhs",
+            is_reduction=True,
+        )
+
+        with (
+            patch.object(soha, "_bmm_k_split_candidates", return_value=[2, 4]),
+            patch.object(soha, "_bmm_k_alignment_error", return_value=None),
+            patch.object(
+                soha,
+                "_remaining_span_candidates_after_tile",
+                side_effect=lambda _op, _cores, output, *, k_split=None: (
+                    [] if output == {} and k_split == 4 else [candidate]
+                ),
+            ),
+        ):
+            plan = soha._search_min_cost_tile_plan(op, 1, [candidate])
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.levels, (SpanOverflowTileLevel(0, 4, is_reduction=True),))
+
+    def test_bmm_combined_plan_rejects_k_alignment_before_span_validation(self):
+        op = _reduction_op(
+            (1, 64, 64), reduction_ranges=(512,), reduction_type=BATCH_MATMUL_OP
+        )
+        output = soha.SpanOverflowCandidate(
+            SimpleNamespace(
+                selected_host_dim=1,
+                per_core_span=2 * MAX_SPAN_BYTES,
+                reason="M span overflow",
+            ),
+            source="input:lhs",
+        )
+        reduction = soha.SpanOverflowCandidate(
+            SimpleNamespace(
+                selected_host_dim=0,
+                per_core_span=2 * MAX_SPAN_BYTES,
+                reason="K span overflow",
+            ),
+            source="input:rhs",
+            is_reduction=True,
+        )
+
+        def alignment_error(_op, _layout, output_splits, reduction_splits):
+            if output_splits and reduction_splits:
+                return "K tile cuts a stick"
+            return None
+
+        with (
+            patch.object(
+                soha,
+                "_split_candidates_for_axis",
+                side_effect=lambda _op, _axis, _required: [1, 2],
+            ),
+            patch.object(
+                soha,
+                "_combined_tile_stick_alignment_error",
+                side_effect=alignment_error,
+            ),
+            patch.object(
+                soha,
+                "_remaining_span_candidates_after_tile",
+                return_value=[output, reduction],
+            ) as validate,
+        ):
+            with self.assertRaisesRegex(Unsupported, "K tile cuts a stick"):
+                soha._search_min_cost_tile_plan(op, 1, [output, reduction])
+
+        self.assertNotIn(call(op, 1, {1: 2}, k_split=2), validate.call_args_list)
 
     def test_bmm_k_alignment_skips_unrelated_nonstatic_input(self):
         op = _reduction_op(
@@ -3003,6 +3154,162 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
                 SpanOverflowTileLevel(0, 4, is_reduction=True),
             ),
         )
+
+    def test_bmm_combined_n_and_k_plan_uses_common_search(self):
+        op = _reduction_op(
+            (1, 64, 128), reduction_ranges=(512,), reduction_type=BATCH_MATMUL_OP
+        )
+        output = soha.SpanOverflowCandidate(
+            SimpleNamespace(
+                selected_host_dim=2,
+                per_core_span=2 * MAX_SPAN_BYTES,
+                reason="N span overflow",
+            ),
+            source="input:rhs",
+        )
+        reduction = soha.SpanOverflowCandidate(
+            SimpleNamespace(
+                selected_host_dim=0,
+                per_core_span=4 * MAX_SPAN_BYTES,
+                reason="K span overflow",
+            ),
+            source="input:lhs",
+            is_reduction=True,
+        )
+
+        def splits(_op, axis, _required):
+            return [1, 4] if axis[1] else [1, 2]
+
+        def remaining(_op, _max_cores, output_splits, *, k_split=None):
+            if output_splits == {2: 2} and k_split == 4:
+                return []
+            return [output]
+
+        with (
+            patch.object(soha, "_split_candidates_for_axis", side_effect=splits),
+            patch.object(
+                soha, "_combined_tile_stick_alignment_error", return_value=None
+            ),
+            patch.object(
+                soha, "_remaining_span_candidates_after_tile", side_effect=remaining
+            ),
+        ):
+            plan = soha._search_min_cost_tile_plan(op, 1, [output, reduction])
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(
+            plan.levels,
+            (
+                SpanOverflowTileLevel(2, 2),
+                SpanOverflowTileLevel(0, 4, is_reduction=True),
+            ),
+        )
+
+    def test_bmm_combined_two_output_axes_and_k_plan(self):
+        op = _reduction_op(
+            (4, 64, 128), reduction_ranges=(512,), reduction_type=BATCH_MATMUL_OP
+        )
+        candidates = [
+            soha.SpanOverflowCandidate(
+                SimpleNamespace(
+                    selected_host_dim=0,
+                    per_core_span=2 * MAX_SPAN_BYTES,
+                    reason="B span overflow",
+                ),
+                source="input:lhs",
+            ),
+            soha.SpanOverflowCandidate(
+                SimpleNamespace(
+                    selected_host_dim=1,
+                    per_core_span=2 * MAX_SPAN_BYTES,
+                    reason="M span overflow",
+                ),
+                source="input:lhs",
+            ),
+            soha.SpanOverflowCandidate(
+                SimpleNamespace(
+                    selected_host_dim=0,
+                    per_core_span=2 * MAX_SPAN_BYTES,
+                    reason="K span overflow",
+                ),
+                source="input:rhs",
+                is_reduction=True,
+            ),
+        ]
+
+        def remaining(_op, _max_cores, output_splits, *, k_split=None):
+            if output_splits == {0: 2, 1: 2} and k_split == 2:
+                return []
+            return candidates
+
+        with (
+            patch.object(
+                soha,
+                "_split_candidates_for_axis",
+                side_effect=lambda _op, _axis, _required: [1, 2],
+            ),
+            patch.object(
+                soha, "_combined_tile_stick_alignment_error", return_value=None
+            ),
+            patch.object(
+                soha, "_remaining_span_candidates_after_tile", side_effect=remaining
+            ),
+        ):
+            plan = soha._search_min_cost_tile_plan(op, 1, candidates)
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(
+            plan.levels,
+            (
+                SpanOverflowTileLevel(0, 2),
+                SpanOverflowTileLevel(1, 2),
+                SpanOverflowTileLevel(0, 2, is_reduction=True),
+            ),
+        )
+
+    def test_bmm_combined_search_tries_next_divisible_k_split(self):
+        op = _reduction_op(
+            (1, 64, 64), reduction_ranges=(96,), reduction_type=BATCH_MATMUL_OP
+        )
+        output = soha.SpanOverflowCandidate(
+            SimpleNamespace(
+                selected_host_dim=1,
+                per_core_span=2 * MAX_SPAN_BYTES,
+                reason="M span overflow",
+            ),
+            source="input:lhs",
+        )
+        reduction = soha.SpanOverflowCandidate(
+            SimpleNamespace(
+                selected_host_dim=0,
+                per_core_span=5 * MAX_SPAN_BYTES,
+                reason="K span overflow",
+            ),
+            source="input:rhs",
+            is_reduction=True,
+        )
+
+        def remaining(_op, _max_cores, output_splits, *, k_split=None):
+            if output_splits == {1: 2} and k_split == 6:
+                return []
+            return [reduction]
+
+        with (
+            patch.object(
+                soha,
+                "_split_candidates_for_host_dim",
+                return_value=[1, 2],
+            ),
+            patch.object(soha, "_bmm_k_alignment_error", return_value=None),
+            patch.object(
+                soha, "_remaining_span_candidates_after_tile", side_effect=remaining
+            ),
+        ):
+            plan = soha._search_min_cost_tile_plan(op, 1, [output, reduction])
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.levels[-1].split_count, 6)
+        self.assertTrue(plan.levels[-1].is_reduction)
 
     def test_bmm_k_split_candidates_try_small_divisors_below_linear_estimate(self):
         op = _reduction_op(

@@ -6893,6 +6893,103 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
             fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
         )
 
+    def test_nested_bmm_outer_M_inner_K_correct(self):
+        """bmm [B,M,K]@[B,K,N] outer M (output) + inner K — correct."""
+        from torch_spyre._inductor import spyre_hint
+
+        B, M, K, N = 2, 128, 512, 32
+        a = torch.randn(B, M, K, dtype=torch.float16) * 0.01
+        b = torch.randn(B, K, N, dtype=torch.float16) * 0.01
+        _declare_tensor_dim("B", B)
+        _declare_tensor_dim("M", M)
+        _declare_tensor_dim("K", K)
+        _declare_tensor_dim("N", N)
+
+        def fn(a, b):
+            _name_tensor_dims(a, ["B", "M", "K"])
+            _name_tensor_dims(b, ["B", "K", "N"])
+            with spyre_hint(num_tiles_per_dim={"M": 2}):
+                with spyre_hint(num_tiles_per_dim={"K": 4}):
+                    return torch.bmm(a, b)
+
+        compare_with_cpu(
+            fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
+        )
+
+    @config.patch(
+        {
+            "sencores": 4,
+            "lx_planning": True,
+            "allow_all_ops_in_lx_planning": True,
+            "ignore_span_overflow_hints": False,
+            "enable_reduction_tiling": True,
+        }
+    )
+    def test_auto_span_overflow_bmm_combined_correct(self):
+        """Automatic span planning selects output+K tiling without spyre_hint."""
+        B, M, K, N = 1, 128, 512, 32
+        a = torch.randn(B, M, K, dtype=torch.float16) * 0.01
+        b = torch.randn(B, K, N, dtype=torch.float16) * 0.01
+
+        def fn(a, b):
+            return torch.bmm(a, b)
+
+        with mock_patch(
+            "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+            16 * 1024,
+        ):
+            compare_with_cpu(
+                fn, a, b, run_compile=True, run_eager=False, atol=0.05, rtol=0.05
+            )
+
+    def _auto_span_overflow_bmm_source(self, *, enable_reduction_tiling):
+        B, M, K, N = 1, 128, 512, 32
+        a = torch.randn(B, M, K, dtype=torch.float16).to("spyre")
+        b = torch.randn(B, K, N, dtype=torch.float16).to("spyre")
+
+        def fn(a, b):
+            return torch.bmm(a, b)
+
+        with (
+            config.patch(
+                {
+                    "sencores": 4,
+                    "lx_planning": True,
+                    "allow_all_ops_in_lx_planning": True,
+                    "ignore_span_overflow_hints": False,
+                    "enable_reduction_tiling": enable_reduction_tiling,
+                }
+            ),
+            mock_patch(
+                "torch_spyre._inductor.wsr.span_overflow_hint_analysis.MAX_SPAN_BYTES",
+                16 * 1024,
+            ),
+            mock_patch(_LAUNCH_JOBPLAN),
+            mock_patch(_PREPARE_KERNEL),
+            mock_patch("subprocess.run"),
+        ):
+            _, source_codes = run_and_get_code(torch.compile(fn), a, b)
+
+        self.assertTrue(source_codes)
+        return source_codes[0]
+
+    def test_auto_span_overflow_bmm_combined_loopspec(self):
+        """Automatic M+K planning emits the expected nested loop counts."""
+        src = self._auto_span_overflow_bmm_source(enable_reduction_tiling=True)
+
+        self.assertEqual(src.count("LoopSpec("), 2)
+        self.assertIn("count=sympify('8')", src)
+        self.assertIn("count=sympify('2')", src)
+        self.assertIn("coarse_tile_reduce_copy", src)
+
+    def test_auto_span_overflow_bmm_kill_switch_keeps_output_loop(self):
+        """Disabling reduction tiling keeps M tiling and removes the K loop."""
+        src = self._auto_span_overflow_bmm_source(enable_reduction_tiling=False)
+
+        self.assertEqual(src.count("LoopSpec("), 1)
+        self.assertIn("count=sympify('8')", src)
+        self.assertNotIn("coarse_tile_reduce_copy", src)
+
     def test_nested_matmul_outer_M_inner_K_correct(self):
         """mm [M,K]@[K,N] with outer M (output) + inner K (reduction) — correct."""
         from torch_spyre._inductor import spyre_hint
