@@ -783,6 +783,7 @@ def span_overflow_groups(
                 )
             ]
             groups.append(([op], levels))
+            auto_tiled_producers.add(op.get_name())
             logger.debug(
                 "[span-overflow groups] created group_index=%d op=%s levels=%s",
                 len(groups) - 1,

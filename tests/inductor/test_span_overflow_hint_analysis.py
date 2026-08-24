@@ -1690,7 +1690,7 @@ class TestSpanOverflowGroups(InductorTestCase):
             ):
                 _apply_span_overflow(_graph([producer, reduction]))
 
-    def test_combined_tiled_bmm_is_an_independent_singleton(self):
+    def test_combined_tiled_bmm_rejects_independently_tiled_consumer(self):
         bmm = _reduction_op(
             _E2E_SHAPE,
             name="buf1",
@@ -1760,12 +1760,11 @@ class TestSpanOverflowGroups(InductorTestCase):
             ),
             config.patch({"sencores": 8, "ignore_span_overflow_hints": False}),
         ):
-            groups = _apply_span_overflow(_graph([bmm, consumer]))
-
-        self.assertEqual([group[0] for group in groups], [[bmm], [consumer]])
-        self.assertFalse(bmm.dim_hints[0].is_reduction)
-        self.assertTrue(bmm.dim_hints[1].is_reduction)
-        self.assertFalse(consumer.dim_hints[0].is_reduction)
+            with self.assertRaisesRegex(
+                Unsupported,
+                "already-tiled producer.*not in an open group this op can join",
+            ):
+                _apply_span_overflow(_graph([bmm, consumer]))
 
     def test_second_reduction_consumer_of_joined_producer_rejected(self):
         """One auto-tiled producer feeds at most one reduction consumer.
@@ -2578,6 +2577,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         input_candidate = SimpleNamespace(
             chunking_info=SimpleNamespace(selected_host_dim=1),
             source="input:lhs",
+            is_reduction=False,
         )
         failure = Unsupported("M-controlled input still overflows")
 
@@ -2711,6 +2711,41 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertEqual(
             [candidate.is_reduction for candidate in candidates], [False, True]
         )
+
+    def test_bmm_unsplittable_k_candidate_does_not_block_output_plan(self):
+        op = _reduction_op(
+            (1, 64, 64), reduction_ranges=(257,), reduction_type=BATCH_MATMUL_OP
+        )
+        output_info = SimpleNamespace(
+            chunking_info=SimpleNamespace(
+                selected_host_dim=1,
+                per_core_span=2 * MAX_SPAN_BYTES,
+            ),
+            dep_name="lhs",
+        )
+        k_info = SimpleNamespace(
+            chunking_info=SimpleNamespace(
+                selected_host_dim=0,
+                per_core_span=2 * MAX_SPAN_BYTES,
+            ),
+            dep_name="rhs",
+        )
+
+        with (
+            patch.object(
+                soha,
+                "_input_span_infos_controlled_by_output_dims",
+                return_value=[output_info],
+            ),
+            patch.object(soha, "_bmm_k_span_infos", return_value=[k_info]),
+            patch.object(
+                soha, "_host_dim_has_legal_nontrivial_split", return_value=True
+            ),
+        ):
+            candidates = soha._input_span_candidates(op, max_cores=1)
+
+        self.assertEqual([candidate.source for candidate in candidates], ["input:lhs"])
+        self.assertFalse(candidates[0].is_reduction)
 
     def test_bmm_kill_switch_keeps_output_input_candidate(self):
         op = _reduction_op(
@@ -4417,6 +4452,54 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
             )
         )
         self.assertEqual(second_kwargs, {"ignore_reduction_spans": True})
+
+    def test_bmm_axis_limit_retries_strict_output_only_by_default(self):
+        op = _reduction_op(
+            (2, 16, 64),
+            reduction_ranges=(65536,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+        output_candidate = soha.SpanOverflowCandidate(
+            SimpleNamespace(selected_host_dim=1),
+            source="M",
+        )
+        reduction_candidate = soha.SpanOverflowCandidate(
+            SimpleNamespace(selected_host_dim=0),
+            source="K",
+            is_reduction=True,
+        )
+        candidates = [output_candidate, reduction_candidate]
+        output_only_plan = SpanOverflowTilePlan(
+            levels=(SpanOverflowTileLevel(1, 2),),
+            chunking_infos=(),
+            reason="output span overflow",
+        )
+
+        with (
+            patch.object(
+                soha, "_output_span_candidates_from_op", return_value=[output_candidate]
+            ),
+            patch.object(
+                soha, "_input_span_candidates", return_value=[reduction_candidate]
+            ),
+            patch.object(
+                soha,
+                "_search_min_cost_tile_plan",
+                side_effect=Unsupported("four axes"),
+            ),
+            patch.object(
+                soha,
+                "_search_output_only_tile_plan",
+                return_value=output_only_plan,
+            ) as output_only_search,
+            config.patch({"enable_reduction_tiling": True}),
+        ):
+            plan = plan_span_overflow_tile(op, max_cores=1)
+
+        self.assertIs(plan, output_only_plan)
+        output_only_search.assert_called_once_with(
+            op, 1, candidates, ignore_reduction_spans=False
+        )
 
     def test_missing_output_write_dep_skips_auto_tiling(self):
         op = _pointwise_op((1, 8195, 256, 64))

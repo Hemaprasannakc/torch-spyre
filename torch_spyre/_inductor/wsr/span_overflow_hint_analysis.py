@@ -1126,18 +1126,26 @@ def _input_span_candidates(
             SpanOverflowCandidate(info.chunking_info, source=f"input:{info.dep_name}")
         )
     if _is_batch_matmul_reduction(op):
-        candidates.extend(
-            SpanOverflowCandidate(
-                info.chunking_info,
-                source=f"input:{info.dep_name}",
-                is_reduction=True,
-            )
-            for info in _bmm_k_span_infos(
-                op,
-                max_cores,
-                split_by_host_dim=split_by_host_dim,
-            )
+        k_infos = _bmm_k_span_infos(
+            op,
+            max_cores,
+            split_by_host_dim=split_by_host_dim,
         )
+        if _bmm_k_split_candidates(op, required_split=1):
+            candidates.extend(
+                SpanOverflowCandidate(
+                    info.chunking_info,
+                    source=f"input:{info.dep_name}",
+                    is_reduction=True,
+                )
+                for info in k_infos
+            )
+        elif k_infos:
+            logger.debug(
+                "span_overflow_input: op=%s BMM K has no legal nontrivial "
+                "coarse split; skipping reduction candidates",
+                op.get_name(),
+            )
     return candidates
 
 
@@ -1709,8 +1717,10 @@ def _search_output_only_tile_plan(
     op: ComputedBuffer,
     max_cores: int,
     candidates: list[SpanOverflowCandidate],
+    *,
+    ignore_reduction_spans: bool = True,
 ) -> SpanOverflowTilePlan | None:
-    """Retry span planning without reduction axes or reduction-span validation."""
+    """Retry span planning without reduction axes."""
     output_candidates = [
         candidate for candidate in candidates if not candidate.is_reduction
     ]
@@ -1720,7 +1730,7 @@ def _search_output_only_tile_plan(
         op,
         max_cores,
         output_candidates,
-        ignore_reduction_spans=True,
+        ignore_reduction_spans=ignore_reduction_spans,
     )
 
 
@@ -1903,11 +1913,12 @@ def plan_span_overflow_tile(
         try:
             plan = _search_min_cost_tile_plan(op, max_cores, candidates)
         except Unsupported:
-            if not config.enable_reduction_tiling and any(
-                candidate.is_reduction for candidate in candidates
-            ):
+            if any(candidate.is_reduction for candidate in candidates):
                 output_only_plan = _search_output_only_tile_plan(
-                    op, max_cores, candidates
+                    op,
+                    max_cores,
+                    candidates,
+                    ignore_reduction_spans=not config.enable_reduction_tiling,
                 )
                 if output_only_plan is not None:
                     return output_only_plan
