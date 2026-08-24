@@ -1140,6 +1140,12 @@ def _input_span_candidates(
         )
     return candidates
 
+def _candidate_axis(candidate: SpanOverflowCandidate) -> tuple[int, bool]:
+    """Return the output or reduction axis represented by ``candidate``."""
+    return (
+        candidate.chunking_info.selected_host_dim,
+        candidate.is_reduction,
+    )
 
 def _candidate_axes(
     candidates: list[SpanOverflowCandidate],
@@ -1148,10 +1154,7 @@ def _candidate_axes(
     max_span_by_axis: dict[tuple[int, bool], int] = {}
     first_seen: dict[tuple[int, bool], int] = {}
     for idx, candidate in enumerate(candidates):
-        axis = (
-            getattr(candidate.chunking_info, "selected_host_dim", 0),
-            getattr(candidate, "is_reduction", False),
-        )
+        axis = _candidate_axis(candidate)
         first_seen.setdefault(axis, idx)
         max_span_by_axis[axis] = max(
             max_span_by_axis.get(axis, 0), candidate.chunking_info.per_core_span
@@ -1191,10 +1194,7 @@ def _required_split_counts_by_axis(
     """Return the strongest required split for each output/reduction axis."""
     required_by_axis: dict[tuple[int, bool], int] = {}
     for candidate in candidates:
-        axis = (
-            getattr(candidate.chunking_info, "selected_host_dim", 0),
-            getattr(candidate, "is_reduction", False),
-        )
+        axis = _candidate_axis(candidate)
         required_by_axis[axis] = max(
             required_by_axis.get(axis, 1),
             _candidate_required_split_count(candidate),
@@ -1560,8 +1560,8 @@ def _search_min_cost_tile_plan(
         [
             {
                 "source": candidate.source,
-                "host_dim": getattr(candidate.chunking_info, "selected_host_dim", 0),
-                "is_reduction": getattr(candidate, "is_reduction", False),
+                "host_dim": _candidate_axis(candidate)[0],
+                "is_reduction": _candidate_axis(candidate)[1],
                 "span_mb": candidate.chunking_info.per_core_span / (1024**2),
                 "reason": candidate.chunking_info.reason,
             }
@@ -1702,6 +1702,23 @@ def _search_min_cost_tile_plan(
         f"after trying at most {_MAX_TILE_COMBOS} combinations."
     )
 
+def _search_output_only_tile_plan(
+    op: ComputedBuffer,
+    max_cores: int,
+    candidates: list[SpanOverflowCandidate],
+) -> SpanOverflowTilePlan | None:
+    """Retry span planning without reduction axes or reduction-span validation."""
+    output_candidates = [
+        candidate for candidate in candidates if not candidate.is_reduction
+    ]
+    if not output_candidates:
+        return None
+    return _search_min_cost_tile_plan(
+        op,
+        max_cores,
+        output_candidates,
+        ignore_reduction_spans=True,
+    )
 
 def _has_indirect_reads(op: ComputedBuffer) -> bool:
     """Return True if the op uses indirect/gather-style input reads.
@@ -1787,9 +1804,10 @@ def plan_span_overflow_tile(
     indirect-access ops because those are handled outside this automatic
     span-overflow coarse-tiling path.
 
-    The returned plan contains one or more output- or reduction-range tile levels plus the
-    physical span facts that caused them.  ``None`` means this op either is not
-    eligible for this pass or has no output/input span that needs coarse tiling.
+    The returned plan contains one or more output- or reduction-range tile levels
+    plus the physical span facts that caused them.  ``None`` means this op either
+    is not eligible for this pass or has no output/input span that needs coarse
+    tiling.
 
     ``max_cores`` is threaded through this function and everything it calls,
     but it has no effect on the emitted split today: every candidate's
@@ -1878,7 +1896,18 @@ def plan_span_overflow_tile(
             len(output_candidates),
             len(input_candidates),
         )
-        plan = _search_min_cost_tile_plan(op, max_cores, candidates)
+        try:
+            plan = _search_min_cost_tile_plan(op, max_cores, candidates)
+        except Unsupported:
+            if not config.enable_reduction_tiling and any(
+                candidate.is_reduction for candidate in candidates
+            ):
+                output_only_plan = _search_output_only_tile_plan(
+                    op, max_cores, candidates
+                )
+                if output_only_plan is not None:
+                    return output_only_plan
+            raise
         if (
             plan is not None
             and not config.enable_reduction_tiling
@@ -1892,15 +1921,9 @@ def plan_span_overflow_tile(
             output_only_candidates = [
                 candidate for candidate in candidates if not candidate.is_reduction
             ]
-            if output_only_candidates:
-                output_only_plan = _search_min_cost_tile_plan(
-                    op,
-                    max_cores,
-                    output_only_candidates,
-                    ignore_reduction_spans=True,
-                )
-                if output_only_plan is not None:
-                    return output_only_plan
+            output_only_plan = _search_output_only_tile_plan(op, max_cores, candidates)
+            if output_only_plan is not None:
+                return output_only_plan
             raise Unsupported(
                 f"Cannot auto-tile {op.get_name()}: K reduction-range tiling "
                 "is required but disabled via enable_reduction_tiling"

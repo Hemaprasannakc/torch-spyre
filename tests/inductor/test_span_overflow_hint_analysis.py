@@ -3068,7 +3068,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         op = _reduction_op(
             (1, 64, 64), reduction_ranges=(64,), reduction_type=BATCH_MATMUL_OP
         )
-        candidate = SimpleNamespace(
+        candidate = soha.SpanOverflowCandidate(
             chunking_info=ChunkingInfo(
                 total_bytes=1,
                 per_core_span=2 * MAX_SPAN_BYTES,
@@ -3441,8 +3441,12 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             stick_elems=64,
             reason="input span overflow for arg0",
         )
-        output_candidate = SimpleNamespace(chunking_info=output_info, source="output")
-        input_candidate = SimpleNamespace(chunking_info=input_info, source="input:arg0")
+        output_candidate = soha.SpanOverflowCandidate(
+            chunking_info=output_info, source="output"
+        )
+        input_candidate = soha.SpanOverflowCandidate(
+            chunking_info=input_info, source="input:arg0"
+        )
 
         def remaining_after_tile(_op, _max_cores, split_by_host_dim):
             if set(split_by_host_dim) == {0, 1}:
@@ -3496,8 +3500,8 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             reason="output span overflow",
         )
         candidates = [
-            SimpleNamespace(chunking_info=dim0_info, source="output"),
-            SimpleNamespace(chunking_info=dim1_info, source="output"),
+            soha.SpanOverflowCandidate(chunking_info=dim0_info, source="output"),
+            soha.SpanOverflowCandidate(chunking_info=dim1_info, source="output"),
         ]
 
         def remaining_after_tile(_op, _max_cores, split_by_host_dim):
@@ -3820,14 +3824,17 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
 
     def test_candidate_axes_orders_by_decreasing_span_pressure(self):
         candidates = [
-            SimpleNamespace(
-                chunking_info=SimpleNamespace(selected_host_dim=1, per_core_span=512)
+            soha.SpanOverflowCandidate(
+                chunking_info=SimpleNamespace(selected_host_dim=1, per_core_span=512),
+                source="output",
             ),
-            SimpleNamespace(
-                chunking_info=SimpleNamespace(selected_host_dim=0, per_core_span=2048)
+            soha.SpanOverflowCandidate(
+                chunking_info=SimpleNamespace(selected_host_dim=0, per_core_span=2048),
+                source="output",
             ),
-            SimpleNamespace(
-                chunking_info=SimpleNamespace(selected_host_dim=2, per_core_span=1024)
+            soha.SpanOverflowCandidate(
+                chunking_info=SimpleNamespace(selected_host_dim=2, per_core_span=1024),
+                source="output",
             ),
         ]
 
@@ -4329,7 +4336,9 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
                 soha, "_input_span_infos_controlled_by_output_dims", return_value=[]
             ),
             patch.object(soha, "_bmm_k_span_infos", return_value=[k_info]),
-            patch.object(soha, "_search_min_cost_tile_plan", return_value=k_plan),
+            patch.object(
+                soha, "_search_min_cost_tile_plan", side_effect=[k_plan, None]
+            ),
         ):
             with config.patch({"enable_reduction_tiling": False}):
                 with self.assertRaisesRegex(
@@ -4338,6 +4347,76 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
                     "enable_reduction_tiling",
                 ):
                     plan_span_overflow_tile(op, max_cores=1)
+
+    def test_bmm_axis_limit_retries_output_only_when_reduction_tiling_disabled(self):
+        op = _reduction_op(
+            (2, 16, 64),
+            reduction_ranges=(65536,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+
+        def candidate(host_dim, source, *, is_reduction=False):
+            return soha.SpanOverflowCandidate(
+                SimpleNamespace(selected_host_dim=host_dim),
+                source=source,
+                is_reduction=is_reduction,
+            )
+
+        output_candidates = [
+            candidate(0, "B"),
+            candidate(1, "M"),
+            candidate(2, "N"),
+        ]
+        reduction_candidate = candidate(0, "K", is_reduction=True)
+        all_candidates = [*output_candidates, reduction_candidate]
+        output_only_plan = SpanOverflowTilePlan(
+            levels=(SpanOverflowTileLevel(1, 2),),
+            chunking_infos=(),
+            reason="output span overflow",
+        )
+
+        with (
+            patch.object(
+                soha,
+                "_output_span_candidates_from_op",
+                return_value=output_candidates,
+            ),
+            patch.object(
+                soha, "_input_span_candidates", return_value=[reduction_candidate]
+            ),
+            patch.object(
+                soha,
+                "_search_min_cost_tile_plan",
+                side_effect=[Unsupported("four axes"), output_only_plan],
+            ) as search,
+            config.patch({"enable_reduction_tiling": False}),
+        ):
+            plan = plan_span_overflow_tile(op, max_cores=1)
+
+        self.assertIs(plan, output_only_plan)
+        self.assertEqual(search.call_count, 2)
+        first_args, first_kwargs = search.call_args_list[0]
+        second_args, second_kwargs = search.call_args_list[1]
+        self.assertIs(first_args[0], op)
+        self.assertEqual(first_args[1], 1)
+        self.assertTrue(
+            all(
+                actual is expected
+                for actual, expected in zip(first_args[2], all_candidates, strict=True)
+            )
+        )
+        self.assertEqual(first_kwargs, {})
+        self.assertIs(second_args[0], op)
+        self.assertEqual(second_args[1], 1)
+        self.assertTrue(
+            all(
+                actual is expected
+                for actual, expected in zip(
+                    second_args[2], output_candidates, strict=True
+                )
+            )
+        )
+        self.assertEqual(second_kwargs, {"ignore_reduction_spans": True})
 
     def test_missing_output_write_dep_skips_auto_tiling(self):
         op = _pointwise_op((1, 8195, 256, 64))
