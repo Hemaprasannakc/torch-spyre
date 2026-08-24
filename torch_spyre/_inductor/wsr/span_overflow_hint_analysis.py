@@ -1125,7 +1125,7 @@ def _input_span_candidates(
         candidates.append(
             SpanOverflowCandidate(info.chunking_info, source=f"input:{info.dep_name}")
         )
-    if _is_batch_matmul_reduction(op) and config.enable_reduction_tiling:
+    if _is_batch_matmul_reduction(op):
         candidates.extend(
             SpanOverflowCandidate(
                 info.chunking_info,
@@ -1549,8 +1549,10 @@ def _search_min_cost_tile_plan(
     op: ComputedBuffer,
     max_cores: int,
     candidates: list[SpanOverflowCandidate],
+    *,
+    ignore_reduction_spans: bool = False,
 ) -> SpanOverflowTilePlan | None:
-    """Find the cheapest output/reduction tile plan that clears all spans."""
+    """Find the cheapest output/reduction tile plan that clears enabled spans."""
     axes = _candidate_axes(candidates)
     logger.debug(
         "[span-overflow search] op=%s candidates=%s axes=%s",
@@ -1638,6 +1640,10 @@ def _search_min_cost_tile_plan(
                 exc,
             )
             continue
+        if ignore_reduction_spans:
+            remaining = [
+                candidate for candidate in remaining if not candidate.is_reduction
+            ]
         if remaining:
             logger.debug(
                 "span_overflow_tile_search: op=%s output=%s reduction=%s "
@@ -1872,6 +1878,33 @@ def plan_span_overflow_tile(
             len(output_candidates),
             len(input_candidates),
         )
-        return _search_min_cost_tile_plan(op, max_cores, candidates)
+        plan = _search_min_cost_tile_plan(op, max_cores, candidates)
+        if (
+            plan is not None
+            and not config.enable_reduction_tiling
+            and any(level.is_reduction for level in plan.levels)
+        ):
+            # The cheapest unrestricted plan may combine an output tile with a
+            # reduction tile. With reduction tiling disabled, retry using only
+            # output-controlled candidates before concluding that K tiling is
+            # required. This preserves useful output tiling behind the kill
+            # switch while still rejecting a K-only overflow.
+            output_only_candidates = [
+                candidate for candidate in candidates if not candidate.is_reduction
+            ]
+            if output_only_candidates:
+                output_only_plan = _search_min_cost_tile_plan(
+                    op,
+                    max_cores,
+                    output_only_candidates,
+                    ignore_reduction_spans=True,
+                )
+                if output_only_plan is not None:
+                    return output_only_plan
+            raise Unsupported(
+                f"Cannot auto-tile {op.get_name()}: K reduction-range tiling "
+                "is required but disabled via enable_reduction_tiling"
+            )
+        return plan
 
     return None
