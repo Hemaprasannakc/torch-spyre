@@ -7151,13 +7151,13 @@ class TestCoarseTileNestedReductionE2E(InductorTestCase):
         self.assertIn("count=sympify('2')", src)
         self.assertIn("coarse_tile_reduce_copy", src)
 
-    def test_auto_span_overflow_bmm_kill_switch_keeps_output_loop(self):
-        """Disabling reduction tiling keeps M tiling and removes the K loop."""
-        src = self._auto_span_overflow_bmm_source(enable_reduction_tiling=False)
-
-        self.assertEqual(src.count("LoopSpec("), 1)
-        self.assertIn("count=sympify('8')", src)
-        self.assertNotIn("coarse_tile_reduce_copy", src)
+    def test_auto_span_overflow_bmm_kill_switch_rejects_unresolved_k_span(self):
+        """Disabling K tiling must not hide a K span left by output-only tiling."""
+        with self.assertRaisesRegex(
+            Exception,
+            "no combined split.*makes all spans fit",
+        ):
+            self._auto_span_overflow_bmm_source(enable_reduction_tiling=False)
 
     def test_nested_matmul_outer_M_inner_K_correct(self):
         """mm [M,K]@[K,N] with outer M (output) + inner K (reduction) — correct."""

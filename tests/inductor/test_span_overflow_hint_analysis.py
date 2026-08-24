@@ -2712,7 +2712,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             [candidate.is_reduction for candidate in candidates], [False, True]
         )
 
-    def test_bmm_unsplittable_k_overflow_blocks_output_plan(self):
+    def test_bmm_unsplittable_k_overflow_is_retained_for_output_fallback(self):
         op = _reduction_op(
             (1, 64, 64), reduction_ranges=(257,), reduction_type=BATCH_MATMUL_OP
         )
@@ -2741,12 +2741,63 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             patch.object(
                 soha, "_host_dim_has_legal_nontrivial_split", return_value=True
             ),
-            self.assertRaisesRegex(
-                Unsupported,
-                "K-controlled input span exceeds the hardware limit.*no legal",
+        ):
+            candidates = soha._input_span_candidates(op, max_cores=1)
+
+        self.assertEqual(
+            [candidate.source for candidate in candidates],
+            ["input:lhs", "input:rhs"],
+        )
+        self.assertEqual(
+            [candidate.is_reduction for candidate in candidates], [False, True]
+        )
+
+    def test_bmm_unsplittable_k_overflow_can_be_rescued_by_output_split(self):
+        op = _reduction_op(
+            (1, 64, 64), reduction_ranges=(257,), reduction_type=BATCH_MATMUL_OP
+        )
+        output_candidate = soha.SpanOverflowCandidate(
+            SimpleNamespace(
+                selected_host_dim=1,
+                per_core_span=2 * MAX_SPAN_BYTES,
+                reason="mixed M+K input span overflow",
+            ),
+            source="input:lhs",
+        )
+        k_candidate = soha.SpanOverflowCandidate(
+            SimpleNamespace(
+                selected_host_dim=0,
+                per_core_span=2 * MAX_SPAN_BYTES,
+                reason="BMM K input span overflow for rhs",
+            ),
+            source="input:rhs",
+            is_reduction=True,
+        )
+
+        def remaining(_op, _max_cores, output_splits, *, k_split=None):
+            self.assertIsNone(k_split)
+            return [] if output_splits == {1: 2} else [k_candidate]
+
+        with (
+            patch.object(soha, "_output_span_candidates_from_op", return_value=[]),
+            patch.object(
+                soha,
+                "_input_span_candidates",
+                return_value=[output_candidate, k_candidate],
+            ),
+            patch.object(soha, "_split_candidates_for_host_dim", return_value=[1, 2]),
+            patch.object(soha, "_bmm_k_split_candidates", return_value=[]),
+            patch.object(
+                soha, "_combined_tile_stick_alignment_error", return_value=None
+            ),
+            patch.object(
+                soha, "_remaining_span_candidates_after_tile", side_effect=remaining
             ),
         ):
-            soha._input_span_candidates(op, max_cores=1)
+            plan = plan_span_overflow_tile(op, max_cores=1)
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.levels, (SpanOverflowTileLevel(1, 2),))
 
     def test_bmm_kill_switch_keeps_output_input_candidate(self):
         op = _reduction_op(
@@ -4411,6 +4462,56 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
                 ):
                     plan_span_overflow_tile(op, max_cores=1)
 
+    def test_bmm_kill_switch_output_retry_strictly_revalidates_k_span(self):
+        op = _reduction_op(
+            (1, 16, 64),
+            reduction_ranges=(65536,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+        output_candidate = soha.SpanOverflowCandidate(
+            SimpleNamespace(selected_host_dim=1),
+            source="M",
+        )
+        reduction_candidate = soha.SpanOverflowCandidate(
+            SimpleNamespace(selected_host_dim=0),
+            source="K",
+            is_reduction=True,
+        )
+        k_plan = SpanOverflowTilePlan(
+            levels=(SpanOverflowTileLevel(0, 4, is_reduction=True),),
+            chunking_infos=(),
+            reason="K span overflow",
+        )
+
+        with (
+            patch.object(
+                soha,
+                "_output_span_candidates_from_op",
+                return_value=[output_candidate],
+            ),
+            patch.object(
+                soha, "_input_span_candidates", return_value=[reduction_candidate]
+            ),
+            patch.object(soha, "_search_min_cost_tile_plan", return_value=k_plan),
+            patch.object(
+                soha,
+                "_search_output_only_tile_plan",
+                side_effect=Unsupported("K still overflows after output split"),
+            ) as output_only_search,
+            config.patch({"enable_reduction_tiling": False}),
+            self.assertRaisesRegex(
+                Unsupported,
+                "K still overflows after output split",
+            ),
+        ):
+            plan_span_overflow_tile(op, max_cores=1)
+
+        args, kwargs = output_only_search.call_args
+        self.assertEqual(args, (op, 1, [output_candidate]))
+        self.assertFalse(kwargs.pop("ignore_reduction_spans"))
+        self.assertEqual(kwargs.pop("validation_cache"), {})
+        self.assertEqual(kwargs, {})
+
     def test_bmm_axis_limit_retries_output_only_when_reduction_tiling_disabled(self):
         op = _reduction_op(
             (2, 16, 64),
@@ -4468,6 +4569,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
                 for actual, expected in zip(first_args[2], all_candidates, strict=True)
             )
         )
+        validation_cache = first_kwargs.pop("validation_cache")
         self.assertEqual(first_kwargs, {})
         self.assertIs(second_args[0], op)
         self.assertEqual(second_args[1], 1)
@@ -4479,6 +4581,7 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
                 )
             )
         )
+        self.assertIs(second_kwargs.pop("validation_cache"), validation_cache)
         self.assertEqual(second_kwargs, {"ignore_reduction_spans": False})
 
     def test_bmm_disabled_reduction_retry_does_not_ignore_k_overflow(self):
@@ -4522,12 +4625,11 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
         ):
             plan_span_overflow_tile(op, max_cores=1)
 
-        output_only_search.assert_called_once_with(
-            op,
-            1,
-            [output_candidate, reduction_candidate],
-            ignore_reduction_spans=False,
-        )
+        args, kwargs = output_only_search.call_args
+        self.assertEqual(args, (op, 1, [output_candidate, reduction_candidate]))
+        self.assertFalse(kwargs.pop("ignore_reduction_spans"))
+        self.assertEqual(kwargs.pop("validation_cache"), {})
+        self.assertEqual(kwargs, {})
 
     def test_bmm_axis_limit_retries_strict_output_only_by_default(self):
         op = _reduction_op(
@@ -4573,9 +4675,11 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
             plan = plan_span_overflow_tile(op, max_cores=1)
 
         self.assertIs(plan, output_only_plan)
-        output_only_search.assert_called_once_with(
-            op, 1, candidates, ignore_reduction_spans=False
-        )
+        args, kwargs = output_only_search.call_args
+        self.assertEqual(args, (op, 1, candidates))
+        self.assertFalse(kwargs.pop("ignore_reduction_spans"))
+        self.assertEqual(kwargs.pop("validation_cache"), {})
+        self.assertEqual(kwargs, {})
 
     def test_bmm_output_only_retry_failure_preserves_original_error(self):
         op = _reduction_op(
@@ -4608,6 +4712,49 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
             self.assertRaisesRegex(Unsupported, "original combined-search failure"),
         ):
             plan_span_overflow_tile(op, max_cores=1)
+
+    def test_output_only_retry_reuses_post_tile_k_span_validation(self):
+        op = _reduction_op(
+            (1, 64, 64), reduction_ranges=(512,), reduction_type=BATCH_MATMUL_OP
+        )
+        output_candidate = soha.SpanOverflowCandidate(
+            SimpleNamespace(
+                selected_host_dim=1,
+                per_core_span=2 * MAX_SPAN_BYTES,
+                reason="mixed M+K input span overflow",
+            ),
+            source="input:lhs",
+        )
+        validation_cache = {}
+
+        with (
+            patch.object(soha, "_split_candidates_for_host_dim", return_value=[1, 2]),
+            patch.object(
+                soha, "_combined_tile_stick_alignment_error", return_value=None
+            ),
+            patch.object(
+                soha,
+                "_remaining_span_candidates_after_tile",
+                return_value=[],
+            ) as validate,
+        ):
+            first = soha._search_min_cost_tile_plan(
+                op,
+                1,
+                [output_candidate],
+                validation_cache=validation_cache,
+            )
+            retry = soha._search_output_only_tile_plan(
+                op,
+                1,
+                [output_candidate],
+                ignore_reduction_spans=False,
+                validation_cache=validation_cache,
+            )
+
+        self.assertIsNotNone(first)
+        self.assertIsNotNone(retry)
+        validate.assert_called_once_with(op, 1, {1: 2})
 
     def test_missing_output_write_dep_skips_auto_tiling(self):
         op = _pointwise_op((1, 8195, 256, 64))

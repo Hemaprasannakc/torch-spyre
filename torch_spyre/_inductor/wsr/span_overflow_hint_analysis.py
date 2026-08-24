@@ -1126,26 +1126,18 @@ def _input_span_candidates(
             SpanOverflowCandidate(info.chunking_info, source=f"input:{info.dep_name}")
         )
     if _is_batch_matmul_reduction(op):
-        k_infos = _bmm_k_span_infos(
-            op,
-            max_cores,
-            split_by_host_dim=split_by_host_dim,
+        candidates.extend(
+            SpanOverflowCandidate(
+                info.chunking_info,
+                source=f"input:{info.dep_name}",
+                is_reduction=True,
+            )
+            for info in _bmm_k_span_infos(
+                op,
+                max_cores,
+                split_by_host_dim=split_by_host_dim,
+            )
         )
-        if _bmm_k_split_candidates(op, required_split=1):
-            candidates.extend(
-                SpanOverflowCandidate(
-                    info.chunking_info,
-                    source=f"input:{info.dep_name}",
-                    is_reduction=True,
-                )
-                for info in k_infos
-            )
-        elif k_infos:
-            raise Unsupported(
-                f"Cannot auto-tile {op.get_name()}: a K-controlled input span "
-                "exceeds the hardware limit, but BMM K has no legal nontrivial "
-                "split."
-            )
     return candidates
 
 
@@ -1568,6 +1560,13 @@ def _search_min_cost_tile_plan(
     candidates: list[SpanOverflowCandidate],
     *,
     ignore_reduction_spans: bool = False,
+    validation_cache: (
+        dict[
+            tuple[tuple[tuple[int, int], ...], int | None],
+            list[SpanOverflowCandidate],
+        ]
+        | None
+    ) = None,
 ) -> SpanOverflowTilePlan | None:
     """Find the cheapest output/reduction tile plan that clears enabled spans."""
     axes = _candidate_axes(candidates)
@@ -1636,8 +1635,11 @@ def _search_min_cost_tile_plan(
             continue
 
         k_split = split_by_reduction_dim.get(0)
+        validation_key = (tuple(sorted(split_by_host_dim.items())), k_split)
         try:
-            if k_split is None:
+            if validation_cache is not None and validation_key in validation_cache:
+                remaining = validation_cache[validation_key]
+            elif k_split is None:
                 remaining = _remaining_span_candidates_after_tile(
                     op, max_cores, split_by_host_dim
                 )
@@ -1648,6 +1650,8 @@ def _search_min_cost_tile_plan(
                     split_by_host_dim,
                     k_split=k_split,
                 )
+            if validation_cache is not None:
+                validation_cache[validation_key] = remaining
         except Unsupported as exc:
             logger.debug(
                 "span_overflow_tile_search: op=%s output=%s reduction=%s rejected: %s",
@@ -1726,6 +1730,13 @@ def _search_output_only_tile_plan(
     candidates: list[SpanOverflowCandidate],
     *,
     ignore_reduction_spans: bool = True,
+    validation_cache: (
+        dict[
+            tuple[tuple[tuple[int, int], ...], int | None],
+            list[SpanOverflowCandidate],
+        ]
+        | None
+    ) = None,
 ) -> SpanOverflowTilePlan | None:
     """Retry span planning without reduction axes."""
     output_candidates = [
@@ -1738,6 +1749,7 @@ def _search_output_only_tile_plan(
         max_cores,
         output_candidates,
         ignore_reduction_spans=ignore_reduction_spans,
+        validation_cache=validation_cache,
     )
 
 
@@ -1917,8 +1929,17 @@ def plan_span_overflow_tile(
             len(output_candidates),
             len(input_candidates),
         )
+        validation_cache: dict[
+            tuple[tuple[tuple[int, int], ...], int | None],
+            list[SpanOverflowCandidate],
+        ] = {}
         try:
-            plan = _search_min_cost_tile_plan(op, max_cores, candidates)
+            plan = _search_min_cost_tile_plan(
+                op,
+                max_cores,
+                candidates,
+                validation_cache=validation_cache,
+            )
         except Unsupported as original_failure:
             if any(candidate.is_reduction for candidate in candidates):
                 try:
@@ -1930,6 +1951,7 @@ def plan_span_overflow_tile(
                         # clears every K-controlled span. Never hide a real K
                         # overflow merely because reduction tiling is disabled.
                         ignore_reduction_spans=False,
+                        validation_cache=validation_cache,
                     )
                 except Unsupported:
                     # The retry is a best-effort fallback. Its narrower search
@@ -1952,7 +1974,11 @@ def plan_span_overflow_tile(
                 candidate for candidate in candidates if not candidate.is_reduction
             ]
             output_only_plan = _search_output_only_tile_plan(
-                op, max_cores, output_only_candidates
+                op,
+                max_cores,
+                output_only_candidates,
+                ignore_reduction_spans=False,
+                validation_cache=validation_cache,
             )
             if output_only_plan is not None:
                 return output_only_plan
