@@ -1141,10 +1141,10 @@ def _input_span_candidates(
                 for info in k_infos
             )
         elif k_infos:
-            logger.debug(
-                "span_overflow_input: op=%s BMM K has no legal nontrivial "
-                "coarse split; skipping reduction candidates",
-                op.get_name(),
+            raise Unsupported(
+                f"Cannot auto-tile {op.get_name()}: a K-controlled input span "
+                "exceeds the hardware limit, but BMM K has no legal nontrivial "
+                "split."
             )
     return candidates
 
@@ -1428,7 +1428,14 @@ def _split_candidates_for_axis(
             f"Cannot auto-tile {op.get_name()}: reduction-range tiling is only "
             "supported for BMM K (reduction dim 0)."
         )
-    return [1, *_bmm_k_split_candidates(op, required_count)]
+    k_candidates = _bmm_k_split_candidates(op, required_count)
+    if not k_candidates:
+        raise Unsupported(
+            f"Cannot auto-tile {op.get_name()}: a K-controlled input span "
+            "exceeds the hardware limit, but BMM K has no legal nontrivial "
+            "split."
+        )
+    return [1, *k_candidates]
 
 
 def _combo_cost(combo: tuple[int, ...]) -> tuple[int, int, int, tuple[int, ...]]:
@@ -1912,17 +1919,25 @@ def plan_span_overflow_tile(
         )
         try:
             plan = _search_min_cost_tile_plan(op, max_cores, candidates)
-        except Unsupported:
+        except Unsupported as original_failure:
             if any(candidate.is_reduction for candidate in candidates):
-                output_only_plan = _search_output_only_tile_plan(
-                    op,
-                    max_cores,
-                    candidates,
-                    ignore_reduction_spans=not config.enable_reduction_tiling,
-                )
+                try:
+                    output_only_plan = _search_output_only_tile_plan(
+                        op,
+                        max_cores,
+                        candidates,
+                        # An output-only split is still valid when it also
+                        # clears every K-controlled span. Never hide a real K
+                        # overflow merely because reduction tiling is disabled.
+                        ignore_reduction_spans=False,
+                    )
+                except Unsupported:
+                    # The retry is a best-effort fallback. Its narrower search
+                    # must not replace the original, more informative failure.
+                    raise original_failure
                 if output_only_plan is not None:
                     return output_only_plan
-            raise
+            raise original_failure
         if (
             plan is not None
             and not config.enable_reduction_tiling

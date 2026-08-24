@@ -2712,7 +2712,7 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             [candidate.is_reduction for candidate in candidates], [False, True]
         )
 
-    def test_bmm_unsplittable_k_candidate_does_not_block_output_plan(self):
+    def test_bmm_unsplittable_k_overflow_blocks_output_plan(self):
         op = _reduction_op(
             (1, 64, 64), reduction_ranges=(257,), reduction_type=BATCH_MATMUL_OP
         )
@@ -2741,11 +2741,12 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
             patch.object(
                 soha, "_host_dim_has_legal_nontrivial_split", return_value=True
             ),
+            self.assertRaisesRegex(
+                Unsupported,
+                "K-controlled input span exceeds the hardware limit.*no legal",
+            ),
         ):
-            candidates = soha._input_span_candidates(op, max_cores=1)
-
-        self.assertEqual([candidate.source for candidate in candidates], ["input:lhs"])
-        self.assertFalse(candidates[0].is_reduction)
+            soha._input_span_candidates(op, max_cores=1)
 
     def test_bmm_kill_switch_keeps_output_input_candidate(self):
         op = _reduction_op(
@@ -3379,6 +3380,33 @@ class TestSpanOverflowPointwisePlannerAndAdapter(InductorTestCase):
         self.assertIn(2, candidates)
         self.assertIn(4, candidates)
         self.assertNotIn(8, candidates)
+
+    def test_bmm_k_overflow_without_legal_split_raises(self):
+        op = _reduction_op(
+            (1, 1, 64),
+            reduction_ranges=(65537,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+        k_candidate = soha.SpanOverflowCandidate(
+            SimpleNamespace(
+                selected_host_dim=0,
+                per_core_span=2 * MAX_SPAN_BYTES,
+                reason="BMM K input span overflow for rhs",
+            ),
+            source="input:rhs",
+            is_reduction=True,
+        )
+
+        with (
+            patch.object(soha, "_output_span_candidates_from_op", return_value=[]),
+            patch.object(soha, "_input_span_candidates", return_value=[k_candidate]),
+            patch.object(soha, "_bmm_k_split_candidates", return_value=[]),
+            self.assertRaisesRegex(
+                Unsupported,
+                "K-controlled input span exceeds the hardware limit.*no legal",
+            ),
+        ):
+            plan_span_overflow_tile(op, max_cores=1)
 
     def test_bmm_without_any_overflow_returns_none(self):
         op = _reduction_op(
@@ -4451,7 +4479,55 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
                 )
             )
         )
-        self.assertEqual(second_kwargs, {"ignore_reduction_spans": True})
+        self.assertEqual(second_kwargs, {"ignore_reduction_spans": False})
+
+    def test_bmm_disabled_reduction_retry_does_not_ignore_k_overflow(self):
+        op = _reduction_op(
+            (2, 16, 64),
+            reduction_ranges=(65537,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+        output_candidate = soha.SpanOverflowCandidate(
+            SimpleNamespace(selected_host_dim=1),
+            source="M",
+        )
+        reduction_candidate = soha.SpanOverflowCandidate(
+            SimpleNamespace(selected_host_dim=0),
+            source="K",
+            is_reduction=True,
+        )
+        original_failure = Unsupported("K has no legal nontrivial split")
+
+        with (
+            patch.object(
+                soha,
+                "_output_span_candidates_from_op",
+                return_value=[output_candidate],
+            ),
+            patch.object(
+                soha, "_input_span_candidates", return_value=[reduction_candidate]
+            ),
+            patch.object(
+                soha,
+                "_search_min_cost_tile_plan",
+                side_effect=original_failure,
+            ),
+            patch.object(
+                soha,
+                "_search_output_only_tile_plan",
+                side_effect=Unsupported("K still overflows after output split"),
+            ) as output_only_search,
+            config.patch({"enable_reduction_tiling": False}),
+            self.assertRaisesRegex(Unsupported, "K has no legal nontrivial split"),
+        ):
+            plan_span_overflow_tile(op, max_cores=1)
+
+        output_only_search.assert_called_once_with(
+            op,
+            1,
+            [output_candidate, reduction_candidate],
+            ignore_reduction_spans=False,
+        )
 
     def test_bmm_axis_limit_retries_strict_output_only_by_default(self):
         op = _reduction_op(
@@ -4500,6 +4576,38 @@ class TestSpanOverflowAdditionalPlannerCases(InductorTestCase):
         output_only_search.assert_called_once_with(
             op, 1, candidates, ignore_reduction_spans=False
         )
+
+    def test_bmm_output_only_retry_failure_preserves_original_error(self):
+        op = _reduction_op(
+            (2, 16, 64),
+            reduction_ranges=(65536,),
+            reduction_type=BATCH_MATMUL_OP,
+        )
+        reduction_candidate = soha.SpanOverflowCandidate(
+            SimpleNamespace(selected_host_dim=0),
+            source="K",
+            is_reduction=True,
+        )
+        original_failure = Unsupported("original combined-search failure")
+
+        with (
+            patch.object(soha, "_output_span_candidates_from_op", return_value=[]),
+            patch.object(
+                soha, "_input_span_candidates", return_value=[reduction_candidate]
+            ),
+            patch.object(
+                soha,
+                "_search_min_cost_tile_plan",
+                side_effect=original_failure,
+            ),
+            patch.object(
+                soha,
+                "_search_output_only_tile_plan",
+                side_effect=Unsupported("less informative retry failure"),
+            ),
+            self.assertRaisesRegex(Unsupported, "original combined-search failure"),
+        ):
+            plan_span_overflow_tile(op, max_cores=1)
 
     def test_missing_output_write_dep_skips_auto_tiling(self):
         op = _pointwise_op((1, 8195, 256, 64))
