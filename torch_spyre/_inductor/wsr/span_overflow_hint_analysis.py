@@ -1140,12 +1140,14 @@ def _input_span_candidates(
         )
     return candidates
 
+
 def _candidate_axis(candidate: SpanOverflowCandidate) -> tuple[int, bool]:
     """Return the output or reduction axis represented by ``candidate``."""
     return (
         candidate.chunking_info.selected_host_dim,
         candidate.is_reduction,
     )
+
 
 def _candidate_axes(
     candidates: list[SpanOverflowCandidate],
@@ -1702,6 +1704,7 @@ def _search_min_cost_tile_plan(
         f"after trying at most {_MAX_TILE_COMBOS} combinations."
     )
 
+
 def _search_output_only_tile_plan(
     op: ComputedBuffer,
     max_cores: int,
@@ -1719,6 +1722,7 @@ def _search_output_only_tile_plan(
         output_candidates,
         ignore_reduction_spans=True,
     )
+
 
 def _has_indirect_reads(op: ComputedBuffer) -> bool:
     """Return True if the op uses indirect/gather-style input reads.
@@ -1921,7 +1925,9 @@ def plan_span_overflow_tile(
             output_only_candidates = [
                 candidate for candidate in candidates if not candidate.is_reduction
             ]
-            output_only_plan = _search_output_only_tile_plan(op, max_cores, candidates)
+            output_only_plan = _search_output_only_tile_plan(
+                op, max_cores, output_only_candidates
+            )
             if output_only_plan is not None:
                 return output_only_plan
             raise Unsupported(
