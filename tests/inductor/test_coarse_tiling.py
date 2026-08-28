@@ -1402,6 +1402,37 @@ class TestCodegenOpSpecListRoundtrip(unittest.TestCase):
 
 
 class TestDivideRanges(unittest.TestCase):
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
+    def _make_named_pointwise(self, ranges, names):
+        from torch._inductor.ir import ComputedBuffer, FixedLayout, Pointwise
+
+        from torch_spyre._inductor.pass_utils import iteration_space_from_op
+
+        data = Pointwise(
+            device=torch.device("cpu"),
+            dtype=torch.float16,
+            inner_fn=lambda index: sympy.Integer(0),
+            ranges=list(ranges),
+        )
+        op = ComputedBuffer(
+            name="named_pointwise",
+            layout=FixedLayout(torch.device("cpu"), torch.float16, list(ranges), None),
+            data=data,
+        )
+        symbols = tuple(iteration_space_from_op(op))
+        self.assertEqual(len(symbols), len(names))
+        op.work_div_loop_info = {  # type: ignore[attr-defined]
+            symbol: [name] for symbol, name in zip(symbols, names)
+        }
+        return op
+
     def test_pointwise_single_dim_divided(self):
         data = _make_pointwise([Integer(64)])
         op = _make_op(data)
@@ -1422,6 +1453,69 @@ class TestDivideRanges(unittest.TestCase):
         _divide_ranges(op, Integer(4), tiled_dims=[0])
         self.assertEqual(data.ranges[0], Integer(8))
         self.assertEqual(data.ranges[1], Integer(8))
+
+    def test_named_token_split_survives_expert_dim_squeeze(self):
+        from torch_spyre._inductor.pass_utils import iteration_space_from_op
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _apply_work_div_symbol_remap,
+        )
+
+        op = self._make_named_pointwise(
+            [Integer(128), Integer(512), Integer(704)], ["E", "T", "F"]
+        )
+
+        result = _divide_ranges(op, Integer(128), tiled_dims=[0])
+        _apply_work_div_symbol_remap(op, result.symbol_remap)
+
+        iteration_space = iteration_space_from_op(op)
+        self.assertEqual(tuple(iteration_space.values()), (Integer(512), Integer(704)))
+        names_by_extent = {
+            iteration_space[symbol]: names
+            for symbol, names in op.work_div_loop_info.items()  # type: ignore[attr-defined]
+        }
+        self.assertEqual(names_by_extent, {Integer(512): ["T"], Integer(704): ["F"]})
+
+    def test_named_dims_compose_across_two_size_one_squeezes(self):
+        from torch_spyre._inductor.pass_utils import iteration_space_from_op
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _apply_work_div_symbol_remap,
+        )
+
+        op = self._make_named_pointwise(
+            [Integer(8), Integer(16), Integer(32)], ["E0", "E1", "T"]
+        )
+
+        first = _divide_ranges(op, Integer(8), tiled_dims=[0])
+        _apply_work_div_symbol_remap(op, first.symbol_remap)
+        second = _divide_ranges(op, Integer(16), tiled_dims=[1])
+        _apply_work_div_symbol_remap(op, second.symbol_remap)
+
+        iteration_space = iteration_space_from_op(op)
+        self.assertEqual(tuple(iteration_space.values()), (Integer(32),))
+        self.assertEqual(
+            list(op.work_div_loop_info.values()),  # type: ignore[attr-defined]
+            [["T"]],
+        )
+
+    def test_non_monotone_symbol_mapping_fails_visibly(self):
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _LogicalIterationSymbol,
+            _order_preserving_symbol_remap,
+        )
+
+        op = MagicMock()
+        op.get_name.return_value = "reordered"
+        before = (
+            _LogicalIterationSymbol(("output", 0), Integer(8), Symbol("d0")),
+            _LogicalIterationSymbol(("output", 1), Integer(16), Symbol("d1")),
+        )
+        after = (
+            _LogicalIterationSymbol(("output", 1), Integer(16), Symbol("d0")),
+            _LogicalIterationSymbol(("output", 0), Integer(8), Symbol("d1")),
+        )
+
+        with self.assertRaisesRegex(Unsupported, "order-preserving dimension mapping"):
+            _order_preserving_symbol_remap(op, before, after)
 
     def test_tiled_dims_indices_0_1(self):
         data = _make_pointwise([Integer(32), Integer(16), Integer(4)])
@@ -2211,6 +2305,50 @@ class TestCoarseTileTiledDimsPerRead(unittest.TestCase):
         # so dim 0 is filtered out of every level's list for this dep;
         # only dim 1 (M=4, extent 1024, tiled at level 1) survives.
         self.assertEqual(broadcast_tiled_dims, [[], [(1, Integer(1024))]])
+
+    def test_unit_tile_step_stays_in_pass1_planning_data(self):
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _capture_predivision_unit_steps,
+        )
+
+        op = _make_real_pointwise_op(
+            ranges=[Integer(3), Integer(64)],
+            input_shapes_strides=[([3, 64], [64, 1])],
+            name="buf0",
+            hints=((1, 0),),
+        )
+        levels = [(1, Integer(3))]
+        plan = plan_coarse_tile_groups([op], [([op], levels)])
+        captured = _capture_predivision_unit_steps([op], plan)
+
+        self.assertEqual(
+            captured[id(op)],
+            ((((0, Integer(64), Integer(1)),),),),
+        )
+
+        _apply_plan([op], (0,), levels, {op.get_operation_name(): 0}, plan)
+        # The early observation is not stamped onto the transformed op. It
+        # does not change general loop addressing before Pass 1 selects a
+        # read copy.
+        self.assertEqual(op.loop_info.squeezed_advance_per_read, [])
+        self.assertFalse(hasattr(op.loop_info, "predivision_unit_step_per_read"))
+
+    def test_predivision_step_wins_and_warns_on_legacy_disagreement(self):
+        from torch_spyre._inductor.wsr.coarse_tile import _select_unit_steps
+
+        planned = [[(Integer(64), Integer(1))]]
+        legacy = [[(Integer(32), Integer(1))]]
+        with patch("torch_spyre._inductor.wsr.coarse_tile.logger.warning") as warning:
+            selected = _select_unit_steps(
+                op_name="buf0",
+                dep_name="arg0",
+                dim=0,
+                planned=planned,
+                legacy=legacy,
+            )
+
+        self.assertEqual(selected, planned)
+        warning.assert_called_once()
 
     def test_reduction_dim_advance_is_offset_by_output_dims(self):
         # out[d0] = sum_{d1} in[d0, d1].  in is [8, 16], row-major
@@ -5233,9 +5371,14 @@ class TestPlanReadCopies(unittest.TestCase):
         from torch_spyre._inductor.wsr.coarse_tile import _plan_read_copies
 
         op_a, op_b, full_buf, operations = _make_two_op_shared_read_fixture()
+        captured = ((((0, Integer(128), Integer(1)),),),)
         retiled_infos_by_group = [((0,), [op_a, op_b], {})]
 
-        plans = _plan_read_copies(operations, retiled_infos_by_group)
+        plans = _plan_read_copies(
+            operations,
+            retiled_infos_by_group,
+            {id(op_a): captured, id(op_b): captured},
+        )
 
         self.assertIn((0,), plans)
         plan = plans[(0,)]
@@ -5245,6 +5388,10 @@ class TestPlanReadCopies(unittest.TestCase):
         self.assertEqual(entry.insert_before_op_name, "op_a")
         self.assertEqual(entry.sizing_op_name, "op_a")
         self.assertEqual(set(entry.consumer_op_names), {"op_a", "op_b"})
+        self.assertEqual(
+            entry.predivision_unit_steps,
+            (((0, Integer(128), Integer(1)),),),
+        )
 
     def test_same_op_two_reads_same_index_collapse_to_one_entry(self):
         """a+b*a: one op reading buffer 'a' twice at the identical index
@@ -5395,10 +5542,12 @@ class TestReadCopyPlanDataclasses(unittest.TestCase):
             dep=dep,
             insert_before_op_name="op0",
             sizing_op_name="op0",
+            sizing_read_index=0,
             consumer_op_names=("op0", "op1"),
         )
         self.assertEqual(entry.copy_name, "coarse_tile_read_copy_group0_a_0")
         self.assertEqual(entry.consumer_op_names, ("op0", "op1"))
+        self.assertEqual(entry.predivision_unit_steps, ())
         with self.assertRaises(Exception):
             entry.copy_name = "other"  # frozen -> raises FrozenInstanceError
 
@@ -5475,6 +5624,32 @@ class TestInsertAllReadCopyOps(unittest.TestCase):
         self.assertEqual(loaded_by_b, [copy_buf.get_name()])
         self.assertNotIn(full_buf.get_name(), loaded_by_a)
         self.assertNotIn(full_buf.get_name(), loaded_by_b)
+
+    def test_generated_read_copy_does_not_inherit_positional_work_div_names(self):
+        from torch._inductor.ir import ComputedBuffer
+
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _insert_all_read_copy_ops,
+            _plan_read_copies,
+        )
+
+        op_a, op_b, _full_buf, operations = _make_two_op_shared_read_fixture()
+        for op in (op_a, op_b):
+            op.work_div_loop_info = {  # type: ignore[attr-defined]
+                Symbol("d0"): ["T"]
+            }
+        plans = _plan_read_copies(operations, [((0,), [op_a, op_b], {})])
+
+        _insert_all_read_copy_ops(operations, plans)
+
+        generated = [
+            op
+            for op in operations
+            if isinstance(op, ComputedBuffer)
+            and op.get_name().startswith("coarse_tile_read_copy")
+        ]
+        self.assertEqual(len(generated), 1)
+        self.assertFalse(hasattr(generated[0], "work_div_loop_info"))
 
     def test_transposed_read_gets_its_own_copy(self):
         """a+b+a.t()-style: two reads of the same buffer with different
@@ -6703,6 +6878,14 @@ class TestCoarseTileInfoReductionField(unittest.TestCase):
 class TestDivideReductionRanges(unittest.TestCase):
     """_divide_reduction_ranges divides reduction_ranges, leaves ranges intact."""
 
+    def setUp(self):
+        gm = fx.symbolic_trace(lambda: None)
+        self._graph_ctx = V.set_graph_handler(GraphLowering(gm))
+        self._graph_ctx.__enter__()
+
+    def tearDown(self):
+        self._graph_ctx.__exit__(None, None, None)
+
     def _make_reduction_op(self, ranges, reduction_ranges, reduction_type="sum"):
         from torch._inductor.ir import ComputedBuffer, Reduction, ReductionHint
         import torch
@@ -6759,6 +6942,44 @@ class TestDivideReductionRanges(unittest.TestCase):
         _divide_reduction_ranges(op, Integer(4), [1])
         self.assertEqual(op.data.reduction_ranges[0], Integer(64))  # untouched
         self.assertEqual(op.data.reduction_ranges[1], Integer(32))  # divided
+
+    def test_named_output_dims_survive_reduction_dim_squeeze(self):
+        from torch_spyre._inductor.wsr.coarse_tile import (
+            _LogicalIterationSymbol,
+            _apply_work_div_symbol_remap,
+            _divide_reduction_ranges,
+        )
+
+        op = self._make_reduction_op(
+            ranges=[Integer(512), Integer(704)],
+            reduction_ranges=[Integer(128)],
+        )
+        before = (
+            _LogicalIterationSymbol(("output", 0), Integer(512), Symbol("d0")),
+            _LogicalIterationSymbol(("output", 1), Integer(704), Symbol("d1")),
+            _LogicalIterationSymbol(("reduction", 0), Integer(128), Symbol("d2")),
+        )
+        after = (
+            _LogicalIterationSymbol(("output", 0), Integer(512), Symbol("d0")),
+            _LogicalIterationSymbol(("output", 1), Integer(704), Symbol("d1")),
+        )
+        op.work_div_loop_info = {  # type: ignore[attr-defined]
+            Symbol("d0"): ["T"],
+            Symbol("d1"): ["F"],
+            Symbol("d2"): ["E"],
+        }
+
+        with patch(
+            "torch_spyre._inductor.wsr.coarse_tile._capture_logical_iteration_symbols",
+            side_effect=(before, after),
+        ):
+            remap = _divide_reduction_ranges(op, Integer(128), [0])
+        _apply_work_div_symbol_remap(op, remap)
+
+        self.assertEqual(
+            op.work_div_loop_info,  # type: ignore[attr-defined]
+            {Symbol("d0"): ["T"], Symbol("d1"): ["F"]},
+        )
 
 
 class TestLoopVarToReductionRangesPos(unittest.TestCase):
