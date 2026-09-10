@@ -46,6 +46,7 @@ import sympy
 import torch
 import torch.nn.functional as F
 from torch._inductor.dependencies import MemoryDep
+from torch._inductor.exc import InductorError
 from torch._inductor.ir import ComputedBuffer, FlexibleLayout, Pointwise, Reduction
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.test_case import TestCase as InductorTestCase
@@ -4857,8 +4858,12 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
     Before this, only batch-matmul K could be reduction-range tiled.  Now a
     plain sum/prod/max/min whose *reduced axis* controls an oversized input
     read gets the same identity-fill + per-tile-combine + drain treatment.
-    Everything else (mean, welford, >1 reduction range) must fail with a clear
-    message instead of silently leaving the span over the hardware limit.
+    `mean` and multi-reduction-range ops are in the same family as
+    sum/prod/max/min but cannot be reduction-range tiled, so those must fail
+    with a clear message instead of silently leaving the span over the
+    hardware limit.  Reduction types outside the family entirely (welford,
+    xor_sum, any, ...) are untouched by this guard and keep the pre-existing
+    silent skip -- other passes own their span handling.
     """
 
     def _reduction_dim_overflow_op(self, reduction_type, reduction_ranges=(65536,)):
@@ -4866,8 +4871,17 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
             (1, 1, 64), reduction_ranges=reduction_ranges, reduction_type=reduction_type
         )
         b, m, n, k = sympy.symbols("b m n k")
-        rhs_dep = MemoryDep("rhs", k * 64 + n, (k, n), (reduction_ranges[0], 64))
-        rhs_layout = _fixed_tiled_layout((reduction_ranges[0], 64))
+        # Size the synthetic input dep by the sole *real* (non-unit) entry,
+        # not always reduction_ranges[0] -- callers may pad reduction_ranges
+        # with an extent-1 entry (see
+        # test_reduction_range_tiling_ignores_extent_one_reduction_ranges),
+        # and that unit entry carries no loop symbol of its own.
+        real_extent = next(
+            (r for r in reduction_ranges if sympy.sympify(r) != 1),
+            reduction_ranges[0],
+        )
+        rhs_dep = MemoryDep("rhs", k * 64 + n, (k, n), (real_extent, 64))
+        rhs_layout = _fixed_tiled_layout((real_extent, 64))
         return op, (b, m, n, k), rhs_dep, rhs_layout
 
     def _plan_with_reduction_dim_overflow(
@@ -4945,6 +4959,116 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
                 Unsupported, r"reduction range has no legal .*nontrivial split"
             ):
                 plan_span_overflow_tile(op, max_cores=1)
+
+    def test_reduction_range_tiling_ignores_extent_one_reduction_ranges(self):
+        # x.sum(dim=(1, 2)) where dim 1 already has size 1 produces
+        # reduction_ranges == (1, 65536): two raw entries, but the size-1 one
+        # gets no loop symbol at all (index_vars_squeeze drops it), so there
+        # is really only one reduction loop var, same as reduction_ranges ==
+        # (65536,).  Counting raw entries used to misclassify this as
+        # "multi-range unsupported", which made _has_untileable_reduction_span
+        # hard-abort compilation instead of planning the ordinary
+        # reduction-range tile it should.  Covers the unit entry leading and
+        # trailing the real one, since only trailing happens to keep the
+        # squeezed position (always 0) aligned with the raw index.
+        for reduction_ranges in ((1, 65536), (65536, 1)):
+            with self.subTest(reduction_ranges=reduction_ranges):
+                op, (b, m, n, _k), rhs_dep, rhs_layout = (
+                    self._reduction_dim_overflow_op(
+                        "sum", reduction_ranges=reduction_ranges
+                    )
+                )
+                self.assertTrue(soha._supports_reduction_range_tiling(op))
+                with (
+                    patch.object(soha, "MAX_SPAN_BYTES", 5 * 1024 * 1024),
+                    patch.object(
+                        soha, "_output_span_candidates_from_op", return_value=[]
+                    ),
+                    patch.object(
+                        soha, "_input_read_deps", return_value=[(rhs_dep, rhs_layout)]
+                    ),
+                    patch.object(
+                        soha, "_output_symbol_to_dim", return_value={b: 0, m: 1, n: 2}
+                    ),
+                ):
+                    plan = plan_span_overflow_tile(op, max_cores=1)
+                self.assertIsNotNone(plan)
+                self.assertEqual(
+                    plan.levels,
+                    (
+                        SpanOverflowTileLevel(
+                            selected_host_dim=0, split_count=2, is_reduction=True
+                        ),
+                    ),
+                )
+
+    def test_sole_real_reduction_range_pos(self):
+        # Direct coverage of the helper itself: it must find the one real
+        # (non-unit) entry regardless of how many extent-1 entries surround
+        # it, and return None when that is ambiguous (zero or 2+ real
+        # entries) rather than guessing.
+        cases = [
+            ((65536,), 0),
+            ((1, 65536), 1),
+            ((65536, 1), 0),
+            ((1, 65536, 1), 1),
+            ((1, 1), None),
+            ((64, 64), None),
+        ]
+        for reduction_ranges, expected in cases:
+            with self.subTest(reduction_ranges=reduction_ranges):
+                op = _reduction_op(
+                    (1, 1, 64), reduction_ranges=reduction_ranges, reduction_type="sum"
+                )
+                self.assertEqual(soha._sole_real_reduction_range_pos(op), expected)
+
+    def test_reduction_range_tiling_active_respects_kill_switch(self):
+        # BMM's kill switch is enforced separately, post-search
+        # (plan_span_overflow_tile) -- _reduction_range_tiling_active must
+        # stay True for it regardless of the flag, so that path is untouched.
+        # A supported non-matmul reduction is gated on the flag directly:
+        # every site that decides whether a reduction-controlled coordinate
+        # becomes visible to the search must go through this, or the flag
+        # is not a real escape hatch for that site.
+        bmm_op = _reduction_op(
+            (1, 1, 64), reduction_ranges=(64,), reduction_type=BATCH_MATMUL_OP
+        )
+        sum_op = _reduction_op((64,), reduction_ranges=(64,), reduction_type="sum")
+        self.assertTrue(soha._reduction_range_tiling_active(bmm_op))
+        self.assertTrue(soha._reduction_range_tiling_active(sum_op))
+        with config.patch({"enable_reduction_tiling": False}):
+            self.assertTrue(soha._reduction_range_tiling_active(bmm_op))
+            self.assertFalse(soha._reduction_range_tiling_active(sum_op))
+
+    def test_mixed_output_reduction_coordinate_skipped_when_kill_switch_off(self):
+        # A coordinate jointly controlled by an output symbol (m) and the
+        # reduction symbol (k) is normally kept visible so the search can
+        # choose an output split for it (case 5/9 in the design doc). With
+        # reduction tiling disabled for this non-BMM op, it must instead be
+        # skipped entirely -- the pre-widening fallback -- rather than
+        # surfacing as an output-only candidate the search can never actually
+        # satisfy (only a reduction split touches the k part of it), which
+        # would exhaust the combo search and raise a generic "no combined
+        # split" error instead of cleanly doing nothing.
+        op = _reduction_op((20,), reduction_ranges=(65536,), reduction_type="sum")
+        m, k = sympy.symbols("m k")
+        dep = MemoryDep("arg0", m * 65536 + k, (m, k), (20, 65536))
+        layout = _fixed_tiled_layout((20, 65536))
+        with (
+            patch.object(soha, "MAX_SPAN_BYTES", 1024),
+            patch.object(soha, "_input_read_deps", return_value=[(dep, layout)]),
+            patch.object(soha, "_output_symbol_to_dim", return_value={m: 0}),
+            patch.object(soha, "_device_coordinates_for_span", return_value=[m + k, k]),
+        ):
+            enabled_infos = soha._input_span_infos_controlled_by_output_dims(
+                op, max_cores=1
+            )
+            with config.patch({"enable_reduction_tiling": False}):
+                disabled_infos = soha._input_span_infos_controlled_by_output_dims(
+                    op, max_cores=1
+                )
+        self.assertTrue(enabled_infos)
+        self.assertEqual(disabled_infos, [])
 
     def test_reduction_range_tile_respects_kill_switch(self):
         # With reduction tiling disabled for a non-BMM reduction, the flag is
@@ -5100,10 +5224,13 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
         int_data.reduction_type = "sum"
         self.assertTrue(soha._supports_reduction_range_tiling(int_op))
 
-    def test_untileable_check_skips_integer_reductions(self):
-        # int max/min are excluded from tiling by dtype; the guard must not
-        # convert them into a compile abort either -- keep the historical
-        # silent skip.
+    def test_untileable_check_fires_for_integer_reductions_too(self):
+        # int max/min are excluded from *tiling* by dtype (the +/-inf identity
+        # casts wrong into an integer accumulator), but an unfixable
+        # reduction-only overflow is exactly as unfixable for int as for
+        # float -- work division pins plain reduction vars to split=1
+        # regardless of dtype -- so the guard must still fire for it rather
+        # than silently dropping the overflow.
         int_data = MagicMock(spec=Reduction)
         int_data.ranges = [1, 1, 64]
         int_data.reduction_ranges = [65536]
@@ -5125,7 +5252,7 @@ class TestSpanOverflowGenericReductionRangeTiling(InductorTestCase):
                 soha, "_output_symbol_to_dim", return_value={b: 0, m: 1, n: 2}
             ),
         ):
-            self.assertFalse(soha._has_untileable_reduction_span(op, max_cores=1))
+            self.assertTrue(soha._has_untileable_reduction_span(op, max_cores=1))
 
     def test_untileable_check_charges_mixed_coord_only_its_reduction_part(self):
         # An inner coordinate mixing an output symbol (m) and a reduction
@@ -7093,7 +7220,7 @@ class TestSpanOverflowNumericValidation(InductorTestCase):
 
         cfn = torch.compile(fn, dynamic=False)
         with self.assertRaisesRegex(
-            Exception, "reduction-dimension tiling is not supported"
+            InductorError, "reduction-dimension tiling is not supported"
         ):
             with (
                 patch(_LAUNCH_JOBPLAN),

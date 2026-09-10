@@ -395,9 +395,12 @@ Still unsupported (raise `Unsupported` with a clear message rather than
 silently dropping the overflow -- `_has_untileable_reduction_span`):
 
 - `mean` (its per-tile scale factor needs separate handling);
-- `xor_sum` / `any` / welford (no Spyre kernel lowering);
 - more than one reduction range on one op (coarse tiling tiles at most one
   reduction dim per level).
+
+`xor_sum` / `any` / welford (no Spyre kernel lowering) are outside this raise's
+scope (`_REDUCTION_RANGE_FAMILY`) entirely -- a reduction-only overflow on one
+of these is still silently skipped, the same as before this feature existed.
 
 ### 9. Coordinate Jointly Controlled by Two Output Symbols
 
@@ -519,8 +522,9 @@ The planner skips:
 - Pointwise or Reduction ops with indirect/gather/scatter-style reads.
 
 It raises `Unsupported` (rather than skipping) when a reduction-only input span
-overflows but the op cannot be reduction-range tiled -- `mean`, welford, or
-more than one reduction range.
+overflows but the op cannot be reduction-range tiled -- `mean` or more than one
+reduction range.  `xor_sum` / `any` / welford overflows are not covered by this
+raise (see Known Limitations) and are silently skipped instead.
 
 ### Support Matrix
 
@@ -532,7 +536,8 @@ more than one reduction range.
 | Reduction input span controlled by output dim | Yes | Emit tile for the matching output dim |
 | Coordinate jointly controlled by 2+ output symbols | Yes | Emit a candidate for each contributing dim |
 | `sum`/`prod`/`max`/`min` input span controlled by the single reduction dim | Yes | Emit reduction-range level (`is_reduction=True`); reduction-only or combined output+reduction |
-| `mean` / welford / multi-reduction-range input span on the reduction dim | No | Raise `Unsupported` with a clear message |
+| `mean` / multi-reduction-range input span on the reduction dim | No | Raise `Unsupported` with a clear message |
+| `xor_sum` / `any` / welford input span on the reduction dim | No | Skip silently (outside `_REDUCTION_RANGE_FAMILY`); span may still overflow |
 | BMM input span controlled by `b`, `m`, or `n` | Yes | Emit tile for matching output dim |
 | BMM input span controlled by `k` | Yes | Emit reduction-only or combined output+`k` levels when full validation clears every span |
 | BMM input spans needing both output dim and `k` tiling | Yes | Search and validate output+`k` split combinations together |
@@ -613,9 +618,12 @@ The output-range scan does not create B/M/N candidates for a coordinate
 controlled only by a reduction symbol.  Instead `_bmm_k_span_infos` collects
 those as `is_reduction=True` candidates for the reduction-range search -- for
 BMM `k`, or for a `sum`/`prod`/`max`/`min` reduction with one reduction range.
-`mean`, welford, and multi-reduction-range ops cannot be reduction-range tiled;
+`mean` and multi-reduction-range ops cannot be reduction-range tiled;
 `_has_untileable_reduction_span` detects an overflow they cannot fix and the
 planner raises `Unsupported` rather than emitting a plan that still overflows.
+`welford` (and `xor_sum` / `any`) fall outside `_REDUCTION_RANGE_FAMILY`
+altogether, so this guard does not see them at all -- an overflow on one of
+these is silently skipped, unchanged from before this feature existed.
 
 ## BMM-Specific Symbol Mapping
 
@@ -918,7 +926,8 @@ automatic output-range tile plan.  Common reasons:
 - selected range is size 1 or non-integral;
 - no legal exact divisor exists;
 - a reduction-only input span overflows but the op cannot be reduction-range
-  tiled (`mean`, welford, more than one reduction range);
+  tiled (`mean`, more than one reduction range -- see Known Limitations for why
+  `xor_sum` / `any` / welford are not included here);
 - reduction-only candidates still leave non-reduction span overflows;
 - stick alignment rejects all candidates;
 - `_resize_device_layout` cannot reconstruct the post-tile layout;
@@ -937,10 +946,13 @@ violates the hardware span limit or silently creates unsynchronized tile loops.
 ## Known Limitations
 
 - Reduction-range tiling covers BMM `k` and single-range `sum`/`prod`/`max`/
-  `min` only.  `mean` needs per-tile scale-factor handling; `xor_sum`, `any`,
-  and welford have no Spyre kernel lowering; more than one reduction range on
-  one op is not searched (coarse tiling tiles at most one reduction dim per
-  level).  A reduction-only overflow on any of these raises `Unsupported`.
+  `min` only.  `mean` needs per-tile scale-factor handling; more than one
+  reduction range on one op is not searched (coarse tiling tiles at most one
+  reduction dim per level).  A reduction-only overflow on `mean` or a
+  multi-range op raises `Unsupported` (`_REDUCTION_RANGE_FAMILY` covers both).
+  `xor_sum`, `any`, and welford have no Spyre kernel lowering and are outside
+  that family entirely -- a reduction-only overflow on one of these is still
+  silently skipped, not raised.
 - Combined output+reduction plans are emitted as nested levels only (outer
   output, inner reduction) -- never a single mixed level.
 - Scalar/full reductions are skipped.
@@ -1067,8 +1079,10 @@ Current coverage includes:
 - Reduction output span tiling;
 - Reduction/BMM input span tiling;
 - generic reduction-range tiling for `sum`/`prod`/`max`/`min` (planner emits an
-  `is_reduction=True` level), combined output+reduction plans, and a clear
-  `Unsupported` for `mean` / welford / multi-reduction-range overflows
+  `is_reduction=True` level), combined output+reduction plans, a clear
+  `Unsupported` for `mean` / multi-reduction-range overflows, and the silent
+  skip (no raise) for reduction types outside `_REDUCTION_RANGE_FAMILY` such
+  as welford / `xor_sum` / `any`
   (`TestSpanOverflowGenericReductionRangeTiling`);
 - scalar reduction skip;
 - indirect-read guards for Pointwise and Reduction;
