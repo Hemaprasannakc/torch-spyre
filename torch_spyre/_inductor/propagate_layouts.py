@@ -3062,17 +3062,6 @@ def propagate_mutation_layouts(
                     layouts[0],
                     offset=output.offset,
                 )
-        elif isinstance(n.node.data, Reduction):
-            real = n.node.layout.real_layout()
-            if isinstance(real, FixedTiledLayout) and _real_layout_matches_op_size(
-                n.node, real
-            ):
-                n.node.layout = real
-            else:
-                logger.warning(
-                    "propagate_mutation_layouts: unhandled mutation Reduction"
-                    f" op {n.node.get_name()}: real_layout is {type(real)}"
-                )
         else:
             logger.warning(
                 f"propagate_mutation_layouts: unhandled mutation op {type(n.node.data)}"
