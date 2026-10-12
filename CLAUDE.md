@@ -92,6 +92,7 @@ Task-specific guidance is available in `.claude/skills/`. These cover:
 - **pr-review** — PR review checklist
 - **debug-compilation** — troubleshooting compilation failures
 - **write-rfc** — design proposal workflow (RFCs now at https://github.com/torch-spyre/rfcs)
+- **generalize-view** — non-stick/strided view bugs: root causes and fix strategies (pad+reorder, loop, deeptools modulo-wiring)
 
 ### Writing SKILL.md Files
 
