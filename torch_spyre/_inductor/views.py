@@ -408,9 +408,15 @@ def compute_coordinates(
                     )
             continue
 
-        # compute index({var=1}) and index({var=var_ranges[var]})
+        # compute index({var=1}) and index({var=var_ranges[var]-1})
+        # claude-check: var's true max value is range_val-1 (var ranges over
+        # 0..range_val-1, never reaching range_val itself); using range_val
+        # here was an off-by-one over-conservatism causing false-positive
+        # "crosses the boundary" rejections for terms that never actually do.
+        # limit is an exclusive bound (one past the true max), matching the
+        # convention the `<` comparisons below already assume.
         step = term.xreplace({var: 1})
-        limit = term.xreplace({var: range_val})
+        limit = term.xreplace({var: range_val - 1}) + 1
 
         mods_with_var = [m for m in term.atoms(sympy.Mod) if m.has(var)]
         if len(mods_with_var) > 1:
@@ -692,7 +698,22 @@ def normalize_coordinates(
                     )
                 inner.dim_size //= stride
             if residual_offset == 0:
-                terms.append(Term(None, None, None, None, stride))
+                # claude-check: try a real synthetic variable (range 1) here
+                # instead of a bare var=None term, so this axis stays
+                # symbol-driven through iteration_space/dim_order/strides
+                # downstream, same as the residual_offset != 0 case below.
+                var = synthetic_var_fn()
+                var_ranges[var] = 1
+                terms.append(
+                    Term(
+                        sympy.S.One,
+                        sympy.S.One,
+                        var,
+                        sympy.S.One,
+                        stride,
+                        sympy.S.Zero,
+                    )
+                )
             else:
                 var = synthetic_var_fn()
                 var_ranges[var] = 1
