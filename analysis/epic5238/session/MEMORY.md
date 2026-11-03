@@ -1,0 +1,1 @@
+- [Stick-pivot fix for epic #5238](stick-pivot-epic-5238.md) — uncommitted worktree location, evidence, and status of the view-issues work
