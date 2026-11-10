@@ -202,23 +202,34 @@ def _layout_serves_own_view(x) -> bool:
     ``x[1, 2, 4, 8, 7].reshape(1, 8, 56)`` keep a layout whose stick coordinate
     for the new shape is ``Mod(Mod(c0, 65), 64)`` or ``Mod(d1, 7)``, which the
     compiler cannot represent, so every op reading the view fails.
+
+    The answer depends only on the layout and the view's geometry, so it is
+    cached on them: a view seen before costs one dict lookup, not a coordinate
+    computation.
     """
+    from torch_spyre._C import get_spyre_tensor_layout
+
+    return _layout_serves_view(
+        get_spyre_tensor_layout(x),
+        tuple(x.shape),
+        tuple(x.stride()),
+    )
+
+
+@functools.lru_cache(maxsize=4096)
+def _layout_serves_view(stl, size, stride) -> bool:
     # Imported here: torch_spyre._inductor imports this module's package.
     import sympy
 
-    from torch_spyre._C import get_spyre_tensor_layout
     from torch_spyre._inductor.errors import Unsupported
     from torch_spyre._inductor.pass_utils import _check_stick_expr_supported
     from torch_spyre._inductor.views import compute_coordinates
 
-    stl = get_spyre_tensor_layout(x)
     syms = [
-        sympy.Symbol(f"d{i}", integer=True, nonnegative=True) for i in range(x.dim())
+        sympy.Symbol(f"d{i}", integer=True, nonnegative=True) for i in range(len(size))
     ]
-    ranges = {s: n for s, n in zip(syms, x.shape) if n > 1}
-    index = sum(
-        (s * st for s, st in zip(syms, x.stride()) if s in ranges), sympy.S.Zero
-    )
+    ranges = {s: n for s, n in zip(syms, size) if n > 1}
+    index = sum((s * st for s, st in zip(syms, stride) if s in ranges), sympy.S.Zero)
     try:
         coords = compute_coordinates(
             list(stl.device_size), list(stl.stride_map), ranges, index

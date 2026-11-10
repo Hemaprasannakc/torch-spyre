@@ -2716,6 +2716,11 @@ def compute_restickify_needed(
         # checking that it is stick_compatible with the output. That is safe only
         # because _default_pointwise_layout and _reduction_layout return a sparse
         # output early. Return the target only for an output it can feed.
+        # TODO(#5966): before the sparse layout, try a dense relocation of the
+        # stick: the first layout with the stick on another real dim (larger
+        # dims first, the former stick dim outermost) on which
+        # try_device_coordinates serves this read. Keep the sparse layout below
+        # as the fallback for a read with no such dim, such as a flatten to 1-D.
         sparse = sparse_layout_serves_read(in_stl, in_host, in_dep, ind_sizes, op=op)
         if sparse is not None:
             return True, sparse
